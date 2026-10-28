@@ -103,7 +103,7 @@ class Context:
             imaging.write_png(target / f"{name}.png", image)
         path = GOLDENS / self.tag / f"{name}.png"
         if not path.exists():
-            if self.args.require_goldens:
+            if self.args.require_goldens and not self.args.update_goldens:
                 raise AssertionError(f"golden {self.tag}/{name}.png is missing (--require-goldens)")
             return f"no committed golden {self.tag}/{name}.png (candidate in artifacts)"
         golden = imaging.read_png(path)
@@ -111,6 +111,9 @@ class Context:
         if diff is not None:
             imaging.write_png(self.artifacts / f"{name}-diff.png", diff)
         if not ok:
+            if self.args.update_goldens:
+                # Regenerating on purpose: the candidate is the evidence, not a failure.
+                return f"golden {self.tag}/{name}.png differs, candidate written for review: {json.dumps(report)}"
             raise AssertionError(f"golden {self.tag}/{name}.png mismatch: {json.dumps(report)}")
         return f"golden {self.tag}/{name}.png matches ({report['fraction']:.4%} px differ)"
 
