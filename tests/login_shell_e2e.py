@@ -62,7 +62,7 @@ class LoginShells(unittest.TestCase):
         self.temp = Path(tempfile.mkdtemp(prefix="crow-login-"))
         self.addCleanup(shutil.rmtree, self.temp, True)
 
-    def daemon(self, home, config_text):
+    def daemon(self, home, config_text, autostart=False):
         runtime = home.parent / f"rt-{home.name}"
         runtime.mkdir(mode=0o700)
         config = home.parent / f"{home.name}.toml"
@@ -70,10 +70,13 @@ class LoginShells(unittest.TestCase):
         env = stripped_env(home, runtime)
         log = (home.parent / f"{home.name}-daemon.log").open("w+")
         self.addCleanup(log.close)
-        daemon = subprocess.Popen([str(BIN), "--config", str(config), "daemon"], env=env, stdout=log, stderr=log)
+        daemon = None if autostart else subprocess.Popen(
+            [str(BIN), "--config", str(config), "daemon"], env=env, stdout=log, stderr=log)
 
         def stop():
             subprocess.run([str(BIN), "stop", "--force"], env=env, capture_output=True, timeout=10)
+            if daemon is None:
+                return
             try:
                 daemon.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -86,12 +89,15 @@ class LoginShells(unittest.TestCase):
             if result.returncode:
                 raise AssertionError(f"{args}: {result.stderr}")
             return result.stdout
+        if autostart:
+            # Like the GUI: a client command starts the daemon (ensure_daemon).
+            cli("list-sessions")
         deadline = time.monotonic() + 15
         while "daemon: running" not in cli("doctor"):
             if time.monotonic() > deadline:
                 raise AssertionError("daemon did not start")
             time.sleep(0.1)
-        return cli, log
+        return cli, runtime
 
     def wait_for(self, cli, pane, needle, timeout=30):
         deadline = time.monotonic() + timeout
@@ -116,9 +122,9 @@ class LoginShells(unittest.TestCase):
                 for relative, text in files.items():
                     (home / relative).parent.mkdir(parents=True, exist_ok=True)
                     (home / relative).write_text(text)
-                cli, log = self.daemon(home, f'shell = "{program}"\n')
+                cli, _ = self.daemon(home, f'shell = "{program}"\n')
                 doctor = cli("doctor")
-                self.assertIn("login shell", doctor)
+                self.assertIn("; login shell)", doctor)
                 pane = json.loads(cli("new-session", name))["Created"]["pane"]
                 time.sleep(1.5)  # let the profile and prompt finish before typing
                 cli("send-keys", pane, probe, "--enter")
@@ -144,12 +150,12 @@ class LoginShells(unittest.TestCase):
             for relative, text in files.items():
                 (home / relative).parent.mkdir(parents=True, exist_ok=True)
                 (home / relative).write_text(text)
-        cli, log = self.daemon(home, "")
+        cli, runtime = self.daemon(home, "", autostart=True)
         doctor = cli("doctor")
-        self.assertIn("user database (login shell)", doctor)
-        log.flush()
-        log.seek(0)
-        self.assertIn("adopted", log.read(), "daemon without TERM must adopt the login environment")
+        self.assertIn("user database (login shell); login shell)", doctor)
+        started = (runtime / "daemon.log").read_text()
+        count = int(started.split("daemon starts with ")[1].split(" variable")[0]) if "daemon starts with" in started else 0
+        self.assertGreater(count, 0, f"a daemon started without TERM must get the login environment: {started}")
         # A program started without a shell inherits the adopted environment.
         printenv = shutil.which("printenv", path="/usr/bin:/bin")
         pane = json.loads(cli("--shell", printenv, "new-session", "env"))["Created"]["pane"]

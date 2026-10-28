@@ -13,9 +13,13 @@ started plainly. On Windows the default stays `powershell.exe`, which loads
 its profiles itself; WSL is unchanged.
 
 When the daemon is started outside a terminal (from Finder or the Dock there
-is no `TERM`), it first captures your login environment once through the same
-shell (5 s limit; the daemon log says what it adopted), so programs started
-without a shell (`crow-term start -- nvim`) also see your PATH.
+is no `TERM`), the starting GUI or command first captures your login
+environment once through the same shell — interactive for zsh and bash, so
+`.zshrc`/`.bashrc` PATH edits count — and starts the daemon with it (3 s limit;
+a profile's background jobs cannot hold it longer; `daemon.log` says how many
+variables were adopted). Programs started without a shell (`crow-term start --
+nvim`) then see your PATH too. csh/tcsh panes are login shells, but their
+environment is not captured (their `-l` cannot be combined with `-c`).
 
 ```toml
 shell = "/opt/homebrew/bin/fish"   # optional: a specific shell (still a login shell)

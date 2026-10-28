@@ -215,8 +215,7 @@ fn main() -> Result<()> {
             println!("runtime: {}", ipc::runtime_dir()?.display());
             let (program, source) = crow_term::login::default_shell(config.shell.as_deref());
             let args = config.shell_args_for(&program);
-            let login = crow_term::login::login_args(&program)
-                .is_some_and(|login| !login.is_empty() && args.starts_with(&login));
+            let login = crow_term::login::is_login(&program, &args);
             println!(
                 "shell: {program} {} ({}; {})",
                 args.join(" "),
