@@ -1,0 +1,50 @@
+name: GUI journeys (macOS)
+# Real GUI + daemon + PTYs on the runner's window server, driven through System
+# Events / Quartz events (the hosted image grants Accessibility to its tools).
+# Rendering is proven by frame dumps and screencapture.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      update_goldens:
+        description: Upload candidate goldens for review
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: gui-macos-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  journeys:
+    name: macos
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      CROW_TERM_REQUIRE_NVIM: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Pinned Symbols Nerd Font
+        run: python tests/gui/fetch_fonts.py
+      - name: Pinned Neovim
+        run: |
+          nvim="$(python scripts/fetch_neovim.py 0.11.7 --dest "$RUNNER_TEMP/neovim")"
+          echo "CROW_TERM_NVIM=$nvim" >> "$GITHUB_ENV"
+      - run: cargo build --locked --features frame-dump
+      - name: Journeys
+        run: |
+          python tests/gui/journeys.py --driver macos --goldens macos --artifacts gui-artifacts --require-goldens --screen-tolerance 40 \
+            ${{ inputs.update_goldens && '--update-goldens' || '' }} \
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: gui-macos
+          path: gui-artifacts
+          retention-days: 14
