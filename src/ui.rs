@@ -1255,7 +1255,9 @@ impl App {
             self.prefix = false;
             if is_prefix {
                 let bytes = encode_input(input, &self.modes());
-                self.pressed_keys.insert(input.physical);
+                if !bytes.is_empty() {
+                    self.pressed_keys.insert(input.physical);
+                }
                 self.input(bytes);
             } else {
                 self.prefix_action(key, event_loop);
@@ -1286,7 +1288,10 @@ impl App {
         }
         if self.ime.is_empty() || !matches!(key, Key::Character(_)) {
             let bytes = encode_input(input, &self.modes());
-            self.pressed_keys.insert(input.physical);
+            // Only a press the application received may report its release.
+            if !bytes.is_empty() {
+                self.pressed_keys.insert(input.physical);
+            }
             self.input(bytes);
         }
     }
@@ -2265,9 +2270,52 @@ fn selected_text(screen: &Screen, selection: &Selection) -> String {
     }
     lines.join("\n")
 }
+/// Bytes for a named key or a character, as the GUI would send them
+/// (testing aid behind the hidden `debug-encode-key` command).
+pub fn encode_named_key(name: &str, mods: ModifiersState, release: bool, modes: &Modes) -> Vec<u8> {
+    let named = |key| (Key::Named(key), None);
+    let (key, text): (Key, Option<String>) = match name {
+        "Enter" => (Key::Named(NamedKey::Enter), Some("\r".into())),
+        "Tab" => (Key::Named(NamedKey::Tab), Some("\t".into())),
+        "Backspace" => named(NamedKey::Backspace),
+        "Escape" => named(NamedKey::Escape),
+        "Space" => (Key::Named(NamedKey::Space), Some(" ".into())),
+        "Up" => named(NamedKey::ArrowUp),
+        "Down" => named(NamedKey::ArrowDown),
+        "Left" => named(NamedKey::ArrowLeft),
+        "Right" => named(NamedKey::ArrowRight),
+        "F1" => named(NamedKey::F1),
+        "F3" => named(NamedKey::F3),
+        "F5" => named(NamedKey::F5),
+        other => (Key::Character(other.into()), Some(other.into())),
+    };
+    let base = key.clone();
+    let key = match (&key, mods.shift_key()) {
+        (Key::Character(text), true) => Key::Character(text.to_uppercase().into()),
+        _ => key,
+    };
+    let text = match (&key, text) {
+        (Key::Character(shifted), Some(_)) => Some(shifted.to_string()),
+        (_, text) => text,
+    };
+    let input = KeyInput {
+        key: &key,
+        base: &base,
+        text: text.as_deref(),
+        physical: PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+        location: KeyLocation::Standard,
+        mods,
+        action: if release {
+            KeyAction::Release
+        } else {
+            KeyAction::Press
+        },
+    };
+    encode_input(&input, modes)
+}
 /// Encode a key for the focused pane: kitty keyboard protocol when the
 /// application enabled it, xterm modifyOtherKeys when requested, else legacy.
-fn encode_input(input: &KeyInput, modes: &Modes) -> Vec<u8> {
+pub fn encode_input(input: &KeyInput, modes: &Modes) -> Vec<u8> {
     if input.mods.super_key() {
         // Super/Command chords are GUI shortcuts, never PTY input.
         return Vec::new();

@@ -26,6 +26,23 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Print the bytes the GUI sends for a key (test aid; not a stable interface).
+    #[command(hide = true)]
+    DebugEncodeKey {
+        /// Character or Enter/Tab/Backspace/Escape/Space/Up/Down/Left/Right/F1/F3/F5.
+        key: String,
+        /// Kitty keyboard flags the application enabled (0 = legacy).
+        #[arg(long, default_value_t = 0)]
+        flags: u8,
+        /// xterm modifyOtherKeys level.
+        #[arg(long, default_value_t = 0)]
+        modify_other_keys: u8,
+        /// shift, ctrl, alt (repeatable).
+        #[arg(long = "mod")]
+        mods: Vec<String>,
+        #[arg(long)]
+        release: bool,
+    },
     /// Open/reattach a GUI. Arguments after -- execute a program without a shell.
     Start {
         #[arg(last = true)]
@@ -329,6 +346,33 @@ fn main() -> Result<()> {
                 window: *window,
                 name: name.clone(),
             })?)
+        }
+        Some(Action::DebugEncodeKey {
+            key,
+            flags,
+            modify_other_keys,
+            mods,
+            release,
+        }) => {
+            use std::io::Write;
+            use winit::keyboard::ModifiersState;
+            let mut state = ModifiersState::empty();
+            for name in mods {
+                state |= match name.as_str() {
+                    "shift" => ModifiersState::SHIFT,
+                    "ctrl" => ModifiersState::CONTROL,
+                    "alt" => ModifiersState::ALT,
+                    other => bail!("unknown modifier {other}"),
+                };
+            }
+            let modes = Modes {
+                keyboard: *flags,
+                modify_other_keys: *modify_other_keys,
+                ..Modes::default()
+            };
+            let bytes = ui::encode_named_key(key, state, *release, &modes);
+            std::io::stdout().write_all(&bytes)?;
+            Ok(())
         }
         Some(Action::ResizePane { pane, rows, cols }) => {
             print_response(ipc::rpc(&Request::Resize {

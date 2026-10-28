@@ -40,12 +40,21 @@ enum State {
 #[derive(Debug)]
 pub struct Interceptor {
     state: State,
+    /// The escape sequence in progress, without the C0 controls inside it
+    /// (those are forwarded immediately: the parser executes them in place).
     held: Vec<u8>,
-    /// C0 controls seen inside the held sequence; the parser executes them.
-    controls: Vec<u8>,
-    forwarded: bool,
+    /// The sequence outgrew `MAX_HELD`: it is dropped whole and never acted on.
+    overflow: bool,
     marker: Option<u8>,
-    params: Vec<u8>,
+    /// Any parameter byte seen (a marker is only valid before them).
+    started: bool,
+    /// First subparameter of each parameter, saturating like the parser.
+    values: Vec<u16>,
+    current: u16,
+    /// The current parameter's first subparameter is already in `values`.
+    field_done: bool,
+    /// Parameter + subparameter separators; at 32 the parser ignores the CSI.
+    separators: usize,
     intermediates: usize,
     ignored: bool,
     alt_screen: bool,
@@ -59,10 +68,13 @@ impl Default for Interceptor {
         Self {
             state: State::Ground,
             held: Vec::new(),
-            controls: Vec::new(),
-            forwarded: false,
+            overflow: false,
             marker: None,
-            params: Vec::new(),
+            started: false,
+            values: Vec::new(),
+            current: 0,
+            field_done: false,
+            separators: 0,
             intermediates: 0,
             ignored: false,
             alt_screen: false,
@@ -73,6 +85,8 @@ impl Default for Interceptor {
 }
 
 const ESC: u8 = 0x1b;
+/// vte's `MAX_PARAMS`: a CSI with this many separators is ignored.
+const MAX_PARAMS: usize = 32;
 
 impl Interceptor {
     /// Scan `bytes`, passing forwarded bytes and queries to `sink`,
@@ -104,11 +118,7 @@ impl Interceptor {
 
     /// Forward a held, unfinished sequence (end of stream).
     pub fn flush(&mut self, sink: &mut impl FnMut(Out<'_>)) {
-        if !self.forwarded && !self.held.is_empty() {
-            sink(Out::Bytes(&self.held));
-        }
-        self.reset_sequence();
-        self.state = State::Ground;
+        self.pass(sink);
     }
 
     fn begin_escape(&mut self) {
@@ -119,46 +129,53 @@ impl Interceptor {
 
     fn reset_sequence(&mut self) {
         self.held.clear();
-        self.controls.clear();
-        self.forwarded = false;
+        self.overflow = false;
         self.marker = None;
-        self.params.clear();
+        self.started = false;
+        self.values.clear();
+        self.current = 0;
+        self.field_done = false;
+        self.separators = 0;
         self.intermediates = 0;
         self.ignored = false;
     }
 
-    fn hold(&mut self, byte: u8, sink: &mut impl FnMut(Out<'_>)) {
-        if self.forwarded {
-            sink(Out::Bytes(&[byte]));
+    fn hold(&mut self, byte: u8) {
+        if self.overflow {
+            return;
+        }
+        if self.held.len() >= MAX_HELD {
+            // Never forward bytes that were not examined: drop the sequence.
+            self.overflow = true;
+            self.held = Vec::new();
             return;
         }
         self.held.push(byte);
-        if self.held.len() > MAX_HELD {
-            sink(Out::Bytes(&self.held));
-            self.held.clear();
-            self.forwarded = true;
-        }
     }
 
-    /// Forward the held sequence unchanged and return to ground.
+    /// Forward the held sequence unchanged (unless oversized) and return to ground.
     fn pass(&mut self, sink: &mut impl FnMut(Out<'_>)) {
-        if !self.forwarded && !self.held.is_empty() {
+        if !self.overflow && !self.held.is_empty() {
             sink(Out::Bytes(&self.held));
         }
         self.reset_sequence();
         self.state = State::Ground;
     }
 
-    /// Drop the held sequence, forwarding only the C0 controls the parser
-    /// would have executed while reading it.
-    fn drop_sequence(&mut self, sink: &mut impl FnMut(Out<'_>)) {
-        if self.forwarded {
-            // Already forwarded in full; nothing can be withheld any more.
-        } else if !self.controls.is_empty() {
-            sink(Out::Bytes(&self.controls));
-        }
+    /// Drop the held sequence; its C0 controls were already forwarded.
+    fn drop_sequence(&mut self) {
         self.reset_sequence();
         self.state = State::Ground;
+    }
+
+    fn end_field(&mut self) {
+        if !self.field_done {
+            if self.values.len() <= MAX_PARAMS {
+                self.values.push(self.current);
+            }
+            self.field_done = true;
+        }
+        self.current = 0;
     }
 
     fn byte(&mut self, byte: u8, sink: &mut impl FnMut(Out<'_>)) {
@@ -169,8 +186,13 @@ impl Interceptor {
                 return;
             }
             0x18 | 0x1a => {
-                self.hold(byte, sink);
+                self.hold(byte);
                 self.pass(sink);
+                return;
+            }
+            // Executed by the parser in every escape/CSI state.
+            0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
+                sink(Out::Bytes(&[byte]));
                 return;
             }
             _ => {}
@@ -178,97 +200,82 @@ impl Interceptor {
         match self.state {
             State::Ground => unreachable!("ground bytes are handled by scan"),
             State::Escape => match byte {
-                0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
-                    self.controls.push(byte);
-                    self.hold(byte, sink);
-                }
-                0x7f => self.hold(byte, sink),
+                0x7f => self.hold(byte),
                 b'[' => {
-                    self.hold(byte, sink);
+                    self.hold(byte);
                     self.state = State::Csi;
                 }
                 b'c' => {
                     // RIS: the parser resets screens, keyboard stacks and modes.
-                    self.hold(byte, sink);
+                    self.hold(byte);
                     self.alt_screen = false;
                     self.kitty_depth = [0; 2];
                     self.modify_other_keys = 0;
                     self.pass(sink);
                 }
                 _ => {
-                    self.hold(byte, sink);
+                    self.hold(byte);
                     self.pass(sink);
                 }
             },
-            State::Csi => match byte {
-                0x00..=0x17 | 0x19 | 0x1c..=0x1f => {
-                    self.controls.push(byte);
-                    self.hold(byte, sink);
-                }
-                0x7f => self.hold(byte, sink),
-                b'<'..=b'?' => {
-                    self.hold(byte, sink);
-                    if self.marker.is_none() && self.params.is_empty() && self.intermediates == 0 {
-                        self.marker = Some(byte);
-                    } else {
-                        self.ignored = true;
-                    }
-                }
-                b'0'..=b';' => {
-                    self.hold(byte, sink);
-                    if self.intermediates > 0 {
-                        self.ignored = true;
-                    } else if self.params.len() < 256 {
-                        self.params.push(byte);
-                    }
-                }
-                0x20..=0x2f => {
-                    self.hold(byte, sink);
-                    self.intermediates += 1;
-                }
-                0x40..=0x7e => {
-                    self.hold(byte, sink);
-                    self.dispatch(byte, sink);
-                }
-                _ => self.hold(byte, sink),
-            },
-        }
-    }
-
-    /// Parameter values as the VT parser reads them: first subparameter of
-    /// each `;`-separated field, saturating, empty fields as zero.
-    fn param_values(&self) -> Vec<u16> {
-        self.params
-            .split(|&byte| byte == b';')
-            .map(|field| {
-                field
-                    .iter()
-                    .take_while(|&&byte| byte != b':')
-                    .fold(0u16, |value, &digit| {
-                        if digit.is_ascii_digit() {
-                            value
-                                .saturating_mul(10)
-                                .saturating_add(u16::from(digit - b'0'))
+            State::Csi => {
+                self.hold(byte);
+                match byte {
+                    b'<'..=b'?' => {
+                        if self.marker.is_none() && !self.started && self.intermediates == 0 {
+                            self.marker = Some(byte);
                         } else {
-                            value
+                            self.ignored = true;
                         }
-                    })
-            })
-            .collect()
+                    }
+                    b'0'..=b';' if self.intermediates > 0 => self.ignored = true,
+                    b'0'..=b'9' => {
+                        self.started = true;
+                        if !self.field_done {
+                            self.current = self
+                                .current
+                                .saturating_mul(10)
+                                .saturating_add(u16::from(byte - b'0'));
+                        }
+                    }
+                    b':' => {
+                        self.started = true;
+                        self.separators += 1;
+                        self.end_field();
+                    }
+                    b';' => {
+                        self.started = true;
+                        self.separators += 1;
+                        self.end_field();
+                        self.field_done = false;
+                    }
+                    0x20..=0x2f => self.intermediates += 1,
+                    0x40..=0x7e => {
+                        self.end_field();
+                        self.dispatch(byte, sink);
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     fn dispatch(&mut self, final_byte: u8, sink: &mut impl FnMut(Out<'_>)) {
-        if self.ignored || self.intermediates > 0 {
+        if self.overflow {
+            self.drop_sequence();
+            return;
+        }
+        if self.ignored || self.intermediates > 0 || self.separators >= MAX_PARAMS {
             self.pass(sink);
             return;
         }
-        let params = self.param_values();
+        let params = std::mem::take(&mut self.values);
         let first = params.first().copied().unwrap_or(0);
         let screen = usize::from(self.alt_screen);
         match (self.marker, final_byte) {
             (Some(b'>'), b'u') => {
                 if self.kitty_depth[screen] >= KITTY_STACK_LIMIT {
-                    self.drop_sequence(sink);
+                    self.drop_sequence();
                     return;
                 }
                 self.kitty_depth[screen] += 1;
@@ -371,13 +378,170 @@ mod tests {
     }
 
     #[test]
-    fn oversized_sequences_are_forwarded_without_unbounded_buffering() {
+    fn oversized_sequences_are_dropped_unexamined_bytes_never_reach_the_parser() {
         let mut interceptor = Interceptor::default();
-        let mut input = b"\x1b[".to_vec();
+        let mut input = b"\x1b[>".to_vec();
         input.extend(std::iter::repeat_n(b'0', MAX_HELD + 10));
-        input.extend_from_slice(b"1u");
+        input.extend_from_slice(b"1\nu after");
         let (fed, _) = run(&mut interceptor, &[&input]);
-        assert_eq!(fed, input);
-        assert!(interceptor.held.capacity() <= MAX_HELD * 2 + 64);
+        assert_eq!(fed, b"\n after");
+        assert!(interceptor.held.capacity() <= MAX_HELD + 64);
+    }
+
+    /// Shadow of alacritty's keyboard stacks, driven by the real vte parser
+    /// over exactly the bytes the scanner forwards.
+    #[derive(Default)]
+    struct Shadow {
+        alt: bool,
+        depth: [usize; 2],
+        max: usize,
+    }
+    impl alacritty_terminal::vte::Perform for Shadow {
+        fn csi_dispatch(
+            &mut self,
+            params: &alacritty_terminal::vte::Params,
+            intermediates: &[u8],
+            ignore: bool,
+            action: char,
+        ) {
+            if ignore || intermediates.len() > 2 {
+                return;
+            }
+            let mut iter = params.iter();
+            let screen = usize::from(self.alt);
+            match (action, intermediates) {
+                ('u', [b'>']) => {
+                    self.depth[screen] += 1;
+                    self.max = self.max.max(self.depth[screen]);
+                }
+                ('u', [b'<']) => {
+                    let count = match iter.next() {
+                        Some(&[value, ..]) if value != 0 => value,
+                        _ => 1,
+                    };
+                    self.depth[screen] = self.depth[screen].saturating_sub(count as usize);
+                }
+                ('h' | 'l', [b'?']) => {
+                    for param in params.iter() {
+                        if param[0] == 1049 {
+                            self.alt = action == 'h';
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+            if byte == b'c' && intermediates.is_empty() {
+                *self = Self {
+                    max: self.max,
+                    ..Self::default()
+                };
+            }
+        }
+    }
+
+    #[test]
+    fn forwarded_stream_never_exceeds_the_push_bound_under_hostile_input() {
+        let tokens: &[&[u8]] = &[
+            b"\x1b[>1u",
+            b"\x1b[>31u",
+            b"\x1b[<u",
+            b"\x1b[<255u",
+            b"\x1b[<0u",
+            b"\x1b[?1049h",
+            b"\x1b[?1049l",
+            b"\x1b[?1;1049h",
+            b"\x1b[?000000000000000000000000000000000000000000001049h",
+            b"\x1b[<255;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1u",
+            b"\x1b[<255;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1u",
+            b"\x1b[<255:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1:1u",
+            b"\x1b[<2:9u",
+            b"\x1b[>1\x07u",
+            b"\x1b[>\x18u",
+            b"\x1b[>1$u",
+            b"\x1b[>>1u",
+            b"\x1b[1>u",
+            b"\x1bc",
+            b"\x1b]2;\x1b[<9u\x07",
+            b"\x1bP+q\x1b[<9u\x1b\\",
+            b"\x1b[?2026h",
+            b"\x1b[?2026l",
+            b"\x1b",
+            b"\x7f",
+            b"x",
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // Targeted: fill the stack, then try each token as a "free capacity"
+        // trick, repeatedly (a miscounted pop or screen switch shows here).
+        let push: &[u8] = b"\x1b[>1u";
+        for trick in tokens {
+            let mut interceptor = Interceptor::default();
+            let mut parser = alacritty_terminal::vte::Parser::new();
+            let mut shadow = Shadow::default();
+            for _ in 0..20 {
+                let mut chunk = push.repeat(KITTY_STACK_LIMIT as usize - 1);
+                chunk.extend_from_slice(trick);
+                let split = (next() as usize) % (chunk.len() + 1);
+                for part in [&chunk[..split], &chunk[split..]] {
+                    interceptor.scan(part, &mut |out| {
+                        if let Out::Bytes(bytes) = out {
+                            parser.advance(&mut shadow, bytes);
+                        }
+                    });
+                }
+            }
+            assert!(
+                shadow.max <= KITTY_STACK_LIMIT as usize,
+                "{:?}: parser stack reached {}",
+                String::from_utf8_lossy(trick),
+                shadow.max
+            );
+        }
+        // Oversized push padding (past the hold limit) must not count as free.
+        let mut padded = b"\x1b[>".to_vec();
+        padded.extend(std::iter::repeat_n(b'0', MAX_HELD + 1));
+        padded.extend_from_slice(b"1u");
+        let mut interceptor = Interceptor::default();
+        let mut parser = alacritty_terminal::vte::Parser::new();
+        let mut shadow = Shadow::default();
+        for _ in 0..(KITTY_STACK_LIMIT as usize + 5) {
+            interceptor.scan(&padded, &mut |out| {
+                if let Out::Bytes(bytes) = out {
+                    parser.advance(&mut shadow, bytes);
+                }
+            });
+        }
+        assert!(shadow.max <= KITTY_STACK_LIMIT as usize);
+        for _ in 0..40 {
+            let mut interceptor = Interceptor::default();
+            let mut parser = alacritty_terminal::vte::Parser::new();
+            let mut shadow = Shadow::default();
+            for _ in 0..4000 {
+                let mut chunk = Vec::new();
+                for _ in 0..(next() % 8 + 1) {
+                    chunk.extend_from_slice(tokens[(next() % tokens.len() as u64) as usize]);
+                }
+                let split = (next() as usize) % (chunk.len() + 1);
+                for part in [&chunk[..split], &chunk[split..]] {
+                    interceptor.scan(part, &mut |out| {
+                        if let Out::Bytes(bytes) = out {
+                            parser.advance(&mut shadow, bytes);
+                        }
+                    });
+                }
+                assert!(
+                    shadow.max <= KITTY_STACK_LIMIT as usize,
+                    "parser stack reached {}",
+                    shadow.max
+                );
+            }
+        }
     }
 }

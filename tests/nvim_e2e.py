@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Real Neovim (no user config) through the daemon PTY: keyboard protocol.
 
-The byte sequences below are the ones `src/keyboard.rs` produces for the
-keyboard flags Neovim requests (asserted by its reference-table unit tests;
-press events are identical under flags 1 and 3); here the real editor must
-decode each one as the intended key.
+Each chord is encoded by the GUI encoder itself (hidden `debug-encode-key`
+command) for the keyboard flags Neovim negotiated, sent to the pane, and the
+real editor must decode it as the intended key.
 """
 import os
 from pathlib import Path
 import shlex
+import subprocess
 import sys
 import unittest
 
@@ -16,24 +16,32 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import daemon_e2e  # noqa: E402
 
-# key name -> (bytes sent for kitty flag 1 "disambiguate", Neovim lhs)
-KITTY_DISAMBIGUATE = {
-    "C_SLASH": ("\x1b[47;5u", "<C-/>"),
-    "C_DOT": ("\x1b[46;5u", "<C-.>"),
-    "C_SEMI": ("\x1b[59;5u", "<C-;>"),
-    "C_COMMA": ("\x1b[44;5u", "<C-,>"),
-    "C_I": ("\x1b[105;5u", "<C-i>"),
-    "TAB": ("\t", "<Tab>"),
-    "C_M": ("\x1b[109;5u", "<C-m>"),
-    "CR": ("\r", "<CR>"),
-    "S_CR": ("\x1b[13;2u", "<S-CR>"),
-    "C_CR": ("\x1b[13;5u", "<C-CR>"),
-    "C_TAB": ("\x1b[9;5u", "<C-Tab>"),
-    "C_BS": ("\x1b[127;5u", "<C-BS>"),
-    # Report-all-keys (flag 8) form; Neovim decodes it even though it only
-    # requests flag 1, under which Shift+Space is plain text (kitty semantics).
-    "S_SPACE": ("\x1b[32;2u", "<S-Space>"),
+# marker -> (key, modifiers, Neovim lhs)
+CHORDS = {
+    "C_SLASH": ("/", ["ctrl"], "<C-/>"),
+    "C_DOT": (".", ["ctrl"], "<C-.>"),
+    "C_SEMI": (";", ["ctrl"], "<C-;>"),
+    "C_COMMA": (",", ["ctrl"], "<C-,>"),
+    "C_I": ("i", ["ctrl"], "<C-i>"),
+    "TAB": ("Tab", [], "<Tab>"),
+    "C_M": ("m", ["ctrl"], "<C-m>"),
+    "CR": ("Enter", [], "<CR>"),
+    "S_CR": ("Enter", ["shift"], "<S-CR>"),
+    "C_CR": ("Enter", ["ctrl"], "<C-CR>"),
+    "C_TAB": ("Tab", ["ctrl"], "<C-Tab>"),
+    "C_BS": ("Backspace", ["ctrl"], "<C-BS>"),
+    "A_J": ("j", ["alt"], "<M-j>"),
 }
+
+
+def encode(key, mods, flags, release=False):
+    args = [str(daemon_e2e.BIN), "debug-encode-key", key, "--flags", str(flags)]
+    for mod in mods:
+        args += ["--mod", mod]
+    if release:
+        args.append("--release")
+    return subprocess.run(args, capture_output=True, check=True, timeout=10).stdout.decode()
+
 
 INIT = """
 vim.opt.shortmess:append('I')
@@ -56,7 +64,7 @@ class NeovimKeyboardTests(daemon_e2e.DaemonHarness):
         import json
         script = self.runtime / "init.lua"
         script.write_text(init)
-        keymap = {name: lhs for name, (_, lhs) in KITTY_DISAMBIGUATE.items()}
+        keymap = {name: lhs for name, (_, _, lhs) in CHORDS.items()}
         pane = self.rpc("new-session", "nvim")["Created"]["pane"]
         command = "CROW_KEYMAP=" + shlex.quote(json.dumps(keymap)) + " " + " ".join(
             map(shlex.quote, [self.nvim, "--clean", "-n", "-i", "NONE", "-u", str(script)]))
@@ -71,16 +79,22 @@ class NeovimKeyboardTests(daemon_e2e.DaemonHarness):
         flags = self.eventually(lambda: self.modes(pane)["keyboard"], timeout=10)
         # Neovim 0.11 requests disambiguate (1); 0.12 adds event types (2).
         self.assertIn(flags, (1, 3))
-        for name, (sequence, lhs) in KITTY_DISAMBIGUATE.items():
+        for name, (key, mods, lhs) in CHORDS.items():
             with self.subTest(key=lhs):
-                self.command("send-keys", pane, sequence)
+                self.command("send-keys", pane, encode(key, mods, flags))
                 self.eventually(lambda: self.output_line(pane, "KEY_" + name), timeout=5)
+        # Shift+Space types a plain space under flags 1/3 (kitty semantics):
+        # Neovim sees <Space>, so a <S-Space> mapping cannot fire.
+        self.assertEqual(encode("Space", ["shift"], flags), " ")
         if flags & 2:
-            # Release events (what the encoder adds under flag 2) insert nothing.
-            self.command("send-keys", pane, "ix\x1b[120;1:3uy\x1b[121;1:3u\x1b[27u\x1b[27;1:3u")
-            self.eventually(lambda: self.output_line(pane, "xyKEY_S_SPACE"), timeout=5)
+            # Release events (sent under flag 2) insert nothing.
+            keys = "i" + encode("x", [], flags) + encode("x", [], flags, release=True)
+            keys += encode("y", [], flags) + encode("y", [], flags, release=True)
+            keys += encode("Escape", [], flags) + encode("Escape", [], flags, release=True)
+            self.command("send-keys", pane, keys)
+            self.eventually(lambda: self.output_line(pane, "xyKEY_A_J"), timeout=5)
         # Leaving Neovim pops its keyboard mode: the shell gets legacy keys again.
-        self.command("send-keys", pane, "\x1b[27u:qa!\r")
+        self.command("send-keys", pane, encode("Escape", [], flags) + ":qa!\r")
         self.eventually(lambda: self.modes(pane)["keyboard"] == 0, timeout=10)
 
 

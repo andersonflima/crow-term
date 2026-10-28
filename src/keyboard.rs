@@ -322,10 +322,23 @@ pub fn encode_kitty(input: &KeyInput, flags: u8, application_cursor: bool) -> Ve
     let report_alternates = flags & ALTERNATE_KEYS != 0;
     let all_as_escapes = flags & ALL_AS_ESCAPES != 0;
     let embed_text = flags & ASSOCIATED_TEXT != 0;
+    let mut mods = modifier_bits(input.mods);
+    // Text is what the key types; control/alt/super chords type no text.
+    let text = input
+        .text
+        .filter(|text| text.chars().next().is_some_and(|c| !c.is_control()))
+        .filter(|_| mods & (CTRL | ALT | SUPER) == 0);
+    // Without "all keys as escapes", typed text goes out as text, also for
+    // keys without a single code point (dead-key compositions, multi-char).
+    if !all_as_escapes
+        && let Some(text) = text
+        && input.action != KeyAction::Release
+    {
+        return text.as_bytes().to_vec();
+    }
     let Some(code) = classify(input, disambiguate || all_as_escapes) else {
         return Vec::new();
     };
-    let mut mods = modifier_bits(input.mods);
     if let Code::Modifier(_, bit) = code {
         if !all_as_escapes {
             return Vec::new();
@@ -337,19 +350,8 @@ pub fn encode_kitty(input: &KeyInput, flags: u8, application_cursor: bool) -> Ve
             mods |= bit;
         }
     }
-    // Text is what the key types; control/alt/super chords type no text.
-    let text = input
-        .text
-        .filter(|text| text.chars().next().is_some_and(|c| !c.is_control()))
-        .filter(|_| mods & (CTRL | ALT | SUPER) == 0);
     if input.action == KeyAction::Release && !report_events {
         return Vec::new();
-    }
-    if !all_as_escapes
-        && let Some(text) = text
-        && input.action != KeyAction::Release
-    {
-        return text.as_bytes().to_vec();
     }
     let event = (report_events && input.action != KeyAction::Press).then_some(match input.action {
         KeyAction::Repeat => 2,
@@ -395,6 +397,13 @@ pub fn encode_kitty(input: &KeyInput, flags: u8, application_cursor: bool) -> Ve
             if legacy_mode && mods == 0 && input.key == &Key::Named(NamedKey::F3) {
                 return b"\x1bOR".to_vec();
             }
+            // xterm's encoding of Menu (F16) when not disambiguating.
+            let (number, final_byte) =
+                if legacy_mode && input.key == &Key::Named(NamedKey::ContextMenu) {
+                    (29, b'~')
+                } else {
+                    (number, final_byte)
+                };
             serialize(
                 &Fields {
                     key: number,
@@ -420,6 +429,23 @@ pub fn encode_kitty(input: &KeyInput, flags: u8, application_cursor: bool) -> Ve
             let embedded = (embed_text && input.action != KeyAction::Release)
                 .then(|| text.map(str::to_owned))
                 .flatten();
+            // kitty: a plain chord with only flags 2/4/16 keeps its legacy bytes.
+            let simple = event.is_none() && !add_alternates && embedded.is_none();
+            if simple && mods != 0 && !disambiguate && !all_as_escapes {
+                if let Some(bytes) = legacy_printable(key, shifted, mods) {
+                    return bytes;
+                }
+                if matches!(mods, CTRL | ALT) || mods == CTRL | ALT {
+                    let ascii = |c: u32| char::from_u32(c).is_some_and(is_legacy_ascii);
+                    if alternate != 0
+                        && !ascii(key)
+                        && ascii(alternate)
+                        && let Some(bytes) = legacy_printable(alternate, 0, mods)
+                    {
+                        return bytes;
+                    }
+                }
+            }
             serialize(
                 &Fields {
                     key,
@@ -433,6 +459,48 @@ pub fn encode_kitty(input: &KeyInput, flags: u8, application_cursor: bool) -> Ve
             )
         }
     }
+}
+
+fn is_legacy_ascii(c: char) -> bool {
+    c.is_ascii_lowercase()
+        || c.is_ascii_digit()
+        || (c.is_ascii_punctuation() && c != '\x7f')
+        || c == ' '
+}
+
+/// kitty's `ctrled_key`: like the C0 table, but keys without a control form
+/// (including `-`) stay themselves.
+fn kitty_ctrled(c: char) -> u8 {
+    match c {
+        '-' => b'-',
+        _ => ctrl_byte(c).unwrap_or(c as u8),
+    }
+}
+
+/// kitty's `encode_printable_ascii_key_legacy` for a chord on a text key.
+fn legacy_printable(key: u32, shifted: u32, mods: u32) -> Option<Vec<u8>> {
+    let ascii = |c: u32| char::from_u32(c).filter(|c| is_legacy_ascii(*c));
+    let base = ascii(key).or_else(|| (shifted != 0).then(|| ascii(shifted)).flatten())?;
+    let mut key = char::from_u32(key).filter(char::is_ascii).unwrap_or(base);
+    let mut rest = mods;
+    if mods & SHIFT != 0
+        && let Some(shifted) = char::from_u32(shifted).filter(char::is_ascii)
+        && shifted != key
+        && (mods & CTRL == 0 || !key.is_ascii_lowercase())
+    {
+        key = shifted;
+        rest &= !SHIFT;
+    }
+    let byte = key as u8;
+    Some(match rest {
+        _ if mods == SHIFT => vec![byte],
+        ALT => vec![0x1b, byte],
+        CTRL => vec![kitty_ctrled(key)],
+        _ if rest == CTRL | ALT => vec![0x1b, kitty_ctrled(key)],
+        _ if key == ' ' && rest == CTRL | SHIFT => vec![0],
+        _ if key == ' ' && rest == ALT | SHIFT => vec![0x1b, b' '],
+        _ => return None,
+    })
 }
 
 fn legacy_special_with_modifiers(special: u32, mods: u32) -> Option<Vec<u8>> {
@@ -851,6 +919,72 @@ mod tests {
         assert_eq!(
             encode_kitty(&shift_press, ALL_AS_ESCAPES | EVENT_TYPES, false),
             b"\x1b[57447;1:3u"
+        );
+    }
+
+    #[test]
+    fn flags_without_disambiguation_keep_legacy_chords_like_kitty() {
+        let a = ch("a");
+        let ctrl_a = event(&a, &a, None, KeyCode::KeyA, C, KeyAction::Press);
+        let alt_a = event(&a, &a, None, KeyCode::KeyA, A, KeyAction::Press);
+        assert_eq!(encode_kitty(&ctrl_a, EVENT_TYPES, false), vec![1]);
+        assert_eq!(encode_kitty(&ctrl_a, ALTERNATE_KEYS, false), vec![1]);
+        assert_eq!(encode_kitty(&alt_a, EVENT_TYPES, false), b"\x1ba");
+        // Repeat events add an event type, so the CSI form is required.
+        let repeat = event(&a, &a, None, KeyCode::KeyA, C, KeyAction::Repeat);
+        assert_eq!(encode_kitty(&repeat, EVENT_TYPES, false), b"\x1b[97;5:2u");
+        let menu = named(NamedKey::ContextMenu);
+        let menu = event(
+            &menu,
+            &menu,
+            None,
+            KeyCode::ContextMenu,
+            NONE,
+            KeyAction::Press,
+        );
+        assert_eq!(encode_kitty(&menu, ALTERNATE_KEYS, false), b"\x1b[29~");
+        assert_eq!(encode_kitty(&menu, DISAMBIGUATE, false), b"\x1b[57363u");
+        // Non-ASCII layout key with Ctrl falls back to its base-layout key.
+        let cyrillic = ch("ф");
+        let ctrl_layout = event(
+            &cyrillic,
+            &cyrillic,
+            None,
+            KeyCode::KeyA,
+            C,
+            KeyAction::Press,
+        );
+        assert_eq!(
+            encode_kitty(&ctrl_layout, ALTERNATE_KEYS | EVENT_TYPES, false),
+            b"\x1b[1092::97;5u"
+        );
+        assert_eq!(encode_kitty(&ctrl_layout, EVENT_TYPES, false), vec![1]);
+    }
+
+    #[test]
+    fn text_without_a_single_code_point_is_still_typed() {
+        let composed = ch("ab");
+        let input = event(
+            &composed,
+            &composed,
+            Some("ab"),
+            KeyCode::KeyA,
+            NONE,
+            KeyAction::Press,
+        );
+        assert_eq!(encode_kitty(&input, DISAMBIGUATE, false), b"ab");
+        let dead = Key::Dead(Some('`'));
+        let input = event(
+            &dead,
+            &dead,
+            Some("è"),
+            KeyCode::KeyE,
+            NONE,
+            KeyAction::Press,
+        );
+        assert_eq!(
+            encode_kitty(&input, DISAMBIGUATE | EVENT_TYPES, false),
+            "è".as_bytes()
         );
     }
 

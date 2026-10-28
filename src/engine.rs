@@ -1008,6 +1008,16 @@ mod tests {
         let flood = b"\x1b[>1u".repeat(10_000);
         state.advance(&flood);
         assert_eq!(state.snapshot(true).modes.keyboard, 1);
+        // Review reproduction: pops the parser ignores (> 32 parameters) must
+        // not free capacity in the bound (alacritty would panic at its limit).
+        let mut payload = b"\x1b[>1u".repeat(255);
+        payload.extend_from_slice(b"\x1b[<255");
+        payload.extend(b";1".repeat(33));
+        payload.push(b'u');
+        for _ in 0..20 {
+            state.advance(&payload);
+        }
+        assert!(state.snapshot(true).modes.keyboard != 0);
         state.advance(b"\x1bc");
         let modes = state.snapshot(true).modes;
         assert_eq!((modes.keyboard, modes.modify_other_keys), (0, 0));

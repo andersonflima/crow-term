@@ -86,8 +86,13 @@ wire-size observations, not rendering/latency benchmarks.
   and xterm modifyOtherKeys are implemented (`src/keyboard.rs`,
   `src/intercept.rs`) with reference-table unit tests and real-Neovim decoding in
   `tests/nvim_e2e.py`; caps/num-lock modifier bits are not reported (winit does
-  not expose lock state), Super/Command chords stay GUI shortcuts, and the GUI
-  encoder itself is verified by unit tests, not by synthetic native key events.
+  not expose lock state), Super/Command chords stay GUI shortcuts, Shift+Space
+  is a plain space unless the application requests flag 8 (kitty semantics), and
+  the encoder is exercised end-to-end through the hidden `debug-encode-key`
+  command, not through synthetic native key events. A bound of 256 kitty pushes
+  per screen guards an upstream panic in alacritty_terminal 0.26; answers the
+  engine generates itself are sent at scan time, so inside a synchronized-output
+  block (DEC 2026) they can precede the parser's own buffered replies.
 - Semantic screen-reader grid accessibility, GUI session switcher, draggable
   split ratios, search UI, crash/reboot layout restore and process persistence
   beyond daemon lifetime.
