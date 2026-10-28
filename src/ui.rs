@@ -1393,6 +1393,11 @@ impl App {
             return;
         }
         let is_prefix = prefix_matches(&self.config.prefix, key, self.mods);
+        // Pressing a modifier alone (Shift for `%`/`"`, a layout's AltGr) is part
+        // of typing the next key, not the key itself: keep the prefix armed.
+        if self.prefix && is_modifier_key(key) {
+            return;
+        }
         if self.prefix {
             self.prefix = false;
             if is_prefix {
@@ -2483,6 +2488,28 @@ fn alternate_scroll_bytes(count: i32, application_cursor: bool) -> Vec<u8> {
     };
     key.repeat((count.unsigned_abs() as usize).min(100) * 3)
 }
+/// Keys that only modify another key (never a prefix action on their own).
+fn is_modifier_key(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Super
+                | NamedKey::Meta
+                | NamedKey::Hyper
+                | NamedKey::Symbol
+                | NamedKey::Fn
+                | NamedKey::FnLock
+                | NamedKey::CapsLock
+                | NamedKey::NumLock
+                | NamedKey::ScrollLock
+                | NamedKey::SymbolLock
+        )
+    )
+}
 fn prefix_matches(prefix: &str, key: &Key, mods: ModifiersState) -> bool {
     if prefix.eq_ignore_ascii_case("none")
         || !mods.control_key()
@@ -3491,6 +3518,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(calls, 2);
         assert!(error.to_string().contains("16384/49152"));
+    }
+    #[test]
+    fn modifier_presses_do_not_count_as_prefix_actions() {
+        for named in [
+            NamedKey::Shift,
+            NamedKey::Control,
+            NamedKey::Alt,
+            NamedKey::AltGraph,
+            NamedKey::Super,
+            NamedKey::CapsLock,
+        ] {
+            assert!(is_modifier_key(&Key::Named(named)), "{named:?}");
+        }
+        for key in [
+            Key::Named(NamedKey::Tab),
+            Key::Named(NamedKey::Escape),
+            Key::Character("%".into()),
+        ] {
+            assert!(!is_modifier_key(&key), "{key:?}");
+        }
     }
     #[test]
     fn tmux_passthrough_never_consumes_its_prefix() {
