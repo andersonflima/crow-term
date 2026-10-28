@@ -355,8 +355,22 @@ struct CachedRow {
     pixels: Vec<u32>,
     width: usize,
 }
+/// Families that hold the Nerd Font icons (Private Use Area), in preference order.
+const SYMBOL_FAMILIES: [&str; 2] = ["Symbols Nerd Font Mono", "Symbols Nerd Font"];
+/// Private Use Area code points: icon fonts live here, and a system CJK font's
+/// vendor glyphs at the same code points are never the intended icon.
+fn private_use(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| {
+        matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
+    })
+}
 struct Renderer {
     fonts: FontSystem,
+    /// Installed Nerd symbols family for Private Use Area cells that the
+    /// configured family cannot draw itself.
+    symbols: Option<&'static str>,
+    /// Whether the configured family maps a Private Use Area code point.
+    primary_covers: HashMap<char, bool>,
     swash: SwashCache,
     rows: HashMap<(u64, usize), CachedRow>,
     font_size: f32,
@@ -375,8 +389,16 @@ impl Renderer {
                 .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data)));
         }
         fonts.db_mut().set_monospace_family(&config.font_family);
+        let symbols = SYMBOL_FAMILIES.into_iter().find(|family| {
+            fonts
+                .db()
+                .faces()
+                .any(|face| face.families.iter().any(|(name, _)| name == family))
+        });
         let mut renderer = Self {
             fonts,
+            symbols,
+            primary_covers: HashMap::new(),
             swash: SwashCache::new(),
             rows: HashMap::new(),
             font_size: 18.0,
@@ -416,7 +438,36 @@ impl Renderer {
         self.rows.clear();
         self.swash = SwashCache::new();
     }
-    fn attrs<'a>(&self, config: &'a Config, cell: &Cell) -> Attrs<'a> {
+    /// An icon cell drawn from the symbols family: a Private Use Area code point
+    /// the configured family does not map (a patched Nerd font keeps its own icons).
+    fn symbol_cell(&mut self, config: &Config, cell: &Cell) -> bool {
+        let Some(c) = cell.text.chars().next() else {
+            return false;
+        };
+        if self.symbols.is_none() || !private_use(&cell.text) {
+            return false;
+        }
+        if self.primary_covers.len() > 4096 {
+            self.primary_covers.clear();
+        }
+        let covered = match self.primary_covers.get(&c) {
+            Some(&covered) => covered,
+            None => {
+                let families = [cosmic_text::fontdb::Family::Name(&config.font_family)];
+                let id = self.fonts.db().query(&cosmic_text::fontdb::Query {
+                    families: &families,
+                    ..Default::default()
+                });
+                let covered = id
+                    .and_then(|id| self.fonts.get_font(id, Weight::NORMAL))
+                    .is_some_and(|font| font.as_swash().charmap().map(c) != 0);
+                self.primary_covers.insert(c, covered);
+                covered
+            }
+        };
+        !covered
+    }
+    fn attrs<'a>(&self, config: &'a Config, cell: &Cell, symbol: bool) -> Attrs<'a> {
         let mut features = FontFeatures::new();
         if !config.ligatures {
             features
@@ -424,9 +475,14 @@ impl Renderer {
                 .disable(FeatureTag::CONTEXTUAL_LIGATURES)
                 .disable(FeatureTag::CONTEXTUAL_ALTERNATES);
         }
+        let family = match self.symbols {
+            Some(symbols) if symbol => symbols,
+            _ => config.font_family.as_str(),
+        };
         Attrs::new()
-            .family(Family::Name(&config.font_family))
-            .weight(if cell.bold {
+            .family(Family::Name(family))
+            // Symbols Nerd Font ships one weight; asking for bold would skip it.
+            .weight(if cell.bold && !symbol {
                 Weight::BOLD
             } else {
                 Weight::NORMAL
@@ -470,20 +526,26 @@ impl Renderer {
             // Coalesce equal styles, rather than assigning per-cell metadata that breaks ligatures.
             let mut spans: Vec<(&str, Attrs<'_>)> = Vec::new();
             let mut begin = 0;
-            let mut previous_cell: Option<&Cell> = None;
+            let symbol: Vec<bool> = cells
+                .iter()
+                .map(|cell| self.symbol_cell(config, cell))
+                .collect();
+            let mut previous_col: Option<usize> = None;
             let mut current_attrs = None;
             for &(byte, col) in &byte_cols {
                 let cell = &cells[col];
-                if previous_cell.is_some_and(|old| !same_text_style(old, cell)) {
+                if previous_col.is_some_and(|old| {
+                    !same_text_style(&cells[old], cell) || symbol[old] != symbol[col]
+                }) {
                     if let Some(attrs) = current_attrs.take() {
                         spans.push((&text[begin..byte], attrs));
                     }
                     begin = byte;
                 }
                 if current_attrs.is_none() {
-                    current_attrs = Some(self.attrs(config, cell));
+                    current_attrs = Some(self.attrs(config, cell, symbol[col]));
                 }
-                previous_cell = Some(cell);
+                previous_col = Some(col);
             }
             if let Some(attrs) = current_attrs {
                 spans.push((&text[begin..], attrs));
@@ -3517,6 +3579,52 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn private_use_cells_are_icon_cells() {
+        for icon in ["\u{E702}", "\u{F113}", "\u{F0001}", "\u{10FFFD}"] {
+            assert!(private_use(icon), "{icon:?}");
+        }
+        for text in ["a", "界", "🚀", "", "\u{F900}"] {
+            assert!(!private_use(text), "{text:?}");
+        }
+    }
+    #[test]
+    fn symbols_family_only_for_icons_the_configured_font_lacks() {
+        let config = Config::default();
+        let mut renderer = Renderer::new(&config, 1.0);
+        renderer.symbols = None;
+        assert!(
+            !renderer.symbol_cell(&config, &cell("\u{E702}")),
+            "no symbols font installed"
+        );
+        renderer.symbols = Some(SYMBOL_FAMILIES[0]);
+        assert!(!renderer.symbol_cell(&config, &cell("a")));
+        assert!(!renderer.symbol_cell(&config, &cell("")));
+        // The answer for a code point follows the configured face's own charmap.
+        let first = renderer.symbol_cell(&config, &cell("\u{E702}"));
+        assert_eq!(renderer.primary_covers.get(&'\u{E702}'), Some(&!first));
+        // A configured family that does not exist covers nothing: always the symbols family.
+        let missing = Config {
+            font_family: "No Such Family For Crow Tests".into(),
+            ..Config::default()
+        };
+        renderer.primary_covers.clear();
+        assert!(renderer.symbol_cell(&missing, &cell("\u{F113}")));
+        let attrs = renderer.attrs(
+            &missing,
+            &Cell {
+                bold: true,
+                ..cell("\u{F113}")
+            },
+            true,
+        );
+        assert_eq!(attrs.family, Family::Name(SYMBOL_FAMILIES[0]));
+        assert_eq!(
+            attrs.weight,
+            Weight::NORMAL,
+            "single-weight icon font must not be skipped for bold"
+        );
     }
     #[test]
     fn bundled_font_shapes_ligatures_and_raster_cache_reuses_rows() {
