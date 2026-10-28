@@ -16,6 +16,7 @@ engineering alpha, not a certification of complete terminal compatibility.
 | Fish/Fisher and zsh | Existing shells plus opt-in offline isolated profiles | `shell/setup.py:1`, pinned licensed sources; real fish/zsh syntax and plugin load tested when installed |
 | Crowquill Ink and Mono | Owner-selected light default, dark example, four embedded OFL faces | `src/config.rs:1`, `assets/`; exact upstream attribution preserved |
 | Ligatures, icons, emojis | Advanced shaping, cell anchoring, fallback, raster cache | UI unit tests verify substitutions and grid alignment; native Mac screenshot verified `->`, `!=`, `===`, accents, CJK, rocket emoji and Nerd Font icon |
+| Crow agent status (owner request) | Footer status line + toggleable agent panel from `crow-skills events snapshot --json`; focused-pane cwd via `PaneCwd` IPC, git branch from `.git/HEAD` | `src/crow.rs` parsing/format/throttle unit tests, `src/engine.rs` cwd test; versioned, tolerant parser; read-only, no prompt content |
 | Lightweight / fast | Native software renderer, no WebView; dirty row/glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented, **no claim of maximum performance or comparative superiority**; GPU rendering remains follow-up |
 
 The owner explicitly chose a **new engine**, rejecting the fork alternative, and

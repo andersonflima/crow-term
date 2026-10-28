@@ -766,6 +766,38 @@ impl Engine {
     pub fn alive(&self) -> bool {
         self.process.alive.load(Ordering::Acquire)
     }
+    /// Working directory of the pane's foreground process (falling back to its
+    /// shell). One targeted OS query: no process enumeration, environment or
+    /// command line is read. `None` when the platform does not expose it.
+    pub fn cwd(&self) -> Option<String> {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        if !self.alive() {
+            return None;
+        }
+        #[cfg(unix)]
+        let foreground = foreground_group(&self.master)
+            .ok()
+            .flatten()
+            .map(|pid| pid.as_raw_nonzero().get() as u32);
+        #[cfg(not(unix))]
+        let foreground: Option<u32> = None;
+        let shell = self.process.child.lock().ok()?.as_ref()?.process_id();
+        let mut system = System::new();
+        for raw in [foreground, shell].into_iter().flatten() {
+            let pid = Pid::from_u32(raw);
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[pid]),
+                false,
+                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+            );
+            if let Some(cwd) = system.process(pid).and_then(|process| process.cwd())
+                && !cwd.as_os_str().is_empty()
+            {
+                return Some(cwd.to_string_lossy().into_owned());
+            }
+        }
+        None
+    }
     pub fn kill(&self) -> Result<()> {
         {
             let mut child = self
@@ -1153,5 +1185,33 @@ mod tests {
             "shell was not reaped"
         );
         engine.kill().unwrap(); // Idempotent close after natural reaping.
+    }
+    #[test]
+    #[cfg(unix)]
+    fn cwd_follows_the_foreground_process() {
+        let start = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        let canonical = |p: &std::path::Path| std::fs::canonicalize(p).unwrap();
+        let shell = ShellSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "read target; cd \"$target\"; sleep 30".into()],
+            cwd: Some(start.path().to_string_lossy().into_owned()),
+        };
+        let engine = Engine::new(&shell, Size::default(), 0, Arc::new(|| {})).unwrap();
+        let read = |engine: &Engine| engine.cwd().map(|c| canonical(std::path::Path::new(&c)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while read(&engine) != Some(canonical(start.path())) {
+            assert!(Instant::now() < deadline, "initial cwd {:?}", engine.cwd());
+            thread::sleep(Duration::from_millis(20));
+        }
+        engine
+            .input(format!("{}\r", next.path().display()).as_bytes())
+            .unwrap();
+        while read(&engine) != Some(canonical(next.path())) {
+            assert!(Instant::now() < deadline, "changed cwd {:?}", engine.cwd());
+            thread::sleep(Duration::from_millis(20));
+        }
+        engine.kill().unwrap();
+        assert_eq!(engine.cwd(), None, "dead panes report no cwd");
     }
 }

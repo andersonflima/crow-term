@@ -200,6 +200,11 @@ pub enum Request {
     Shutdown {
         force: bool,
     },
+    /// Working directory of a pane's foreground process (status bar git branch).
+    /// Appended last: earlier variant indices of the internal wire format are unchanged.
+    PaneCwd {
+        pane: u64,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
@@ -207,4 +212,5 @@ pub enum Response {
     Created { window: u64, pane: u64 },
     View(View),
     Error(String),
+    Cwd(Option<String>),
 }

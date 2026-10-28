@@ -1,6 +1,7 @@
 //! Native, event-driven software frontend. PTYs live in the mux server, not this window.
 //! The two RPC workers keep long polls and command I/O off the native event thread.
 use crate::config::Config;
+use crate::crow::{self, CrowView, Segment, Tone};
 use crate::ipc::rpc;
 use crate::model::*;
 use anyhow::{Context as _, Result};
@@ -33,6 +34,11 @@ const BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/CrowquillMono-BoldIta
 const HEADER: f32 = 48.0;
 const FOOTER: f32 = 25.0;
 const PADDING: f32 = 10.0;
+/// Crow panel: logical width when docked right, logical line height.
+const PANEL_WIDTH: f32 = 380.0;
+const PANEL_LINE: f32 = 18.0;
+/// Rows of the bottom-docked panel (capped at 2/5 of the window height).
+const PANEL_ROWS: f32 = 12.0;
 
 #[derive(Debug)]
 enum UiEvent {
@@ -42,6 +48,8 @@ enum UiEvent {
         activate_created: bool,
     },
     Error(String),
+    /// Crow agent status, published only when its rendered content changed.
+    Crow(Box<CrowView>),
 }
 
 /// At most one snapshot notification is queued, even if painting falls behind output.
@@ -121,6 +129,7 @@ pub fn run(
     let active_window = Arc::new(AtomicU64::new(initial_window));
     let (tx, rx) = mpsc::channel::<Command>();
     let command_proxy = proxy.clone();
+    let crow_proxy = proxy.clone();
     let command_running = running.clone();
     let command_worker = thread::Builder::new()
         .name("crow-ui-commands".into())
@@ -203,6 +212,30 @@ pub fn run(
                 }
             }
         })?;
+    // Read-only crow agent status: its own thread, at most one subprocess in flight.
+    let crow_shared = if config.crow.enabled {
+        match crow::spawn(
+            &config.crow,
+            running.clone(),
+            initial_pane,
+            |pane| match rpc(&Request::PaneCwd { pane }) {
+                Ok(Response::Cwd(cwd)) => Ok(cwd),
+                // rpc() already maps Response::Error (e.g. a closed pane) to Err.
+                _ => Err(()),
+            },
+            move |view| crow_proxy.send_event(UiEvent::Crow(Box::new(view))).is_ok(),
+        ) {
+            // The worker is never joined: a snapshot in flight finishes or times out
+            // on its own and must not delay closing (detaching) the GUI.
+            Ok((shared, _detached)) => Some(shared),
+            Err(error) => {
+                eprintln!("crow-term: crow status disabled: {error}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut app = App::new(
         config,
         session,
@@ -213,10 +246,14 @@ pub fn run(
         active_window,
         running.clone(),
         mailbox,
+        crow_shared.clone(),
     );
     let result = event_loop.run_app(&mut app);
     let fatal_error = app.fatal_error.take();
     running.store(false, Ordering::Relaxed);
+    if let Some(shared) = &crow_shared {
+        shared.wake();
+    }
     // Closing the event loop never sends ClosePane/KillSession to the mux.
     drop(app);
     let _ = command_worker.join();
@@ -525,7 +562,7 @@ impl Renderer {
         color: u32,
         config: &Config,
         size: f32,
-    ) {
+    ) -> f32 {
         let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, size * 1.3));
         buffer.set_wrap(Wrap::None);
         buffer.set_text(
@@ -537,7 +574,9 @@ impl Renderer {
             None,
         );
         buffer.shape_until_scroll(&mut self.fonts, false);
+        let mut width = 0f32;
         for run in buffer.layout_runs() {
+            width = width.max(run.line_w);
             for glyph in run.glyphs {
                 let physical = glyph.physical((x as f32, y as f32 + run.line_y), 1.0);
                 self.swash.with_pixels(
@@ -557,6 +596,7 @@ impl Renderer {
                 );
             }
         }
+        width
     }
 }
 
@@ -623,6 +663,30 @@ impl Chrome {
             muted: mix_rgb(bg, fg, 72),
         }
     }
+}
+/// Semantic crow colours. Crowquill palettes are greyscale, so state colours are
+/// fixed per light/dark background instead of being taken from the ANSI palette.
+fn tone_color(tone: Tone, chrome: &Chrome, light: bool) -> u32 {
+    match (tone, light) {
+        (Tone::Plain, _) => chrome.text,
+        (Tone::Muted, _) => chrome.muted,
+        (Tone::On, true) => 0x1e7f3c,
+        (Tone::On, false) => 0x6fcf8a,
+        (Tone::Off, true) => 0xb4532a,
+        (Tone::Off, false) => 0xe39264,
+        (Tone::Accent, true) => 0x2f5fb3,
+        (Tone::Accent, false) => 0x7aa7f0,
+        (Tone::Warn, true) => 0xa86400,
+        (Tone::Warn, false) => 0xe6b450,
+        (Tone::Alert, true) => 0xc0392b,
+        (Tone::Alert, false) => 0xf07167,
+    }
+}
+/// Rasterised crow panel, rebuilt only when its lines, size or scale change.
+struct PanelLayer {
+    key: u64,
+    width: usize,
+    pixels: Vec<u32>,
 }
 fn cosmic_color(value: u32) -> Color {
     Color::rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
@@ -706,6 +770,58 @@ fn blit(
     }
 }
 
+/// Paint the crow agent list into its own buffer (cached by the caller).
+fn render_panel(
+    renderer: &mut Renderer,
+    config: &Config,
+    lines: &[Vec<Segment>],
+    panel: Rect,
+    scale: f64,
+    chrome: &Chrome,
+    light: bool,
+) -> Vec<u32> {
+    let (w, h) = (panel.w as usize, panel.h as usize);
+    let mut pixels = vec![chrome.surface; w * h];
+    let local = Rect {
+        x: 0,
+        y: 0,
+        w: panel.w,
+        h: panel.h,
+    };
+    // Divider on the edge facing the panes.
+    let divider = if config.crow.panel_position == "bottom" {
+        Rect { h: 1, ..local }
+    } else {
+        Rect { w: 1, ..local }
+    };
+    fill(&mut pixels, w, divider, chrome.border);
+    let pad = (PADDING * 1.4 * scale as f32) as i32;
+    let line = (PANEL_LINE * scale as f32) as i32;
+    let size = (12.0 * scale) as f32;
+    let gap = (8.0 * scale) as i32;
+    let mut y = pad;
+    let capacity = ((h as i32 - pad - pad / 2) / line.max(1)).max(0) as usize;
+    for segments in &crow::fit_lines(lines, capacity) {
+        let mut x = pad;
+        for segment in segments {
+            let width = renderer.text(
+                &mut pixels,
+                w,
+                local,
+                x,
+                y,
+                &segment.text,
+                tone_color(segment.tone, chrome, light),
+                config,
+                size,
+            );
+            x += width.ceil() as i32 + gap;
+        }
+        y += line;
+    }
+    pixels
+}
+
 struct App {
     config: Config,
     session: String,
@@ -734,6 +850,11 @@ struct App {
     ime: String,
     sent_sizes: HashMap<u64, Size>,
     clipboard: Option<arboard::Clipboard>,
+    crow: Option<Arc<crow::Shared>>,
+    crow_view: CrowView,
+    crow_panel: bool,
+    crow_pane: u64,
+    panel_layer: Option<PanelLayer>,
 }
 impl App {
     // Construction joins independent model/worker handles exactly once, not a hot-path API.
@@ -748,8 +869,10 @@ impl App {
         shared_window: Arc<AtomicU64>,
         running: Arc<AtomicBool>,
         mailbox: Arc<ViewMailbox>,
+        crow: Option<Arc<crow::Shared>>,
     ) -> Self {
         let renderer = Renderer::new(&config, 1.0);
+        let crow_panel = crow.is_some() && config.crow.panel;
         Self {
             config,
             session,
@@ -778,7 +901,61 @@ impl App {
             ime: String::new(),
             sent_sizes: HashMap::new(),
             clipboard: None,
+            crow,
+            crow_view: CrowView::default(),
+            crow_panel,
+            crow_pane: pane_id,
+            panel_layer: None,
         }
+    }
+    /// Crow panel area, or `None` when hidden or the window is too small for it.
+    fn panel_rect(&self) -> Option<Rect> {
+        if !self.crow_panel {
+            return None;
+        }
+        let size = self.window.as_ref()?.inner_size();
+        let scale = self.scale as f32;
+        let top = (HEADER * scale).round() as u32;
+        let footer = (FOOTER * scale).round() as u32;
+        let available = size.height.saturating_sub(top + footer);
+        if self.config.crow.panel_position == "bottom" {
+            // Fixed height: content changes must never resize (SIGWINCH) the panes.
+            let h = ((PANEL_ROWS * PANEL_LINE + 2.0 * PADDING) * scale) as u32;
+            let h = h.min(available * 2 / 5);
+            if available.saturating_sub(h) < (120.0 * scale) as u32 {
+                return None;
+            }
+            Some(Rect {
+                x: 0,
+                y: (top + available - h) as i32,
+                w: size.width,
+                h,
+            })
+        } else {
+            let w = ((PANEL_WIDTH * scale) as u32).min(size.width * 9 / 20);
+            if size.width.saturating_sub(w) < (300.0 * scale) as u32 {
+                return None;
+            }
+            Some(Rect {
+                x: (size.width - w) as i32,
+                y: top as i32,
+                w,
+                h: available,
+            })
+        }
+    }
+    fn toggle_crow_panel(&mut self) {
+        let Some(shared) = &self.crow else {
+            self.status = "crow status is disabled (crow.enabled = false)".into();
+            return;
+        };
+        self.crow_panel = !self.crow_panel;
+        shared.panel.store(self.crow_panel, Ordering::Relaxed);
+        shared.wake();
+        self.panel_layer = None;
+        self.renderer.rows.clear();
+        self.resize_panes();
+        self.redraw();
     }
     fn send(&self, request: Request, activate_created: bool) {
         let _ = self.commands.send(Command {
@@ -841,12 +1018,19 @@ impl App {
         let padding = (PADDING * self.scale as f32).round() as u32;
         let top = (HEADER * self.scale as f32).round() as u32;
         let footer = (FOOTER * self.scale as f32).round() as u32;
-        let rect = Rect {
+        let mut rect = Rect {
             x: padding as i32,
             y: (top + padding) as i32,
             w: size.width.saturating_sub(2 * padding),
             h: size.height.saturating_sub(top + footer + 2 * padding),
         };
+        if let Some(panel) = self.panel_rect() {
+            if self.config.crow.panel_position == "bottom" {
+                rect.h = rect.h.saturating_sub(panel.h);
+            } else {
+                rect.w = rect.w.saturating_sub(panel.w);
+            }
+        }
         let mut out = Vec::new();
         if let Some(info) = self.current_window() {
             pane_rects(&info.layout, rect, self.scale.ceil() as u32, &mut out);
@@ -999,6 +1183,7 @@ impl App {
             "p" => self.cycle_window(-1),
             "h" | "j" | "k" | "l" | "o" => self.select_pane(character.chars().next().unwrap()),
             "d" => event_loop.exit(),
+            "a" => self.toggle_crow_panel(),
             "x" => self.send(
                 Request::ClosePane {
                     session: self.session.clone(),
@@ -1015,7 +1200,7 @@ impl App {
             }
             _ => {
                 self.status =
-                    "Prefix: c window  % / \" split  n/p tabs  h/j/k/l pane  d detach  x close"
+                    "Prefix: c window  % / \" split  n/p tabs  h/j/k/l pane  a agents  d detach  x close"
                         .into()
             }
         }
@@ -1344,6 +1529,7 @@ impl App {
             return Ok(());
         };
         let rects = self.rects();
+        let panel_rect = self.panel_rect();
         let tabs = self.tab_rects();
         let windows = self.windows();
         let chrome = Chrome::new(&self.config);
@@ -1603,7 +1789,7 @@ impl App {
         };
         fill(&mut frame, fw, footer, chrome.surface);
         let hint = if self.prefix {
-            "PREFIX  c window   % / \" split   n/p tabs   h/j/k/l panes   d detach   x close"
+            "PREFIX  c window   % / \" split   n/p tabs   h/j/k/l panes   a agents   d detach   x close"
                 .to_owned()
         } else if !self.status.is_empty() {
             self.status.clone()
@@ -1619,21 +1805,102 @@ impl App {
                 self.pane_id
             )
         };
-        self.renderer.text(
-            &mut frame,
-            fw,
-            footer,
-            (12.0 * self.scale) as i32,
-            footer_y + (4.0 * self.scale) as i32,
-            &hint,
-            if self.prefix {
-                chrome.text
-            } else {
-                chrome.muted
-            },
-            &self.config,
-            (11.0 * self.scale) as f32,
-        );
+        let light = light_background(&self.config);
+        // Footer order: prefix help alone; otherwise status/error messages first (they
+        // must stay visible), then the crow segments, then the default session hint.
+        let hint_color = if self.prefix {
+            chrome.text
+        } else {
+            chrome.muted
+        };
+        let mut footer_items: Vec<(&str, u32)> = Vec::new();
+        let message_first = self.prefix || !self.status.is_empty();
+        if message_first {
+            footer_items.push((&hint, hint_color));
+        }
+        if !self.prefix {
+            footer_items.extend(self.crow_view.status.iter().map(|segment| {
+                (
+                    segment.text.as_str(),
+                    tone_color(segment.tone, &chrome, light),
+                )
+            }));
+        }
+        if !message_first {
+            footer_items.push((&hint, hint_color));
+        }
+        let mut footer_x = (12.0 * self.scale) as i32;
+        let gap = (16.0 * self.scale) as i32;
+        for (text, color) in footer_items {
+            if footer_x >= footer.w as i32 {
+                break;
+            }
+            let width = self.renderer.text(
+                &mut frame,
+                fw,
+                footer,
+                footer_x,
+                footer_y + (4.0 * self.scale) as i32,
+                text,
+                color,
+                &self.config,
+                (11.0 * self.scale) as f32,
+            );
+            footer_x += width.ceil() as i32 + gap;
+        }
+        if let Some(panel) = panel_rect {
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                self.crow_view.panel.hash(&mut hash);
+                (
+                    panel.w,
+                    panel.h,
+                    self.scale.to_bits(),
+                    chrome.surface,
+                    light,
+                )
+                    .hash(&mut hash);
+                hash.finish()
+            };
+            if self
+                .panel_layer
+                .as_ref()
+                .is_none_or(|layer| layer.key != key)
+            {
+                self.panel_layer = Some(PanelLayer {
+                    key,
+                    width: panel.w as usize,
+                    pixels: render_panel(
+                        &mut self.renderer,
+                        &self.config,
+                        &self.crow_view.panel,
+                        panel,
+                        self.scale,
+                        &chrome,
+                        light,
+                    ),
+                });
+            }
+            if let Some(layer) = &self.panel_layer {
+                blit(
+                    &mut frame,
+                    fw,
+                    &layer.pixels,
+                    layer.width,
+                    panel.x,
+                    panel.y,
+                    bounds,
+                );
+            }
+        }
+        if let Some(shared) = &self.crow
+            && self.crow_pane != self.pane_id
+        {
+            self.crow_pane = self.pane_id;
+            shared.pane.store(self.pane_id, Ordering::Relaxed);
+            shared.wake();
+        }
         // Row raster cache is bounded by visible panes; bound glyph growth during long sessions.
         if self.renderer.swash.image_cache.len() > 16384 {
             self.renderer.swash.image_cache.clear();
@@ -1749,6 +2016,10 @@ impl ApplicationHandler<UiEvent> for App {
                 self.status = error;
                 self.redraw();
             }
+            UiEvent::Crow(view) => {
+                self.crow_view = *view;
+                self.redraw();
+            }
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -1806,6 +2077,12 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => self.mouse_click(state, button),
             WindowEvent::MouseWheel { delta, .. } => self.wheel(delta),
             WindowEvent::Focused(focused) => {
+                if let Some(shared) = &self.crow {
+                    shared.focused.store(focused, Ordering::Relaxed);
+                    if focused {
+                        shared.wake();
+                    }
+                }
                 if !focused {
                     if let Some(button) = self.mouse_button {
                         self.release_mouse_capture(button);

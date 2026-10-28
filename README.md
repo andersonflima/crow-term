@@ -64,12 +64,53 @@ The default native prefix is `Ctrl-t`, matching the originating setup:
 | `n` / `p`, `1`..`9` | Switch window |
 | `h`, `j`, `k`, `l` | Focus adjacent pane |
 | `x` | Close focused pane and its process |
+| `a` | Toggle the crow agent panel |
 | `d` | Detach GUI |
 | `Ctrl-t` again | Send a literal `Ctrl-t` |
 
 Without the prefix, Vim control chords go to the PTY. Clipboard shortcuts are
 `Ctrl-Shift-C/V` and `Command-C/V` on macOS. Scrollback, selection, bracketed paste,
 truecolor, alternate screen and application mouse reporting are implemented.
+
+## Crow agent status bar and panel
+
+When the [`crow-skills`](https://github.com/andersonflima/crow-skills) CLI is
+installed, the footer shows a thin status line for agent CLIs running on the
+machine, and prefix `a` toggles an agent list panel:
+
+```text
+▸▸ crow on   claude 2  codex 1   ⚠ 1 blocked   Crow panel 3/7   mem 41%   ⎇ main
+```
+
+- crow mode (`on`/`off`, coloured), live sessions per CLI, blocked/error
+  sessions highlighted, the active crow-behaviour run `title done/total`
+  (preferring the run that contains the focused pane's directory), memory
+  pressure when `crow-skills` reports it (0.9.0+), and the git branch of the
+  focused pane's working directory (read from `.git/HEAD`, no `git` subprocess).
+- The panel lists each running run as `● main  <title>  x/y`, one
+  `○ <owner>  <activity>` line per running unit and a `✓ done ✗ failed pending`
+  count line, then each session (CLI, state, tool, age; project@branch, model,
+  context/tokens, cost, subagents) and a summary line.
+- Data comes from `crow-skills events snapshot --json` (`crow-snapshot/1`), run on
+  a worker thread with at most one call in flight, only when crow's state files
+  change (at most every 5 s while agents work) or the data is stale (15 s while
+  agents work, 60 s idle; 4x slower while the window is unfocused), with a 5 s
+  timeout that kills the launcher's whole process group, a 2 MiB output cap,
+  exponential back-off on failure and bounded row counts. One call costs about
+  0.14 s CPU (crow-skills is node + python). Unknown fields and newer minor
+  versions are ignored; an unknown major version is shown as `crow ?`. The source
+  never contains prompt, message or tool I/O text.
+- Without `crow-skills` the crow segments are hidden (the branch remains).
+
+```toml
+[crow]
+enabled = true            # false: no worker thread, no subprocess
+status_bar = true
+panel = false             # visible at startup; prefix `a` toggles it
+panel_position = "right"  # or "bottom"
+command = "crow-skills"   # name or absolute path; Homebrew/~/.local/bin are searched too
+interval_ms = 2000        # 1000..60000
+```
 
 ## Reuse an existing tmux configuration exactly
 
