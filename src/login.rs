@@ -257,12 +257,20 @@ fn capture_with(
     if let Some(home) = home {
         command.env("HOME", home);
     }
-    // Own process group: on timeout the whole group goes, including background
-    // jobs a profile started that would otherwise keep the pipe open.
+    // Own session (hence own process group, no controlling terminal): an
+    // interactive zsh/bash cannot be stopped by job control for touching a
+    // terminal, and on timeout the whole group goes, including background jobs
+    // a profile started that would otherwise keep the pipe open.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        command.process_group(0);
+        // SAFETY: setsid is async-signal-safe and touches no parent state.
+        unsafe {
+            command.pre_exec(|| {
+                rustix::process::setsid().map_err(std::io::Error::from)?;
+                Ok(())
+            });
+        }
     }
     let mut child = command
         .spawn()

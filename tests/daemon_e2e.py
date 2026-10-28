@@ -90,9 +90,20 @@ class DaemonHarness(unittest.TestCase):
             except (AssertionError, KeyError, ValueError) as exc:
                 error = exc
             time.sleep(0.03)
-        self.log.flush()
-        self.log.seek(0)
-        raise AssertionError(f"Condition timed out: {error}; daemon: {self.daemon_log()}")
+        raise AssertionError(f"Condition timed out: {error}; daemon: {self.daemon_log()}; "
+                             f"screens:\n{self.all_screens()}")
+
+    def all_screens(self):
+        """Every pane's text, for failure messages."""
+        try:
+            sessions = json.loads(self.command("list-sessions", check=False).stdout or "{}")
+            panes = []
+            for session in sessions.get("View", {}).get("sessions", []):
+                for window in session["windows"]:
+                    panes += re.findall(r'"Pane": (\d+)', json.dumps(window["layout"]).replace('"Pane":', '"Pane": '))
+            return "\n".join(f"--- pane {p}\n{self.command('capture-pane', p, check=False).stdout}" for p in panes)
+        except Exception as error:  # noqa: BLE001 - diagnostics only
+            return f"(no screens: {error})"
 
     def capture(self, pane):
         return self.command("capture-pane", pane).stdout
@@ -102,6 +113,13 @@ class DaemonHarness(unittest.TestCase):
         return any(line.strip()==expected for line in self.capture(pane).splitlines())
 
     def send(self, pane, text):
+        # A login shell reads its profile first: type once its prompt is drawn,
+        # as a person would (input typed earlier may be read by the profile).
+        if pane not in getattr(self, "_prompted", set()):
+            self._prompted = getattr(self, "_prompted", set()) | {pane}
+            until = time.monotonic() + 15
+            while time.monotonic() < until and not self.capture(pane).strip():
+                time.sleep(0.05)
         self.command("send-keys", pane, text, "--enter")
 
 
