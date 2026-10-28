@@ -10,6 +10,12 @@ impl Default for Size {
         Self { rows: 24, cols: 80 }
     }
 }
+/// Character cell size in physical pixels, reported by the GUI that renders a pane.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CellPixels {
+    pub width: u16,
+    pub height: u16,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShellSpec {
     pub program: String,
@@ -23,6 +29,17 @@ pub enum ColorSpec {
     Indexed(u8),
     Rgb(u8, u8, u8),
 }
+/// SGR 4 / 4:x underline variants. `None` when the cell is not underlined.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cell {
     pub text: String,
@@ -30,9 +47,18 @@ pub struct Cell {
     pub bg: ColorSpec,
     pub bold: bool,
     pub italic: bool,
+    /// Any underline style; kept for consumers of the JSON capture.
     pub underline: bool,
     pub strike: bool,
     pub wide_spacer: bool,
+    #[serde(default)]
+    pub underline_style: UnderlineStyle,
+    /// SGR 58 underline color; `None` draws in the foreground color.
+    #[serde(default)]
+    pub underline_color: Option<ColorSpec>,
+    /// OSC 8 hyperlink: index into `Screen::links`.
+    #[serde(default)]
+    pub link: Option<u16>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cursor {
@@ -53,6 +79,15 @@ pub struct Modes {
     pub mouse_drag: bool,
     pub mouse_click: bool,
     pub focus_reporting: bool,
+    /// Active kitty keyboard enhancement flags; 0 means legacy encoding.
+    #[serde(default)]
+    pub keyboard: u8,
+    /// xterm modifyOtherKeys level requested by the application (0-2).
+    #[serde(default)]
+    pub modify_other_keys: u8,
+    /// Alternate screen with DEC 1007 alternate scroll: the wheel sends arrows.
+    #[serde(default)]
+    pub alternate_scroll: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Screen {
@@ -63,6 +98,16 @@ pub struct Screen {
     pub title: String,
     pub alive: bool,
     pub display_offset: usize,
+    /// Bell (BEL) count since the pane started; a change means "ring".
+    #[serde(default)]
+    pub bell: u64,
+    /// OSC 8 hyperlink targets referenced by `Cell::link`.
+    #[serde(default)]
+    pub links: Vec<String>,
+    /// OSC 52 copies accepted from this pane (only with `terminal.osc52 = "copy"`);
+    /// a change means a new text is available through `Request::Clipboard`.
+    #[serde(default)]
+    pub clipboard_seq: u64,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Axis {
@@ -179,6 +224,8 @@ pub enum Request {
     Resize {
         pane: u64,
         size: Size,
+        /// Cell metrics of the GUI rendering this pane (pixel size reports).
+        cell: Option<CellPixels>,
     },
     Scroll {
         pane: u64,
@@ -205,12 +252,21 @@ pub enum Request {
     PaneCwd {
         pane: u64,
     },
+    /// Latest OSC 52 copy of a pane (appended last, wire v5).
+    Clipboard {
+        pane: u64,
+    },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
     Ok,
-    Created { window: u64, pane: u64 },
+    Created {
+        window: u64,
+        pane: u64,
+    },
     View(View),
     Error(String),
     Cwd(Option<String>),
+    /// `(clipboard_seq, text)` of the latest accepted OSC 52 copy.
+    Clipboard(Option<(u64, String)>),
 }

@@ -42,7 +42,7 @@ for iteration in range(args.iterations+1):
                     try:
                         cli("doctor") # doctor does not autostart another daemon
                         # The socket exists only after daemon has bound it.
-                        if (path/"daemon-v2.sock").exists():break
+                        if any(path.glob("daemon-v*.sock")):break
                     except RuntimeError:pass
                     if time.perf_counter()-start>10:raise TimeoutError("startup")
                     time.sleep(.002)

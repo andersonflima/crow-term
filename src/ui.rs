@@ -3,13 +3,14 @@
 use crate::config::Config;
 use crate::crow::{self, CrowView, Segment, Tone};
 use crate::ipc::rpc;
+use crate::keyboard::{self, KeyAction, KeyInput};
 use crate::model::*;
 use anyhow::{Context as _, Result};
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style,
     SwashCache, Weight, Wrap,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::{
     Arc, Mutex,
@@ -20,11 +21,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Theme, Window, WindowId};
 
 const REGULAR: &[u8] = include_bytes!("../assets/fonts/CrowquillMono-Regular.ttf");
@@ -526,17 +528,22 @@ impl Renderer {
                     );
                 }
             }
+            let cell_width = self.cell_width as usize;
             for (col, cell) in cells.iter().enumerate() {
                 let color = resolve_color(config, cell.fg);
-                for y in [
-                    (cell.underline, height.saturating_sub(2)),
-                    (cell.strike, height / 2),
-                ] {
-                    if y.0 && width > 0 {
-                        let start = y.1 * width + col * self.cell_width as usize;
-                        pixels[start..start + self.cell_width as usize].fill(color);
-                    }
+                if cell.strike && width > 0 {
+                    let start = height / 2 * width + col * cell_width;
+                    pixels[start..start + cell_width].fill(color);
                 }
+                let (style, color) = underline_paint(config, cell);
+                draw_underline(
+                    &mut pixels,
+                    width,
+                    height,
+                    col * cell_width..(col + 1) * cell_width,
+                    style,
+                    color,
+                );
             }
             self.rows.insert(
                 key,
@@ -597,6 +604,78 @@ impl Renderer {
             }
         }
         width
+    }
+}
+
+/// Underline style and color of a cell: SGR 58 color if set, else the
+/// foreground; snapshots that only set the boolean draw a single line.
+fn underline_paint(config: &Config, cell: &Cell) -> (UnderlineStyle, u32) {
+    let style = match cell.underline_style {
+        UnderlineStyle::None if cell.underline => UnderlineStyle::Single,
+        style => style,
+    };
+    let color = resolve_color(config, cell.underline_color.unwrap_or(cell.fg));
+    (style, color)
+}
+
+/// Rasterize one cell's underline into a row buffer. Pure and bounds-checked,
+/// so a later GPU renderer can share the geometry. Positions use row-absolute
+/// x, which keeps curly and dashed patterns continuous across cells.
+fn draw_underline(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    columns: std::ops::Range<usize>,
+    style: UnderlineStyle,
+    color: u32,
+) {
+    if style == UnderlineStyle::None || width == 0 || height < 2 {
+        return;
+    }
+    let thickness = (height / 20).max(1);
+    let bottom = height - 1;
+    let mut plot = |x: usize, y: usize| {
+        if x < width && y < height {
+            pixels[y * width + x] = color;
+        }
+    };
+    let line = |plot: &mut dyn FnMut(usize, usize), x: usize, top: usize| {
+        for dy in 0..thickness {
+            plot(x, top + dy);
+        }
+    };
+    let single_top = height.saturating_sub(1 + thickness);
+    for x in columns.start..columns.end.min(width) {
+        match style {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => line(&mut plot, x, single_top),
+            UnderlineStyle::Double => {
+                line(&mut plot, x, bottom + 1 - thickness);
+                line(&mut plot, x, bottom.saturating_sub(3 * thickness) + 1);
+            }
+            UnderlineStyle::Dotted => {
+                if (x / (thickness * 2).max(2)).is_multiple_of(2) {
+                    line(&mut plot, x, single_top);
+                }
+            }
+            UnderlineStyle::Dashed => {
+                let dash = (columns.len() / 2).max(3);
+                if (x / dash).is_multiple_of(2) {
+                    line(&mut plot, x, single_top);
+                }
+            }
+            UnderlineStyle::Curly => {
+                let amplitude = (height / 8).clamp(1, 12) as f32;
+                let period = (columns.len().max(4)) as f32;
+                let phase = (x as f32 / period) * std::f32::consts::TAU;
+                let offset = (amplitude * (1.0 - phase.cos()) / 2.0).round() as usize;
+                line(
+                    &mut plot,
+                    x,
+                    (bottom + 1).saturating_sub(thickness + offset),
+                );
+            }
+        }
     }
 }
 
@@ -849,6 +928,18 @@ struct App {
     wheel_remainder: f64,
     ime: String,
     sent_sizes: HashMap<u64, Size>,
+    /// Keys whose press reached the PTY, so only their release is reported.
+    pressed_keys: HashSet<PhysicalKey>,
+    /// Window focus, for DEC 1004 focus reports on pane switches.
+    focused: bool,
+    /// Pane that becomes active before its screen arrives (window switch).
+    pending_focus_in: Option<u64>,
+    /// Last seen bell count / OSC 52 copy sequence per pane.
+    bells: HashMap<u64, u64>,
+    clipboard_seqs: HashMap<u64, u64>,
+    /// Visual bell: panes flashing until the deadline.
+    bell_flash: Option<(Instant, HashSet<u64>)>,
+    window_title: String,
     clipboard: Option<arboard::Clipboard>,
     crow: Option<Arc<crow::Shared>>,
     crow_view: CrowView,
@@ -900,6 +991,13 @@ impl App {
             wheel_remainder: 0.0,
             ime: String::new(),
             sent_sizes: HashMap::new(),
+            pressed_keys: HashSet::new(),
+            focused: true,
+            pending_focus_in: None,
+            bells: HashMap::new(),
+            clipboard_seqs: HashMap::new(),
+            bell_flash: None,
+            window_title: String::new(),
             clipboard: None,
             crow,
             crow_view: CrowView::default(),
@@ -1060,7 +1158,18 @@ impl App {
             let size = self.rect_size(rect);
             if self.sent_sizes.get(&pane) != Some(&size) {
                 self.sent_sizes.insert(pane, size);
-                self.send(Request::Resize { pane, size }, false);
+                let cell = CellPixels {
+                    width: self.renderer.cell_width.min(u32::from(u16::MAX)) as u16,
+                    height: self.renderer.cell_height.min(u32::from(u16::MAX)) as u16,
+                };
+                self.send(
+                    Request::Resize {
+                        pane,
+                        size,
+                        cell: Some(cell),
+                    },
+                    false,
+                );
             }
         }
         self.update_ime_position();
@@ -1079,16 +1188,50 @@ impl App {
             );
         }
     }
+    /// Make `pane` the input target, reporting DEC 1004 focus out/in to the
+    /// panes that requested focus events.
+    fn focus_pane(&mut self, pane: u64) {
+        if pane == self.pane_id {
+            return;
+        }
+        let old = self.pane_id;
+        self.pane_id = pane;
+        self.pending_focus_in = None;
+        if !self.focused {
+            return;
+        }
+        if self.screen(old).is_some_and(|s| s.modes.focus_reporting) {
+            self.send(
+                Request::Input {
+                    pane: old,
+                    bytes: b"\x1b[O".to_vec(),
+                },
+                false,
+            );
+        }
+        match self.screen(pane) {
+            Some(screen) if screen.modes.focus_reporting => self.send(
+                Request::Input {
+                    pane,
+                    bytes: b"\x1b[I".to_vec(),
+                },
+                false,
+            ),
+            Some(_) => {}
+            None => self.pending_focus_in = Some(pane),
+        }
+    }
     fn activate_window(&mut self, id: u64) {
         if id == self.window_id {
             return;
         }
         self.window_id = id;
         self.shared_window.store(id, Ordering::Relaxed);
-        if let Some(info) = self.current_window()
-            && let Some(id) = info.layout.panes().first()
+        if let Some(id) = self
+            .current_window()
+            .and_then(|info| info.layout.panes().first().copied())
         {
-            self.pane_id = *id;
+            self.focus_pane(id);
         }
         self.selection = None;
         self.renderer.rows.clear();
@@ -1118,7 +1261,7 @@ impl App {
                 .iter()
                 .position(|(id, _)| *id == self.pane_id)
                 .unwrap_or(0);
-            self.pane_id = rects[(index + 1) % rects.len()].0;
+            self.focus_pane(rects[(index + 1) % rects.len()].0);
         } else if let Some((_, current)) = rects.iter().find(|(id, _)| *id == self.pane_id) {
             let cx = current.x as f64 + current.w as f64 / 2.0;
             let cy = current.y as f64 + current.h as f64 / 2.0;
@@ -1141,8 +1284,8 @@ impl App {
                 })
                 .collect::<Vec<_>>();
             candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((id, _)) = candidates.first() {
-                self.pane_id = *id;
+            if let Some(&(id, _)) = candidates.first() {
+                self.focus_pane(id);
             }
         }
         self.selection = None;
@@ -1205,14 +1348,33 @@ impl App {
             }
         }
     }
-    fn key(
-        &mut self,
-        key: &Key,
-        text: Option<&str>,
-        physical: PhysicalKey,
-        location: KeyLocation,
-        event_loop: &ActiveEventLoop,
-    ) {
+    fn key_event(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
+        let base = event.key_without_modifiers();
+        let input = KeyInput {
+            key: &event.logical_key,
+            base: &base,
+            text: event.text.as_deref(),
+            physical: event.physical_key,
+            location: event.location,
+            mods: self.mods,
+            action: match (event.state, event.repeat) {
+                (ElementState::Released, _) => KeyAction::Release,
+                (_, true) => KeyAction::Repeat,
+                _ => KeyAction::Press,
+            },
+        };
+        if input.action == KeyAction::Release {
+            // Report a release only for a press the application received.
+            if self.pressed_keys.remove(&event.physical_key) {
+                let bytes = encode_input(&input, &self.modes());
+                self.input(bytes);
+            }
+            return;
+        }
+        self.key(&input, event_loop);
+    }
+    fn key(&mut self, input: &KeyInput, event_loop: &ActiveEventLoop) {
+        let key = input.key;
         let c = match key {
             Key::Character(s) => s.to_lowercase(),
             _ => String::new(),
@@ -1230,7 +1392,11 @@ impl App {
         if self.prefix {
             self.prefix = false;
             if is_prefix {
-                self.input(encode_key(key, text, self.mods, &self.modes()));
+                let bytes = encode_input(input, &self.modes());
+                if !bytes.is_empty() {
+                    self.pressed_keys.insert(input.physical);
+                }
+                self.input(bytes);
             } else {
                 self.prefix_action(key, event_loop);
             }
@@ -1259,7 +1425,11 @@ impl App {
             return;
         }
         if self.ime.is_empty() || !matches!(key, Key::Character(_)) {
-            let bytes = encode_key_event(key, text, physical, location, self.mods, &self.modes());
+            let bytes = encode_input(input, &self.modes());
+            // Only a press the application received may report its release.
+            if !bytes.is_empty() {
+                self.pressed_keys.insert(input.physical);
+            }
             self.input(bytes);
         }
     }
@@ -1423,7 +1593,7 @@ impl App {
             return;
         };
         if state == ElementState::Pressed {
-            self.pane_id = pane;
+            self.focus_pane(pane);
             self.mouse_button = Some(button);
         }
         let modes = self.modes();
@@ -1467,7 +1637,7 @@ impl App {
             return;
         }
         if let Some((pane, point)) = self.point_at(self.cursor.x, self.cursor.y) {
-            self.pane_id = pane;
+            self.focus_pane(pane);
             let modes = self.modes();
             if (modes.mouse_click || modes.mouse_motion || modes.mouse_drag)
                 && !self.mods.shift_key()
@@ -1475,6 +1645,15 @@ impl App {
                 for _ in 0..count.unsigned_abs().min(100) {
                     self.mouse_report_to(pane, if count > 0 { 64 } else { 65 }, point, false);
                 }
+            } else if modes.alternate_scroll && !self.mods.shift_key() {
+                // DEC 1007: on the alternate screen the wheel sends cursor keys.
+                self.send(
+                    Request::Input {
+                        pane,
+                        bytes: alternate_scroll_bytes(count, modes.application_cursor),
+                    },
+                    false,
+                );
             } else {
                 self.selection = None;
                 self.send(
@@ -1485,6 +1664,82 @@ impl App {
                     false,
                 );
             }
+        }
+    }
+    /// Bell, OSC 52 copy and title changes carried by a new view.
+    fn apply_screen_events(&mut self) {
+        let Some(view) = &self.view else {
+            return;
+        };
+        if view.screens.is_empty() {
+            return;
+        }
+        let mut rang = HashSet::new();
+        let mut copies = Vec::new();
+        // Counters are kept only for panes in this view: a pane seen again
+        // after a window switch (or a new pane) only records its counters, so
+        // bells and copies from while it was hidden are never replayed.
+        let mut bells = HashMap::new();
+        let mut clipboard_seqs = HashMap::new();
+        for (pane, screen) in &view.screens {
+            if self.bells.get(pane).is_some_and(|old| *old != screen.bell) {
+                rang.insert(*pane);
+            }
+            if self
+                .clipboard_seqs
+                .get(pane)
+                .is_some_and(|old| *old != screen.clipboard_seq)
+            {
+                copies.push(*pane);
+            }
+            bells.insert(*pane, screen.bell);
+            clipboard_seqs.insert(*pane, screen.clipboard_seq);
+        }
+        self.bells = bells;
+        self.clipboard_seqs = clipboard_seqs;
+        if !rang.is_empty() {
+            self.bell_flash = Some((Instant::now() + Duration::from_millis(150), rang));
+        }
+        for pane in copies {
+            self.send(Request::Clipboard { pane }, false);
+        }
+        let title = match self.screen(self.pane_id).map(|s| s.title.trim()) {
+            Some(title) if !title.is_empty() => format!("{title} — crow-term"),
+            _ => format!("crow-term — {}", self.session),
+        };
+        if title != self.window_title {
+            if let Some(window) = &self.window {
+                window.set_title(&title);
+            }
+            self.window_title = title;
+        }
+        if let Some(pane) = self.pending_focus_in
+            && let Some(screen) = self.screen(pane)
+        {
+            let report = self.focused && pane == self.pane_id && screen.modes.focus_reporting;
+            self.pending_focus_in = None;
+            if report {
+                self.send(
+                    Request::Input {
+                        pane,
+                        bytes: b"\x1b[I".to_vec(),
+                    },
+                    false,
+                );
+            }
+        }
+    }
+    fn store_clipboard(&mut self, text: String) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if self
+            .clipboard
+            .as_mut()
+            .is_none_or(|clipboard| clipboard.set_text(text).is_err())
+        {
+            self.status = "OSC 52 copy could not reach the system clipboard".into();
+            self.redraw();
         }
     }
     fn tab_rects(&self) -> Vec<(u64, Rect)> {
@@ -1529,6 +1784,7 @@ impl App {
             return Ok(());
         };
         let rects = self.rects();
+        let flash_rects = rects.clone();
         let panel_rect = self.panel_rect();
         let tabs = self.tab_rects();
         let windows = self.windows();
@@ -1778,6 +2034,39 @@ impl App {
                 );
             }
         }
+        if let Some((until, panes)) = &self.bell_flash
+            && Instant::now() < *until
+        {
+            let thickness = (2.0 * self.scale).ceil().max(1.0) as u32;
+            for &(pane, rect) in &flash_rects {
+                if !panes.contains(&pane) {
+                    continue;
+                }
+                let rect = rect.intersection(bounds);
+                for edge in [
+                    Rect {
+                        h: thickness,
+                        ..rect
+                    },
+                    Rect {
+                        y: rect.y + rect.h.saturating_sub(thickness) as i32,
+                        h: thickness,
+                        ..rect
+                    },
+                    Rect {
+                        w: thickness,
+                        ..rect
+                    },
+                    Rect {
+                        x: rect.x + rect.w.saturating_sub(thickness) as i32,
+                        w: thickness,
+                        ..rect
+                    },
+                ] {
+                    fill(&mut frame, fw, edge.intersection(bounds), chrome.text);
+                }
+            }
+        }
         let footer_y = size
             .height
             .saturating_sub((FOOTER as f64 * self.scale) as u32) as i32;
@@ -1985,12 +2274,13 @@ impl ApplicationHandler<UiEvent> for App {
                 if let Some(info) = self.current_window() {
                     let panes = info.layout.panes();
                     if !panes.contains(&self.pane_id)
-                        && let Some(id) = panes.first()
+                        && let Some(&id) = panes.first()
                     {
-                        self.pane_id = *id;
+                        self.focus_pane(id);
                         self.selection = None;
                     }
                 }
+                self.apply_screen_events();
                 self.resize_panes();
                 if revision_changed {
                     self.redraw();
@@ -2000,9 +2290,10 @@ impl ApplicationHandler<UiEvent> for App {
                 response,
                 activate_created,
             } => match response {
+                Response::Clipboard(Some((_, text))) => self.store_clipboard(text),
                 Response::Created { window, pane } if activate_created => {
                     self.activate_window(window);
-                    self.pane_id = pane;
+                    self.focus_pane(pane);
                     self.resize_panes();
                     self.redraw();
                 }
@@ -2050,13 +2341,7 @@ impl ApplicationHandler<UiEvent> for App {
                 event,
                 is_synthetic: false,
                 ..
-            } if event.state == ElementState::Pressed => self.key(
-                &event.logical_key,
-                event.text.as_deref(),
-                event.physical_key,
-                event.location,
-                event_loop,
-            ),
+            } => self.key_event(&event, event_loop),
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.ime.clear();
                 self.input(text.into_bytes());
@@ -2077,6 +2362,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => self.mouse_click(state, button),
             WindowEvent::MouseWheel { delta, .. } => self.wheel(delta),
             WindowEvent::Focused(focused) => {
+                self.focused = focused;
                 if let Some(shared) = &self.crow {
                     shared.focused.store(focused, Ordering::Relaxed);
                     if focused {
@@ -2088,6 +2374,7 @@ impl ApplicationHandler<UiEvent> for App {
                         self.release_mouse_capture(button);
                     }
                     self.mods = ModifiersState::empty();
+                    self.pressed_keys.clear();
                     self.prefix = false;
                     self.dragging = false;
                     self.mouse_button = None;
@@ -2110,11 +2397,33 @@ impl ApplicationHandler<UiEvent> for App {
             _ => {}
         }
     }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The visual bell is the only timed redraw; otherwise stay event-driven.
+        match &self.bell_flash {
+            Some((until, _)) if Instant::now() >= *until => {
+                self.bell_flash = None;
+                self.redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some((until, _)) => event_loop.set_control_flow(ControlFlow::WaitUntil(*until)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.running.store(false, Ordering::Relaxed);
     }
 }
 
+/// Cursor keys for one wheel step on the alternate screen (3 lines per notch).
+fn alternate_scroll_bytes(count: i32, application_cursor: bool) -> Vec<u8> {
+    let key: &[u8] = match (count > 0, application_cursor) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    key.repeat((count.unsigned_abs() as usize).min(100) * 3)
+}
 fn prefix_matches(prefix: &str, key: &Key, mods: ModifiersState) -> bool {
     if prefix.eq_ignore_ascii_case("none")
         || !mods.control_key()
@@ -2242,6 +2551,74 @@ fn selected_text(screen: &Screen, selection: &Selection) -> String {
         lines.push(text.trim_end().to_string());
     }
     lines.join("\n")
+}
+/// Bytes for a named key or a character, as the GUI would send them
+/// (testing aid behind the hidden `debug-encode-key` command).
+pub fn encode_named_key(name: &str, mods: ModifiersState, release: bool, modes: &Modes) -> Vec<u8> {
+    let named = |key| (Key::Named(key), None);
+    let (key, text): (Key, Option<String>) = match name {
+        "Enter" => (Key::Named(NamedKey::Enter), Some("\r".into())),
+        "Tab" => (Key::Named(NamedKey::Tab), Some("\t".into())),
+        "Backspace" => named(NamedKey::Backspace),
+        "Escape" => named(NamedKey::Escape),
+        "Space" => (Key::Named(NamedKey::Space), Some(" ".into())),
+        "Up" => named(NamedKey::ArrowUp),
+        "Down" => named(NamedKey::ArrowDown),
+        "Left" => named(NamedKey::ArrowLeft),
+        "Right" => named(NamedKey::ArrowRight),
+        "F1" => named(NamedKey::F1),
+        "F3" => named(NamedKey::F3),
+        "F5" => named(NamedKey::F5),
+        other => (Key::Character(other.into()), Some(other.into())),
+    };
+    let base = key.clone();
+    let key = match (&key, mods.shift_key()) {
+        (Key::Character(text), true) => Key::Character(text.to_uppercase().into()),
+        _ => key,
+    };
+    let text = match (&key, text) {
+        (Key::Character(shifted), Some(_)) => Some(shifted.to_string()),
+        (_, text) => text,
+    };
+    let input = KeyInput {
+        key: &key,
+        base: &base,
+        text: text.as_deref(),
+        physical: PhysicalKey::Unidentified(winit::keyboard::NativeKeyCode::Unidentified),
+        location: KeyLocation::Standard,
+        mods,
+        action: if release {
+            KeyAction::Release
+        } else {
+            KeyAction::Press
+        },
+    };
+    encode_input(&input, modes)
+}
+/// Encode a key for the focused pane: kitty keyboard protocol when the
+/// application enabled it, xterm modifyOtherKeys when requested, else legacy.
+pub fn encode_input(input: &KeyInput, modes: &Modes) -> Vec<u8> {
+    if input.mods.super_key() {
+        // Super/Command chords are GUI shortcuts, never PTY input.
+        return Vec::new();
+    }
+    if modes.keyboard != 0 {
+        return keyboard::encode_kitty(input, modes.keyboard, modes.application_cursor);
+    }
+    if input.action == KeyAction::Release {
+        return Vec::new();
+    }
+    if let Some(bytes) = keyboard::encode_modify_other_keys(input, modes.modify_other_keys) {
+        return bytes;
+    }
+    encode_key_event(
+        input.key,
+        input.text,
+        input.physical,
+        input.location,
+        input.mods,
+        modes,
+    )
 }
 fn modifier_parameter(mods: ModifiersState) -> u8 {
     1 + u8::from(mods.shift_key()) + 2 * u8::from(mods.alt_key()) + 4 * u8::from(mods.control_key())
@@ -2414,16 +2791,12 @@ fn encode_key(key: &Key, text: Option<&str>, mods: ModifiersState, modes: &Modes
                     return Vec::new();
                 }
                 let c = c.to_ascii_lowercase();
-                match c {
-                    'a'..='z' => vec![c as u8 - b'a' + 1],
-                    '@' | ' ' | '2' => vec![0],
-                    '[' | '3' => vec![27],
-                    '\\' | '4' => vec![28],
-                    ']' | '5' => vec![29],
-                    '^' | '6' => vec![30],
-                    '_' | '-' | '7' => vec![31],
-                    '?' | '8' => vec![127],
-                    _ => return Vec::new(),
+                match keyboard::ctrl_byte(c) {
+                    Some(byte) => vec![byte],
+                    // xterm/kitty legacy: printable ASCII without a C0 form
+                    // (Ctrl+. , ; ' 0 1 9 ...) sends the character itself.
+                    None if c.is_ascii_graphic() => vec![c as u8],
+                    None => return Vec::new(),
                 }
             } else {
                 text.unwrap_or(character.as_str()).as_bytes().to_vec()
@@ -2450,6 +2823,9 @@ mod tests {
             underline: false,
             strike: false,
             wide_spacer: false,
+            underline_style: UnderlineStyle::None,
+            underline_color: None,
+            link: None,
         }
     }
     #[test]
@@ -2575,6 +2951,136 @@ mod tests {
             ),
             b"\x1b[24;3~"
         );
+    }
+    #[test]
+    fn underline_styles_rasterize_distinct_shapes_inside_the_cell() {
+        let (width, height) = (24usize, 20usize);
+        let render = |style| {
+            let mut pixels = vec![0u32; width * height];
+            draw_underline(&mut pixels, width, height, 8..16, style, 0xff0000);
+            pixels
+        };
+        let rows = |pixels: &[u32]| {
+            (0..height)
+                .filter(|y| pixels[y * width..(y + 1) * width].contains(&0xff0000))
+                .collect::<Vec<_>>()
+        };
+        let lit = |pixels: &[u32]| pixels.iter().filter(|&&p| p == 0xff0000).count();
+        assert_eq!(lit(&render(UnderlineStyle::None)), 0);
+        let single = render(UnderlineStyle::Single);
+        assert_eq!(rows(&single), [height - 2]);
+        assert_eq!(lit(&single), 8);
+        // Nothing is drawn outside the cell's columns.
+        for pixels in [
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ]
+        .map(render)
+        {
+            for y in 0..height {
+                for x in (0..8).chain(16..width) {
+                    assert_eq!(pixels[y * width + x], 0);
+                }
+            }
+        }
+        assert_eq!(rows(&render(UnderlineStyle::Double)).len(), 2);
+        assert!(
+            rows(&render(UnderlineStyle::Curly)).len() >= 2,
+            "undercurl is not flat"
+        );
+        assert!(lit(&render(UnderlineStyle::Dotted)) < 8);
+        assert!(lit(&render(UnderlineStyle::Dashed)) < 8);
+        // Tiny rows and out-of-range columns never index outside the buffer.
+        let mut tiny = vec![0u32; 4];
+        draw_underline(&mut tiny, 4, 1, 0..100, UnderlineStyle::Curly, 1);
+        draw_underline(&mut tiny, 2, 2, 0..100, UnderlineStyle::Double, 1);
+    }
+    #[test]
+    fn row_raster_uses_the_cell_underline_style_and_color() {
+        let config = Config::default();
+        let mut curly = cell("x");
+        curly.underline = true;
+        curly.underline_style = UnderlineStyle::Curly;
+        curly.underline_color = Some(ColorSpec::Rgb(255, 0, 0));
+        assert_eq!(
+            underline_paint(&config, &curly),
+            (UnderlineStyle::Curly, 0xff0000)
+        );
+        let mut legacy = cell("x");
+        legacy.underline = true;
+        legacy.fg = ColorSpec::Rgb(0, 0, 255);
+        assert_eq!(
+            underline_paint(&config, &legacy),
+            (UnderlineStyle::Single, 0x0000ff)
+        );
+        // Through the real row rasterizer: red pixels only below the glyph area,
+        // on more than one scanline (a curl, not a straight line).
+        let mut renderer = Renderer::new(&config, 1.0);
+        let row = renderer.row(&config, 1, 0, &[curly]);
+        let height = row.pixels.len() / row.width;
+        let red: Vec<usize> = (0..height)
+            .filter(|y| row.pixels[y * row.width..(y + 1) * row.width].contains(&0xff0000))
+            .collect();
+        assert!(red.len() >= 2, "{red:?}");
+        assert!(red.iter().all(|&y| y >= height * 2 / 3), "{red:?}");
+    }
+    #[test]
+    fn alternate_scroll_sends_three_cursor_keys_per_notch() {
+        assert_eq!(alternate_scroll_bytes(1, false), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(alternate_scroll_bytes(-1, true), b"\x1bOB\x1bOB\x1bOB");
+        assert_eq!(alternate_scroll_bytes(i32::MIN, false).len(), 100 * 3 * 3);
+    }
+    #[test]
+    fn key_routing_follows_the_application_keyboard_mode() {
+        let slash = Key::Character("/".into());
+        let dot = Key::Character(".".into());
+        let a = Key::Character("a".into());
+        let input = |key: &'static Key, code, mods, action| KeyInput {
+            key,
+            base: key,
+            text: None,
+            physical: PhysicalKey::Code(code),
+            location: KeyLocation::Standard,
+            mods,
+            action,
+        };
+        let slash: &'static Key = Box::leak(Box::new(slash));
+        let dot: &'static Key = Box::leak(Box::new(dot));
+        let a: &'static Key = Box::leak(Box::new(a));
+        let mut modes = Modes::default();
+        let ctrl_slash = input(
+            slash,
+            KeyCode::Slash,
+            ModifiersState::CONTROL,
+            KeyAction::Press,
+        );
+        let ctrl_dot = input(
+            dot,
+            KeyCode::Period,
+            ModifiersState::CONTROL,
+            KeyAction::Press,
+        );
+        let release = input(
+            a,
+            KeyCode::KeyA,
+            ModifiersState::empty(),
+            KeyAction::Release,
+        );
+        // Legacy: xterm C0 for Ctrl+/ and the plain character for Ctrl+.
+        assert_eq!(encode_input(&ctrl_slash, &modes), vec![0x1f]);
+        assert_eq!(encode_input(&ctrl_dot, &modes), b".");
+        assert_eq!(encode_input(&release, &modes), b"");
+        modes.modify_other_keys = 1;
+        assert_eq!(encode_input(&ctrl_dot, &modes), b"\x1b[27;5;46~");
+        assert_eq!(encode_input(&ctrl_slash, &modes), vec![0x1f]);
+        // Kitty mode wins over modifyOtherKeys and reports releases on flag 2.
+        modes.keyboard = keyboard::DISAMBIGUATE | keyboard::EVENT_TYPES;
+        assert_eq!(encode_input(&ctrl_slash, &modes), b"\x1b[47;5u");
+        assert_eq!(encode_input(&release, &modes), b"\x1b[97;1:3u");
+        let command = input(a, KeyCode::KeyA, ModifiersState::SUPER, KeyAction::Press);
+        assert_eq!(encode_input(&command, &modes), b"");
     }
     #[test]
     fn vim_ctrl_chords_and_utf8_are_not_reinterpreted() {
@@ -2954,6 +3460,9 @@ mod tests {
             title: String::new(),
             alive: true,
             display_offset: 0,
+            bell: 0,
+            links: Vec::new(),
+            clipboard_seq: 0,
         };
         assert!(mailbox.push(
             1,

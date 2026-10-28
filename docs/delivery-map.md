@@ -10,11 +10,13 @@ engineering alpha, not a certification of complete terminal compatibility.
 | Public `crow-term` repository | Original Rust application, MIT | Owner explicitly authorized public repo |
 | New engine, no fork | Own native frontend, protocol and daemon | `src/ui.rs:1`, `src/ipc.rs:1`, `src/server.rs:1`; reusable crates are attributed in NOTICE |
 | macOS / Windows / Linux | Winit, native PTY/ConPTY, sockets/named pipes; CI matrix | `.github/workflows/ci.yml:1`; native build/test coverage is distinct from graphical validation |
-| Vim/Neovim/LazyVim/CLIs | VT emulation, alt screen, truecolor, mouse, bracketed paste, keypad | `src/engine.rs:1`, `src/ui.rs:1`; Neovim clean tested with real PTY and native GUI; user's entire LazyVim plugin tree is not certified |
+| Vim/Neovim/LazyVim/CLIs | VT emulation, alt screen, truecolor, mouse, bracketed paste, keypad, kitty keyboard, underline styles, terminal queries | CI (Linux, macOS) with pinned upstream Neovim 0.11.7 and 0.12.6 (SHA-256, `scripts/fetch_neovim.py`): `tests/nvim_e2e.py` (keyboard chords through the real encoder, termguicolors, background, cursor shapes, undercurl in the capture, no leaked replies), `tests/protocol_probe.py` (reply matrix, also in the native job), and `tests/lazyvim_e2e.py` against LazyVim v16.0.1 from a committed `lazy-lock.json` (dashboard, which-key, snacks picker, noice cmdline, lualine, bufferline, gitsigns sign, treesitter highlight, blink menu, `:checkhealth` errors vs allowlist). CI overrides: no Mason, Lua fuzzy matcher, nvim-treesitter disabled in favour of Neovim's bundled parsers; network only in `tests/lazyvim_bootstrap.py`. Not covered: Windows Neovim/LazyVim, LSP servers, LazyVim extras, the user's own plugin tree |
 | Native sessions/windows/panes | Daemon owns PTYs; recursive splits; named sessions and windows | `src/model.rs:1`, `src/server.rs:1`; E2E creates, resizes, reconnects and isolates sessions |
 | Existing tmux configuration | Real tmux compatibility profile; native prefix disabled | `src/config.rs:1`, `src/main.rs:1`; E2E config marker/prefix and detach, not arbitrary plugin certification |
 | Fish/Fisher and zsh | Existing shells plus opt-in offline isolated profiles | `shell/setup.py:1`, pinned licensed sources; real fish/zsh syntax and plugin load tested when installed |
 | Crowquill Ink and Mono | Owner-selected light default, dark example, four embedded OFL faces | `src/config.rs:1`, `assets/`; exact upstream attribution preserved |
+| Underline styles (Neovim diagnostics) | SGR 4:1-4:5 single/double/curly/dotted/dashed and SGR 58/59 underline color carried engine → model → IPC (wire v4) → software renderer (`draw_underline`) | `src/engine.rs` and `src/ui.rs` unit tests, daemon E2E JSON capture; raster geometry is unit-tested, not screenshot-verified on every platform |
+| Terminal queries and events | XTVERSION, XTGETTCAP (Tc/RGB/Smulx/Setulc/Ss/Se, Ms only with OSC 52 copy), DECRQSS (SGR, DECSCUSR), DA2 with the crow-term version, CSI 14t/16t from the GUI's real cell metrics (also TIOCSWINSZ pixels), DEC 1004 focus on pane switch, OSC 8 links kept in the snapshot (not clickable yet), visual bell, DEC 1007 alternate scroll, window title from OSC 0/2 | `src/intercept.rs`, `src/engine.rs` unit tests; GUI behaviours are covered by unit tests of their pure parts, not by native-event automation. Pixel reports are withheld until a GUI reported cell metrics; OSC 52 strings over the cap are discarded before decoding; OSC 8 targets are bounded (64 KiB per snapshot) |
 | Ligatures, icons, emojis | Advanced shaping, cell anchoring, fallback, raster cache | UI unit tests verify substitutions and grid alignment; native Mac screenshot verified `->`, `!=`, `===`, accents, CJK, rocket emoji and Nerd Font icon |
 | Crow agent status (owner request) | Footer status line + toggleable agent panel from `crow-skills events snapshot --json`; focused-pane cwd via `PaneCwd` IPC, git branch from `.git/HEAD` | `src/crow.rs` parsing/format/throttle unit tests, `src/engine.rs` cwd test; versioned, tolerant parser; read-only, no prompt content |
 | Lightweight / fast | Native software renderer, no WebView; dirty row/glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented, **no claim of maximum performance or comparative superiority**; GPU rendering remains follow-up |
@@ -80,9 +82,19 @@ wire-size observations, not rendering/latency benchmarks.
 
 - Full manual Windows/WSL and Linux/Wayland/X11 journeys, including GPU/driver,
   international input, IME, complex emoji ZWJ clusters and accessibility.
-- Every Vim/LazyVim plugin, terminal protocol or keyboard extension. Kitty
-  keyboard, graphics protocols, sixel and tmux control-mode integration are not
-  advertised as implemented.
+- Every Vim/LazyVim plugin, terminal protocol or keyboard extension. Graphics
+  protocols, sixel and tmux control-mode integration are not advertised as
+  implemented. The kitty keyboard protocol (flags 1/2/4/8/16, push/pop/query/set)
+  and xterm modifyOtherKeys are implemented (`src/keyboard.rs`,
+  `src/intercept.rs`) with reference-table unit tests and real-Neovim decoding in
+  `tests/nvim_e2e.py`; caps/num-lock modifier bits are not reported (winit does
+  not expose lock state), Super/Command chords stay GUI shortcuts, Shift+Space
+  is a plain space unless the application requests flag 8 (kitty semantics), and
+  the encoder is exercised end-to-end through the hidden `debug-encode-key`
+  command, not through synthetic native key events. A bound of 256 kitty pushes
+  per screen guards an upstream panic in alacritty_terminal 0.26; a query that
+  the engine answers itself inside a synchronized-output block (DEC 2026)
+  commits the pending block first, so answers keep stream order.
 - Semantic screen-reader grid accessibility, GUI session switcher, draggable
   split ratios, search UI, crash/reboot layout restore and process persistence
   beyond daemon lifetime.
@@ -116,8 +128,11 @@ patterns before publication; this does not claim a formal full dependency audit.
 notices are cached from immutable official upstream revisions. Two upstream
 source trees omit original license files; their MIT declarations and a labelled
 standard template are explicitly distinguished from original copyright notices.
-OSC52 clipboard access from terminal output is disabled; explicit user clipboard
-shortcuts remain enabled. Nonexistent/unknown config fields fail explicitly.
+OSC 52 from terminal output is copy-only by owner decision (2026-10-28): writes
+are accepted by default (`[terminal] osc52 = "copy"`, opt out with `"off"`),
+capped at 1 MiB, delivered to attached GUIs on demand, and advertised (XTGETTCAP
+`Ms`) only when enabled; clipboard read queries are never answered. Explicit
+user clipboard shortcuts remain enabled. Nonexistent/unknown config fields fail explicitly.
 
 Network: official documentation/crate/upstream sources and the authorized GitHub
 repo/CI. External writes: coordination ledger and memory records; disposable

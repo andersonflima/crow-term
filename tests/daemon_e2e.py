@@ -15,7 +15,24 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("CROW_TERM_BIN", ROOT / "target/debug" / ("crow-term.exe" if os.name == "nt" else "crow-term")))
 
 
-class DaemonTests(unittest.TestCase):
+def neovim_binary(test):
+    """CROW_TERM_NVIM selects a pinned binary; CROW_TERM_REQUIRE_NVIM turns a skip into a failure."""
+    required = os.environ.get("CROW_TERM_REQUIRE_NVIM")
+    nvim = os.environ.get("CROW_TERM_NVIM") or (None if required else shutil.which("nvim"))
+    if not nvim:
+        if required:
+            test.fail("CROW_TERM_REQUIRE_NVIM is set but CROW_TERM_NVIM names no binary")
+        test.skipTest("nvim not installed")
+    expected = os.environ.get("CROW_TERM_NVIM_VERSION")
+    if expected:
+        version = subprocess.run([nvim, "--version"], capture_output=True, text=True, timeout=20).stdout.splitlines()[0]
+        test.assertEqual(version, f"NVIM v{expected}", "pinned Neovim version mismatch")
+    return nvim
+
+
+class DaemonHarness(unittest.TestCase):
+    """Isolated runtime + daemon per test. Holds no tests itself, so other
+    E2E modules can reuse it without re-running this module's tests."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="crow-e2e-")
         self.addCleanup(self.temp.cleanup)
@@ -25,9 +42,13 @@ class DaemonTests(unittest.TestCase):
         self.shell = "powershell.exe" if os.name == "nt" else "/bin/sh"
         self.log = (self.runtime / "test-daemon.log").open("w+")
         self.addCleanup(self.log.close)
-        self.daemon = subprocess.Popen([str(BIN), "daemon"], env=self.env, stdout=self.log, stderr=self.log)
+        self.daemon = subprocess.Popen([str(BIN), *self.daemon_args(), "daemon"], env=self.env, stdout=self.log, stderr=self.log)
         self.addCleanup(self.stop)
         self.eventually(lambda: self.command("list-sessions"), timeout=8)
+
+    def daemon_args(self):
+        """Extra global CLI arguments for the daemon (e.g. --config)."""
+        return []
 
     def stop(self):
         if self.daemon.poll() is None:
@@ -74,6 +95,8 @@ class DaemonTests(unittest.TestCase):
     def send(self, pane, text):
         self.command("send-keys", pane, text, "--enter")
 
+
+class DaemonTests(DaemonHarness):
     def test_session_window_split_reattach_resize_and_isolation(self):
         first = self.rpc("new-session", "alpha")["Created"]
         self.assertEqual(self.rpc("new-session", "alpha")["Created"], first)
@@ -139,21 +162,32 @@ class DaemonTests(unittest.TestCase):
         self.assertTrue(any(c["fg"] == {"Rgb": [1, 2, 3]} for row in screen["cells"] for c in row))
         self.assertTrue(any(c["wide_spacer"] for row in screen["cells"] for c in row))
         self.assertIn("界", self.capture(pane))
+        self.send(pane, "printf '\\033[4:3;58:2::1:2:3mCROW_CURL\\033[0m\\n'")
+        self.eventually(lambda: self.output_line(pane, "CROW_CURL"))
+        cells = [c for row in self.rpc("capture-pane", pane, "--json")["cells"] for c in row]
+        curly = [c for c in cells if c["underline_style"] == "Curly"]
+        self.assertEqual("".join(c["text"] for c in curly), "CROW_CURL")
+        self.assertTrue(all(c["underline_color"] == {"Rgb": [1, 2, 3]} and c["underline"] for c in curly))
         self.command("kill-session", "pid")
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
     @unittest.skipIf(os.name == "nt", "Neovim POSIX PTY fixture")
     def test_neovim_alternate_screen_input_and_clean_exit(self):
-        nvim = shutil.which("nvim")
-        if not nvim:
-            self.skipTest("nvim not installed")
+        nvim = neovim_binary(self)
         import shlex
         pane = self.rpc("new-session", "nvim")["Created"]["pane"]
         self.send(pane, shlex.quote(nvim) + " --clean -n -i NONE")
         self.eventually(lambda: self.rpc("capture-pane", pane, "--json")["modes"]["bracketed_paste"])
-        self.command("send-keys", pane, "iCrow terminal é 界 -> != 🚀\x1b")
+        self.command("send-keys", pane, "iCrow terminal é 界 -> != 🚀")
         self.eventually(lambda: "Crow terminal" in self.capture(pane))
+        # Escape as the GUI encodes it for the keyboard mode Neovim enabled: a
+        # raw ESC followed by ":" is ambiguous (Alt+:) under the kitty protocol.
+        flags = self.rpc("capture-pane", pane, "--json")["modes"].get("keyboard", 0)
+        escape = subprocess.run([str(BIN), "debug-encode-key", "Escape", "--flags", str(flags)],
+                                capture_output=True, check=True, timeout=10).stdout.decode()
+        self.command("send-keys", pane, escape)
+        self.eventually(lambda: self.rpc("capture-pane", pane, "--json")["cursor"]["shape"] == "block")
         self.command("send-keys", pane, ":qa!\r")
         self.eventually(lambda: not self.rpc("capture-pane", pane, "--json")["modes"]["bracketed_paste"])
         self.send(pane, "echo CROW_NVIM_EXIT_OK")
@@ -180,6 +214,17 @@ class DaemonTests(unittest.TestCase):
         self.command("send-keys", pane, "\x14d")
         self.send(pane, "echo CROW_TMUX_DETACHED")
         self.eventually(lambda: self.output_line(pane,"CROW_TMUX_DETACHED"))
+
+
+class DebugEncodeKeyTests(unittest.TestCase):
+    def test_key_encoding_aid_never_starts_a_daemon(self):
+        with tempfile.TemporaryDirectory(prefix="crow-e2e-") as temp:
+            runtime = Path(temp) / "runtime"
+            env = dict(os.environ, CROW_TERM_RUNTIME_DIR=str(runtime))
+            result = subprocess.run([str(BIN), "debug-encode-key", "/", "--mod", "ctrl", "--flags", "1"],
+                                    env=env, capture_output=True, timeout=10)
+            self.assertEqual(result.stdout, b"\x1b[47;5u", result.stderr)
+            self.assertFalse(runtime.exists() and any(runtime.iterdir()), "a daemon runtime was created")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,13 @@ use std::{
 };
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Internal wire-format generation. It names the socket/pipe, so a GUI or CLI
+/// never decodes frames of a daemon built from another model revision: a newer
+/// client starts its own daemon and older sessions keep their own.
+/// v3: kitty keyboard flags and modifyOtherKeys level in `Modes`.
+/// v4: underline style and underline color in `Cell`.
+/// v5: cell pixel metrics on resize, bell count, hyperlinks, alternate scroll.
+pub const WIRE_VERSION: u32 = 5;
 const DEADLINE: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
@@ -38,7 +45,7 @@ fn windows_pipe_basename() -> Result<String> {
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     runtime_dir()?.hash(&mut hash);
-    Ok(format!("crow-term-v2-{:x}", hash.finish()))
+    Ok(format!("crow-term-v{WIRE_VERSION}-{:x}", hash.finish()))
 }
 
 /// The Windows PIPE_NOWAIT transport can report a successful zero-byte read
@@ -140,10 +147,15 @@ pub fn runtime_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(unix)]
+fn socket_file() -> String {
+    format!("daemon-v{WIRE_VERSION}.sock")
+}
+
 fn socket_name() -> Result<interprocess::local_socket::Name<'static>> {
     #[cfg(unix)]
     {
-        let path = runtime_dir()?.join("daemon-v2.sock");
+        let path = runtime_dir()?.join(socket_file());
         if path.as_os_str().len() > 100 {
             bail!("IPC path too long; set CROW_TERM_RUNTIME_DIR to a shorter private directory");
         }
@@ -169,7 +181,7 @@ pub fn listen() -> Result<IpcListener> {
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(
-            runtime_dir()?.join("daemon-v2.sock"),
+            runtime_dir()?.join(socket_file()),
             std::fs::Permissions::from_mode(0o600),
         )?;
     }

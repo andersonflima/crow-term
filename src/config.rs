@@ -18,8 +18,25 @@ pub struct Config {
     pub shell: Option<String>,
     pub shell_args: Vec<String>,
     pub prefix: String,
+    /// Terminal protocol options that grant applications extra access.
+    pub terminal: TerminalConfig,
     /// Crow agent status bar and panel. Last field: TOML tables follow plain values.
     pub crow: CrowConfig,
+}
+/// OSC 52 clipboard access from programs running in the terminal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Osc52Mode {
+    /// No clipboard access.
+    Off,
+    /// Programs may set the clipboard (default); reading it back is never allowed.
+    #[default]
+    Copy,
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalConfig {
+    pub osc52: Osc52Mode,
 }
 /// Read-only view of `crow-skills events snapshot --json` (crow-snapshot/1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,6 +110,7 @@ impl Default for Config {
             shell: None,
             shell_args: vec![],
             prefix: "Ctrl-t".into(),
+            terminal: TerminalConfig::default(),
             crow: CrowConfig::default(),
         }
     }
@@ -233,6 +251,20 @@ mod tests {
         c.font_size = 18.0;
         c.palette.clear();
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn osc52_defaults_to_copy_and_accepts_only_off_or_copy() {
+        assert_eq!(Config::default().terminal.osc52, Osc52Mode::Copy);
+        let off: Config = toml::from_str("[terminal]\nosc52 = \"off\"").unwrap();
+        assert_eq!(off.terminal.osc52, Osc52Mode::Off);
+        for invalid in [
+            "[terminal]\nosc52 = \"paste\"",
+            "[terminal]\nosc52 = \"Copy\"",
+            "[terminal]\nosc52 = true",
+            "[terminal]\nosc_52 = \"copy\"",
+        ] {
+            assert!(toml::from_str::<Config>(invalid).is_err(), "{invalid}");
+        }
     }
     #[test]
     fn rejects_unknown_fields() {

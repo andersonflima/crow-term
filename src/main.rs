@@ -26,6 +26,23 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Action {
+    /// Print the bytes the GUI sends for a key (test aid; not a stable interface).
+    #[command(hide = true)]
+    DebugEncodeKey {
+        /// Character or Enter/Tab/Backspace/Escape/Space/Up/Down/Left/Right/F1/F3/F5.
+        key: String,
+        /// Kitty keyboard flags the application enabled (0 = legacy).
+        #[arg(long, default_value_t = 0)]
+        flags: u8,
+        /// xterm modifyOtherKeys level.
+        #[arg(long, default_value_t = 0)]
+        modify_other_keys: u8,
+        /// shift, ctrl, alt (repeatable).
+        #[arg(long = "mod")]
+        mods: Vec<String>,
+        #[arg(long)]
+        release: bool,
+    },
     /// Open/reattach a GUI. Arguments after -- execute a program without a shell.
     Start {
         #[arg(last = true)]
@@ -262,8 +279,17 @@ fn main() -> Result<()> {
                     "not connected"
                 }
             );
+            println!("renderer: native software framebuffer; OpenType shaping; no WebView");
             println!(
-                "renderer: native software framebuffer; OpenType shaping; no WebView; OSC52 disabled"
+                "osc52: {} (terminal output may {}; reading the clipboard is never allowed)",
+                match config.terminal.osc52 {
+                    crow_term::config::Osc52Mode::Copy => "copy",
+                    crow_term::config::Osc52Mode::Off => "off",
+                },
+                match config.terminal.osc52 {
+                    crow_term::config::Osc52Mode::Copy => "set the clipboard",
+                    crow_term::config::Osc52Mode::Off => "not access the clipboard",
+                }
             );
             return Ok(());
         }
@@ -290,6 +316,35 @@ fn main() -> Result<()> {
             return print_response(ipc::rpc(&Request::Shutdown { force: *force })?);
         }
         _ => {}
+    }
+    // Pure key encoding (test aid): never needs or starts the daemon.
+    if let Some(Action::DebugEncodeKey {
+        key,
+        flags,
+        modify_other_keys,
+        mods,
+        release,
+    }) = &cli.command
+    {
+        use std::io::Write;
+        use winit::keyboard::ModifiersState;
+        let mut state = ModifiersState::empty();
+        for name in mods {
+            state |= match name.as_str() {
+                "shift" => ModifiersState::SHIFT,
+                "ctrl" => ModifiersState::CONTROL,
+                "alt" => ModifiersState::ALT,
+                other => bail!("unknown modifier {other}"),
+            };
+        }
+        let modes = Modes {
+            keyboard: *flags,
+            modify_other_keys: *modify_other_keys,
+            ..Modes::default()
+        };
+        let bytes = ui::encode_named_key(key, state, *release, &modes);
+        std::io::stdout().write_all(&bytes)?;
+        return Ok(());
     }
     ensure_daemon(cli.config.as_ref())?;
     match cli.command.as_ref() {
@@ -337,6 +392,7 @@ fn main() -> Result<()> {
                     rows: *rows,
                     cols: *cols,
                 },
+                cell: None,
             })?)
         }
         Some(Action::ClosePane { pane, window }) => {

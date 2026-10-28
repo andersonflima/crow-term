@@ -1,0 +1,16 @@
+# Regular expressions for :checkhealth ERROR lines accepted in the offline,
+# Mason-free CI setup. Anything else fails tests/lazyvim_e2e.py.
+# snacks.image: optional external tools are not installed in CI.
+None of the tools found: 'kitty', 'wezterm', 'ghostty'
+None of the tools found: 'tectonic', 'pdflatex'
+Tool not found: 'mmdc'
+# snacks.image: Crow Term does not implement the kitty graphics protocol.
+your terminal does not support the kitty graphics protocol
+# nvim-treesitter is disabled in CI (no tree-sitter CLI); bundled parsers are used.
+`tree-sitter \(CLI\)` is not installed
+# snacks.lazygit: lazygit is not installed in CI.
+\{lazygit\} not installed
+# snacks.image: ImageMagick and Ghostscript are not installed on the Linux runner.
+None of the tools found: 'magick', 'convert'
+Tool not found: 'gs'
+`magick` is required to convert images

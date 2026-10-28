@@ -162,6 +162,22 @@ automatically. Config changes for newly created PTYs require restarting the
 daemon after safely closing/detaching existing sessions; do not use `stop --force`
 to reload if you want to keep those processes.
 
+### Clipboard from programs (OSC 52)
+
+Programs in the terminal (Neovim, tmux, remote shells over SSH) may **copy** to
+the system clipboard with OSC 52. This is on by default because editors rely on
+it to yank across SSH. Reading the clipboard back is never allowed, in any mode,
+and a single copy is capped at 1 MiB. The trade-off: any program whose output
+reaches the terminal (including `cat` of an untrusted file) can replace your
+clipboard contents, though it cannot read them. To turn it off:
+
+```toml
+[terminal]
+osc52 = "off"   # "copy" (default) or "off"; any other value is rejected
+```
+
+The capability is advertised to applications (XTGETTCAP `Ms`) only in `copy` mode.
+
 [Isolated shell setup](docs/shell-integration.md) supplies Fisher + `z`, and zsh
 autosuggestions + syntax-highlighting from pinned, licensed, vendored sources:
 
@@ -184,6 +200,11 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 python3 tests/shell_setup.py
 python3 tests/daemon_e2e.py
+python3 tests/protocol_probe.py
+python3 tests/nvim_e2e.py   # optional: CROW_TERM_NVIM=/path/to/nvim (>= 0.11)
+# LazyVim (pinned): one network bootstrap, then offline tests
+python3 tests/lazyvim_bootstrap.py --home /tmp/crow-lazyvim
+CROW_LAZYVIM_HOME=/tmp/crow-lazyvim python3 tests/lazyvim_e2e.py
 ```
 
 The E2E suite uses an isolated daemon/runtime and real PTYs. Available Neovim and
