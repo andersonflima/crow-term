@@ -1,0 +1,1 @@
+-- From LazyVim/starter@803bc181d7c0 (Apache-2.0): intentionally empty.

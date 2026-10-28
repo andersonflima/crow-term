@@ -42,9 +42,13 @@ class DaemonHarness(unittest.TestCase):
         self.shell = "powershell.exe" if os.name == "nt" else "/bin/sh"
         self.log = (self.runtime / "test-daemon.log").open("w+")
         self.addCleanup(self.log.close)
-        self.daemon = subprocess.Popen([str(BIN), "daemon"], env=self.env, stdout=self.log, stderr=self.log)
+        self.daemon = subprocess.Popen([str(BIN), *self.daemon_args(), "daemon"], env=self.env, stdout=self.log, stderr=self.log)
         self.addCleanup(self.stop)
         self.eventually(lambda: self.command("list-sessions"), timeout=8)
+
+    def daemon_args(self):
+        """Extra global CLI arguments for the daemon (e.g. --config)."""
+        return []
 
     def stop(self):
         if self.daemon.poll() is None:

@@ -5,6 +5,7 @@ Each chord is encoded by the GUI encoder itself (hidden `debug-encode-key`
 command) for the keyboard flags Neovim negotiated, sent to the pane, and the
 real editor must decode it as the intended key.
 """
+import json
 import os
 from pathlib import Path
 import shlex
@@ -61,7 +62,6 @@ class NeovimKeyboardTests(daemon_e2e.DaemonHarness):
         super().setUp()
 
     def start_nvim(self, init):
-        import json
         script = self.runtime / "init.lua"
         script.write_text(init)
         keymap = {name: lhs for name, (_, _, lhs) in CHORDS.items()}
@@ -96,6 +96,55 @@ class NeovimKeyboardTests(daemon_e2e.DaemonHarness):
         # Leaving Neovim pops its keyboard mode: the shell gets legacy keys again.
         self.command("send-keys", pane, encode("Escape", [], flags) + ":qa!\r")
         self.eventually(lambda: self.modes(pane)["keyboard"] == 0, timeout=10)
+
+    def test_clean_neovim_detects_terminal_features_without_leaking_replies(self):
+        report = self.runtime / "report.json"
+        init = f"""
+vim.opt.shortmess:append('I')
+vim.api.nvim_buf_set_lines(0, 0, -1, false, {{ 'crowtypo here' }})
+vim.fn.matchadd('SpellBad', 'crowtypo')
+vim.api.nvim_create_user_command('CrowReport', function()
+  local report = {{
+    termguicolors = vim.o.termguicolors,
+    background = vim.o.background,
+  }}
+  vim.fn.writefile({{ vim.json.encode(report) }}, {json_quote(str(report))})
+end, {{}})
+"""
+        pane = self.start_nvim(init)
+        self.eventually(lambda: self.output_line(pane, "crowtypo here"), timeout=10)
+        # Detection is asynchronous (OSC 11, XTGETTCAP); give it a moment.
+        def reported():
+            self.command("send-keys", pane, ":CrowReport\r")
+            return report.exists() and json.loads(report.read_text())
+        state = self.eventually(lambda: (r := reported()) and r["background"] == "light" and r, timeout=10)
+        self.assertTrue(state["termguicolors"], state)
+        # SpellBad: undercurl with a special (underline) color, rendered by
+        # Neovim through Smulx/Setulc learned from XTGETTCAP.
+        def curly():
+            cells = [c for c in self.rpc("capture-pane", pane, "--json")["cells"][0]]
+            marked = cells[:8]
+            return all(c["underline_style"] == "Curly" for c in marked) and marked
+        marked = self.eventually(curly, timeout=10)
+        self.assertTrue(all(c["underline_color"] is not None for c in marked), marked[0])
+        self.assertNotEqual(self.rpc("capture-pane", pane, "--json")["cells"][0][9]["underline_style"], "Curly")
+        # Cursor shape follows 'guicursor': block in Normal, beam in Insert.
+        cursor = lambda: self.rpc("capture-pane", pane, "--json")["cursor"]["shape"]
+        self.eventually(lambda: cursor() == "block", timeout=5)
+        self.command("send-keys", pane, "i")
+        self.eventually(lambda: cursor() == "beam", timeout=5)
+        self.command("send-keys", pane, "\x1b:qa!\r")
+        self.eventually(lambda: self.modes(pane)["keyboard"] == 0, timeout=10)
+        self.send(pane, "echo CROW_AFTER_NVIM")
+        self.eventually(lambda: self.output_line(pane, "CROW_AFTER_NVIM"), timeout=10)
+        # No query answer may surface as text in the shell afterwards.
+        text = self.capture(pane)
+        for leaked in ("rgb:", "+r", "$r", "[?", ">|", "0u", "1u", "3u"):
+            self.assertNotIn(leaked, text.replace("echo CROW_AFTER_NVIM", ""), text)
+
+
+def json_quote(text):
+    return json.dumps(text)
 
 
 if __name__ == "__main__":
