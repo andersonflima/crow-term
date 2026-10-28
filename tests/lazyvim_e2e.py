@@ -88,7 +88,22 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
         self.send(pane, f"cd {shlex.quote(str(self.project))} && echo {BEFORE} && {command}")
         self.pane = pane
         self.flags = self.eventually(lambda: self.modes()["keyboard"], timeout=30)
+        # Runs before the daemon stops: let Neovim exit and finish writing its
+        # state into the temporary directory before that directory is removed.
+        self.addCleanup(self.quit_editor)
         return pane
+
+    def quit_editor(self):
+        try:
+            if self.modes()["keyboard"] == 0:
+                return
+            self.key("Escape")
+            self.ex("qa!")
+            self.eventually(lambda: self.modes()["keyboard"] == 0, timeout=15)
+            self.send(self.pane, "echo CROW_EDITOR_EXITED")
+            self.eventually(lambda: self.output_line(self.pane, "CROW_EDITOR_EXITED"), timeout=10)
+        except AssertionError:
+            pass
 
     def modes(self):
         return self.rpc("capture-pane", self.pane, "--json")["modes"]
