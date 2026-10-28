@@ -226,15 +226,20 @@ impl State {
                 bg,
                 bold: cell.flags.contains(Flags::BOLD),
                 italic: cell.flags.contains(Flags::ITALIC),
-                underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
-                strike: cell.flags.contains(Flags::STRIKEOUT),
+                underline: !hidden && cell.flags.intersects(Flags::ALL_UNDERLINES),
+                strike: !hidden && cell.flags.contains(Flags::STRIKEOUT),
                 wide_spacer: cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
-                underline_style: underline_style(cell.flags),
+                // Concealed text (SGR 8) shows neither glyph nor decoration.
+                underline_style: if hidden {
+                    UnderlineStyle::None
+                } else {
+                    underline_style(cell.flags)
+                },
                 underline_color: cell
                     .underline_color()
-                    .filter(|_| cell.flags.intersects(Flags::ALL_UNDERLINES))
+                    .filter(|_| !hidden && cell.flags.intersects(Flags::ALL_UNDERLINES))
                     .map(|color| convert_color(color, content.colors, &self.default_colors)),
             });
             if row.len() == self.size.cols as usize {
@@ -1023,6 +1028,14 @@ mod tests {
         // SGR 59 resets the color; a color without an underline is not reported.
         assert_eq!(cells[4].underline_color, None);
         assert_eq!(cells[6].underline_color, None);
+        let hidden = vt(Size { rows: 1, cols: 4 }, 0, b"\x1b[8;9;4:3;58:5:9ma");
+        let cell = &hidden.cells[0][0];
+        assert_eq!(cell.text, " ");
+        assert!(!cell.underline && !cell.strike);
+        assert_eq!(
+            (cell.underline_style, cell.underline_color),
+            (UnderlineStyle::None, None)
+        );
     }
     fn replies(state: &mut State) -> Vec<String> {
         let (writer, writes) = mpsc::sync_channel(64);

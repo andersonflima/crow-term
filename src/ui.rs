@@ -535,14 +535,7 @@ impl Renderer {
                     let start = height / 2 * width + col * cell_width;
                     pixels[start..start + cell_width].fill(color);
                 }
-                let style = match cell.underline_style {
-                    // Snapshots from producers that only set the boolean.
-                    UnderlineStyle::None if cell.underline => UnderlineStyle::Single,
-                    style => style,
-                };
-                let color = cell
-                    .underline_color
-                    .map_or(color, |spec| resolve_color(config, spec));
+                let (style, color) = underline_paint(config, cell);
                 draw_underline(
                     &mut pixels,
                     width,
@@ -614,6 +607,17 @@ impl Renderer {
     }
 }
 
+/// Underline style and color of a cell: SGR 58 color if set, else the
+/// foreground; snapshots that only set the boolean draw a single line.
+fn underline_paint(config: &Config, cell: &Cell) -> (UnderlineStyle, u32) {
+    let style = match cell.underline_style {
+        UnderlineStyle::None if cell.underline => UnderlineStyle::Single,
+        style => style,
+    };
+    let color = resolve_color(config, cell.underline_color.unwrap_or(cell.fg));
+    (style, color)
+}
+
 /// Rasterize one cell's underline into a row buffer. Pure and bounds-checked,
 /// so a later GPU renderer can share the geometry. Positions use row-absolute
 /// x, which keeps curly and dashed patterns continuous across cells.
@@ -661,7 +665,7 @@ fn draw_underline(
                 }
             }
             UnderlineStyle::Curly => {
-                let amplitude = (height / 8).clamp(1, 4) as f32;
+                let amplitude = (height / 8).clamp(1, 12) as f32;
                 let period = (columns.len().max(4)) as f32;
                 let phase = (x as f32 / period) * std::f32::consts::TAU;
                 let offset = (amplitude * (1.0 - phase.cos()) / 2.0).round() as usize;
@@ -2786,6 +2790,35 @@ mod tests {
         let mut tiny = vec![0u32; 4];
         draw_underline(&mut tiny, 4, 1, 0..100, UnderlineStyle::Curly, 1);
         draw_underline(&mut tiny, 2, 2, 0..100, UnderlineStyle::Double, 1);
+    }
+    #[test]
+    fn row_raster_uses_the_cell_underline_style_and_color() {
+        let config = Config::default();
+        let mut curly = cell("x");
+        curly.underline = true;
+        curly.underline_style = UnderlineStyle::Curly;
+        curly.underline_color = Some(ColorSpec::Rgb(255, 0, 0));
+        assert_eq!(
+            underline_paint(&config, &curly),
+            (UnderlineStyle::Curly, 0xff0000)
+        );
+        let mut legacy = cell("x");
+        legacy.underline = true;
+        legacy.fg = ColorSpec::Rgb(0, 0, 255);
+        assert_eq!(
+            underline_paint(&config, &legacy),
+            (UnderlineStyle::Single, 0x0000ff)
+        );
+        // Through the real row rasterizer: red pixels only below the glyph area,
+        // on more than one scanline (a curl, not a straight line).
+        let mut renderer = Renderer::new(&config, 1.0);
+        let row = renderer.row(&config, 1, 0, &[curly]);
+        let height = row.pixels.len() / row.width;
+        let red: Vec<usize> = (0..height)
+            .filter(|y| row.pixels[y * row.width..(y + 1) * row.width].contains(&0xff0000))
+            .collect();
+        assert!(red.len() >= 2, "{red:?}");
+        assert!(red.iter().all(|&y| y >= height * 2 / 3), "{red:?}");
     }
     #[test]
     fn key_routing_follows_the_application_keyboard_mode() {
