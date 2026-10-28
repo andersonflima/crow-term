@@ -759,9 +759,10 @@ fn kill_unix_session(raw_shell: u32, foreground: Option<rustix::process::Pid>) -
         }
         if let Err(error) = kill_process_group(group, Signal::KILL)
             && error != rustix::io::Errno::SRCH
-            // macOS answers EPERM for a group whose members already exited and
-            // await reaping (seen on close-pane right after the members above
-            // were killed): nothing is left to signal, so that is success.
+            // Defensive: EPERM for a group in which nothing is left alive (all
+            // members exited, awaiting reaping) means there is nothing to
+            // signal. The reproduced macOS failure was the duplicate signal
+            // removed above; this path has not been observed since.
             && !(error == rustix::io::Errno::PERM && !session_has_live_member(&mut system, raw_shell))
         {
             return Err(error).context("terminate terminal process group");
@@ -1586,21 +1587,27 @@ mod tests {
     fn kill_succeeds_while_the_session_is_exiting() {
         // Regression: close-pane failed on macOS with "terminate terminal
         // process group: Operation not permitted" when the group was already
-        // exiting. Under load (8 concurrent closers, shells that exit on their
-        // own or keep running) the unfixed code failed about 1 in 200 kills.
-        let workers: Vec<_> = (0..8)
+        // exiting. Probabilistic: under this load (4 concurrent closers, shells
+        // that exit on their own or keep running) the unfixed code failed about
+        // 1 kill in 2,400, i.e. in roughly one run of five on an M3 macOS.
+        // PTYs are opened one at a time: concurrent openpty calls fail
+        // intermittently (os error -6) and are not what this test is about.
+        static OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let workers: Vec<_> = (0..4)
             .map(|worker| {
                 std::thread::spawn(move || {
                     let mut errors = Vec::new();
-                    for round in 0..60 {
+                    for round in 0..120 {
                         let body = if round % 2 == 0 { "exit 0" } else { "sleep 5" };
                         let shell = ShellSpec {
                             program: "/bin/sh".into(),
                             args: vec!["-c".into(), body.into()],
                             cwd: None,
                         };
-                        let engine =
-                            Engine::new(&shell, Size::default(), 0, Arc::new(|| {})).unwrap();
+                        let engine = {
+                            let _open = OPEN.lock().unwrap_or_else(|error| error.into_inner());
+                            Engine::new(&shell, Size::default(), 0, Arc::new(|| {})).unwrap()
+                        };
                         if round % 3 == 0 {
                             std::thread::sleep(Duration::from_millis((round % 7) as u64));
                         }
