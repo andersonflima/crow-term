@@ -539,6 +539,51 @@ def j9_reattach(ctx):
     return f"{how} (exit {code}); reattached GUI renders the unsaved line from the same Neovim", [ctx.save_frame("j9-reattached", frame)]
 
 
+class frozen:
+    """Freeze a process for the duration of a `with` block: SIGSTOP/SIGCONT
+    on Unix, NtSuspendProcess/NtResumeProcess on Windows."""
+
+    def __init__(self, pid):
+        self.pid = pid
+        self.handle = None
+
+    def __enter__(self):
+        if os.name == "nt":
+            import ctypes
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            self.handle = kernel32.OpenProcess(0x0800, False, self.pid)  # PROCESS_SUSPEND_RESUME
+            if not self.handle:
+                raise AssertionError(f"OpenProcess({self.pid}) failed: {ctypes.get_last_error()}")
+            status = ctypes.WinDLL("ntdll").NtSuspendProcess(ctypes.c_void_p(self.handle))
+            if status != 0:
+                raise AssertionError(f"NtSuspendProcess failed: {status:#x}")
+        else:
+            import signal
+            os.kill(self.pid, signal.SIGSTOP)
+        return self
+
+    def __exit__(self, *exc):
+        if os.name == "nt":
+            import ctypes
+            ctypes.WinDLL("ntdll").NtResumeProcess(ctypes.c_void_p(self.handle))
+            ctypes.WinDLL("kernel32").CloseHandle(ctypes.c_void_p(self.handle))
+        else:
+            import signal
+            os.kill(self.pid, signal.SIGCONT)
+        return False
+
+
+def daemon_pid(ctx):
+    """The daemon serving the run (the harness's own until J12 replaces it)."""
+    return ctx.run.daemon.pid
+
+
+# Status texts that mean a command failed (a pane closed on purpose, a busy or
+# frozen daemon are never one).
+COMMAND_FAILURE_WORDS = ("mux command", "timed out", "pane not found", "has exited", "pty writer stopped")
+
+
 def quiet_screen(ctx, pane, seconds=1.0, timeout=60):
     """Wait until the pane shows something and stops changing (shell ready)."""
     state = {"screen": None, "since": time.monotonic()}
@@ -563,14 +608,22 @@ def j15_stuck_pane(ctx):
     # Pane A runs a program that never reads its input.
     ctx.run.send_keys(pane_a, ("Start-Sleep 600" if os.name == "nt" else "stty raw -echo; sleep 600") + "\r")
     time.sleep(1)
-    ctx.driver.set_clipboard("x" * (600 * 1024))
+    # Windows: ConPTY keeps reading console input into its own buffer while
+    # the program does not, so a larger paste is needed to reach back-pressure.
+    size = (8 if os.name == "nt" else 0.6) * 1024 * 1024
+    ctx.driver.set_clipboard("x" * int(size))
     ctx.driver.key(gui, ctx.driver.paste_chord)
-    if os.name == "nt":
-        # ConPTY buffers console input itself: the paste may never back up.
-        stuck = gui.wait_frame(what="frame after the paste")
-    else:
-        stuck = gui.wait_frame(lambda m, i: m.get("stuck_pane") == pane_a, timeout=20,
+    try:
+        stuck = gui.wait_frame(lambda m, i: m.get("stuck_pane") == pane_a, timeout=30,
                                what="footer note that pane A is not reading its input")
+    except AssertionError:
+        if os.name != "nt":
+            raise
+        # Evidence for the report: ConPTY took the whole paste without ever
+        # pushing back, so there is nothing for the GUI to detect.
+        stuck = gui.wait_frame(what="frame after the paste")
+        ctx.degrade(f"ConPTY accepted a {size / 1048576:.0f} MiB paste into a program that never reads "
+                    "without back-pressure: no stuck pane to detect")
     # Typing elsewhere and splitting still work while A is stuck.
     ctx.driver.key(gui, "ctrl+t")
     ctx.driver.type(gui, "%")
@@ -591,6 +644,11 @@ def j15_stuck_pane(ctx):
     eventually(lambda: panes_of(ctx.run.session("lanes")["windows"][0]["layout"]) == [pane_b], 15,
                what="closing the stuck pane")
     frame = gui.wait_frame(lambda m, i: m.get("stuck_pane") is None, what="stuck note cleared")
+    # A pane closed on purpose drops its pending paste quietly.
+    time.sleep(1)
+    status = gui.frame()[1]["status"]
+    if any(word in status.lower() for word in COMMAND_FAILURE_WORDS):
+        raise AssertionError(f"closing the stuck pane showed an error: {status!r}")
     gui.kill()
     return (f"pane {pane_a} not reading (note shown: {stuck[1]['stuck_pane']}); split, typing in pane {pane_b} "
             f"and closing pane {pane_a} all worked"), [ctx.save_frame("j15-after-close", frame)]
@@ -599,14 +657,10 @@ def j15_stuck_pane(ctx):
 @journey("J16", "closing the window with the daemon frozen finishes in under 2 s")
 def j16_exit_frozen(ctx):
     ctx.need("close")
-    if os.name == "nt":
-        raise Skip("the daemon cannot be frozen with SIGSTOP on Windows")
-    import signal
     gui = ctx.run.launch("exit", name="exit")
     gui.wait_frame(lambda m, i: m["revision"] > 0, what="exit frame")
     ctx.driver.attach(gui)
-    os.kill(ctx.run.daemon.pid, signal.SIGSTOP)
-    try:
+    with frozen(daemon_pid(ctx)):
         if "keys" in ctx.driver.caps:
             ctx.driver.type(gui, "typed while frozen")
         time.sleep(1)
@@ -614,8 +668,6 @@ def j16_exit_frozen(ctx):
         ctx.driver.close(gui)
         code = gui.wait_exit(timeout=15)
         elapsed = time.monotonic() - started
-    finally:
-        os.kill(ctx.run.daemon.pid, signal.SIGCONT)
     if elapsed >= 2.0:
         raise AssertionError(f"window took {elapsed:.2f} s to close with the daemon frozen")
     return f"closed in {elapsed:.2f} s (exit {code}) with the daemon stopped", []
@@ -632,6 +684,75 @@ def link_gui(ctx):
 
 
 LINK_FAILURE_WORDS = ("disconnect", "stopped", "could not")
+
+
+def flood(ctx, held):
+    """Fill the daemon's accept queue (Unix): connections nobody accepts while
+    it is frozen, kept open afterwards as idle clients."""
+    if os.name == "nt":
+        return "no flood (named pipes have no accept backlog)"
+    import socket
+    path = next(ctx.run.runtime.glob("daemon-v*.sock"))
+    refused = False
+    for _ in range(2048):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.setblocking(False)
+        try:
+            client.connect(str(path))
+        except BlockingIOError:
+            pass
+        except OSError:
+            client.close()
+            refused = True
+            break
+        held.append(client)
+    return f"{len(held)} connections queued{' until refused' if refused else ''}"
+
+
+@journey("J17", "typing into a daemon whose accept backlog is full arrives in order, with no error")
+def j17_backlog(ctx):
+    ctx.need("keys")
+    gui = ctx.run.launch("backlog", name="backlog")
+    pane = eventually(lambda: first_pane(ctx, "backlog"), 15, what="backlog session")
+    gui.wait_frame(lambda m, i: m["revision"] > 0, what="backlog frame")
+    ctx.driver.attach(gui)
+    quiet_screen(ctx, pane)
+    held, statuses = [], []
+
+    def watch(seconds):
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            current = gui.frame()
+            if current and (not statuses or statuses[-1] != current[1]["status"]):
+                statuses.append(current[1]["status"])
+            time.sleep(0.1)
+    try:
+        with frozen(daemon_pid(ctx)):
+            how = flood(ctx, held)
+            ctx.driver.type(gui, "echo BACKLOG_0123456789")
+            ctx.driver.key(gui, "Return")
+            watch(3)
+        # The queued clients now hold connections open without a request:
+        # they must not starve the GUI's next connects.
+        ctx.driver.type(gui, "echo AFTER_0123456789")
+        ctx.driver.key(gui, "Return")
+        lines = lambda: [l.strip() for l in ctx.run.capture(pane).splitlines()]
+        eventually(lambda: "AFTER_0123456789" in lines(), 30, what="typing while idle clients hold connections")
+        watch(1)
+    finally:
+        for client in held:
+            client.close()
+    output = lines()
+    counts = (output.count("BACKLOG_0123456789"), output.count("AFTER_0123456789"))
+    if counts != (1, 1) or output.index("BACKLOG_0123456789") > output.index("AFTER_0123456789"):
+        raise AssertionError(f"typed lines out of order or not exactly once: {counts} in {output}")
+    bad = [s for s in statuses if any(word in s.lower() for word in COMMAND_FAILURE_WORDS)]
+    if bad:
+        raise AssertionError(f"a busy daemon was reported as an error: {bad}")
+    frame = gui.wait_frame(what="frame after the backlog")
+    gui.kill()
+    return (f"{how}; both lines arrived once, in order; statuses {[s for s in statuses if s] or ['(none)']}"), \
+        [ctx.save_frame("j17-backlog", frame)]
 
 
 @journey("J11", "a daemon that keeps stalling is waited for, never reported as disconnected")
@@ -674,16 +795,12 @@ def j11_stall(ctx):
 @journey("J14", "keys typed while the daemon is frozen for 7 s arrive once, with no timeout shown")
 def j14_frozen_daemon(ctx):
     ctx.need("keys")
-    if os.name == "nt":
-        raise Skip("the daemon cannot be frozen with SIGSTOP on Windows")
-    import signal
     gui, session, pane = link_gui(ctx)
     if ctx.nvim_gui is not gui:
         raise Skip("needs the Neovim GUI from the earlier journeys")
     normal_mode(ctx, gui)
     statuses = []
-    os.kill(ctx.run.daemon.pid, signal.SIGSTOP)
-    try:
+    with frozen(daemon_pid(ctx)):
         ctx.driver.type(gui, "ofrozen daemon typed")
         ctx.driver.key(gui, "Escape")
         until = time.monotonic() + 7
@@ -692,13 +809,11 @@ def j14_frozen_daemon(ctx):
             if current and (not statuses or statuses[-1] != current[1]["status"]):
                 statuses.append(current[1]["status"])
             time.sleep(0.1)
-    finally:
-        os.kill(ctx.run.daemon.pid, signal.SIGCONT)
     eventually(lambda: "frozen daemon typed" in ctx.run.capture(pane), 20, what="text typed during the freeze")
     count = ctx.run.capture(pane).count("frozen daemon typed")
     frame = gui.wait_frame(lambda m, i: "frozen daemon typed" not in m["status"], what="frame after the freeze")
     statuses.append(frame[1]["status"])
-    bad = [s for s in statuses if any(word in s.lower() for word in ("timed out", "mux command", "disconnect", "stopped"))]
+    bad = [s for s in statuses if any(word in s.lower() for word in COMMAND_FAILURE_WORDS + ("disconnect", "stopped"))]
     if bad or count != 1:
         raise AssertionError(f"statuses {statuses}; text appears {count} time(s)")
     return f"7 s freeze: text arrived once; statuses {[s for s in statuses if s] or ['(none)']}", [ctx.save_frame("j14-after-freeze", frame)]
@@ -714,8 +829,22 @@ def j12_restart(ctx):
     if not gui.alive():
         raise AssertionError("GUI exited after the daemon died")
     sessions = [s["name"] for s in ctx.run.sessions()]
-    return (f"daemon killed; GUI restarted it and reattached to a new pane {frame[1]['pane']} "
-            f"(sessions {sessions}); status: {frame[1]['status']!r}"), [ctx.save_frame("j12-restarted", frame)]
+    new_pane = frame[1]["pane"]
+    typed = "not typed (driver without keys)"
+    if "keys" in ctx.driver.caps:
+        # Typing goes to the new daemon's pane, never lost or sent to the old ids.
+        quiet_screen(ctx, new_pane)
+        ctx.driver.type(gui, "echo REATTACHED_TYPING")
+        ctx.driver.key(gui, "Return")
+        eventually(lambda: any(l.strip() == "REATTACHED_TYPING" for l in ctx.run.capture(new_pane).splitlines()),
+                   20, what="text typed after the reattach in the new pane")
+        typed = "typing after it reached the new pane"
+        frame = gui.wait_frame(what="frame after typing")
+        status = frame[1]["status"]
+        if any(word in status.lower() for word in COMMAND_FAILURE_WORDS):
+            raise AssertionError(f"typing after the reattach showed an error: {status!r}")
+    return (f"daemon killed; GUI restarted it and reattached to a new pane {new_pane} "
+            f"(sessions {sessions}); {typed}; status: {frame[1]['status']!r}"), [ctx.save_frame("j12-restarted", frame)]
 
 
 @journey("J13", "crow-term stop is respected: the GUI does not restart a stopped daemon")
@@ -732,7 +861,7 @@ def j13_stop(ctx):
 
 
 JOURNEYS = [j1_launch, j2_text, j3_split, j4_resize, j5_nvim_edit, j6_paste, j7_mouse, j8_focus, j10_chords, j9_reattach,
-            j15_stuck_pane, j16_exit_frozen, j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
+            j15_stuck_pane, j16_exit_frozen, j17_backlog, j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
 
 
 def summary_markdown(ctx):

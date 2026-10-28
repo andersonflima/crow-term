@@ -54,6 +54,23 @@ pub fn refused(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<Refused>())
 }
 
+/// The daemon answered that the request's pane (or the daemon instance it was
+/// made for) no longer exists: closed on purpose, its program exited, or a
+/// restarted daemon. Whatever waited for that pane is discarded quietly.
+pub fn pane_gone(error: &anyhow::Error) -> bool {
+    const GONE: [&str; 5] = [
+        "Pane not found",
+        "terminal process has exited",
+        "PTY writer stopped",
+        "Daemon instance changed",
+        "Window not found",
+    ];
+    refused(error) && {
+        let message = format!("{error:#}");
+        GONE.iter().any(|gone| message.contains(gone))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
     /// The daemon accepted the connection but the exchange did not complete

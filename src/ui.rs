@@ -146,6 +146,18 @@ pub fn run(
     let dispatcher = Arc::new(crate::lanes::Dispatcher::new(
         running.clone(),
         crate::ipc::rpc_patient,
+        |error| {
+            // Never reached a live daemon (full accept backlog, busy): the
+            // same bytes are sent again. A pane closed on purpose (or its
+            // program exited) drops what waited for it quietly.
+            if crate::link::not_sent(error) && crate::ipc::daemon_alive() {
+                crate::lanes::Outcome::Retry
+            } else if crate::link::pane_gone(error) {
+                crate::lanes::Outcome::PaneGone
+            } else {
+                crate::lanes::Outcome::Failed
+            }
+        },
         move |event| {
             let event = match event {
                 crate::lanes::Event::Reply {
@@ -1692,7 +1704,18 @@ impl App {
             .as_mut()
             .and_then(|clipboard| clipboard.get_text().ok())
         {
-            Some(text) => self.input(paste_bytes(&text, self.modes().bracketed_paste)),
+            Some(text) => {
+                self.selection = None;
+                let bytes = paste_bytes(&text, self.modes().bracketed_paste);
+                if let Err(waiting) = self.dispatcher.paste(self.pane_id, bytes) {
+                    self.status = format!(
+                        "Paste refused: pane {} is not reading its input ({} KB already waiting)",
+                        self.pane_id, waiting
+                    );
+                    self.status_expires = None;
+                    self.redraw();
+                }
+            }
             None => {
                 self.status = "Clipboard unavailable or has no text".into();
                 self.redraw();
@@ -2551,6 +2574,20 @@ impl ApplicationHandler<UiEvent> for App {
                     return;
                 }
                 self.dispatcher.set_instance(view.instance);
+                // Lanes of panes that no longer exist (closed, exited) end.
+                if view
+                    .sessions
+                    .iter()
+                    .any(|session| session.name == self.session)
+                {
+                    let live: Vec<u64> = view
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.windows)
+                        .flat_map(|window| window.layout.panes())
+                        .collect();
+                    self.dispatcher.retain(&live);
+                }
                 let revision_changed = self
                     .view
                     .as_ref()

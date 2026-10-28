@@ -50,9 +50,6 @@ fn stall_for_tests(session: &str) {
     std::thread::sleep(Duration::from_millis(ms.min(60_000)));
 }
 
-/// Concurrent client connections served; further clients wait to be accepted.
-const MAX_CLIENTS: usize = 256;
-
 /// Requests slower than this are logged to daemon.log with their cause
 /// (`CROW_TERM_SLOW_MS` overrides it; 0 logs every Watch, for measurements).
 fn slow() -> Duration {
@@ -513,17 +510,16 @@ pub fn run(config: Config) -> Result<()> {
                 if server.stopped.load(Ordering::Acquire) {
                     break;
                 }
-                // At capacity, wait for a slot instead of dropping the client
-                // (a dropped request looks like a broken link to the GUI).
-                while active.load(Ordering::Acquire) >= MAX_CLIENTS
-                    && !server.stopped.load(Ordering::Acquire)
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                // Never stop accepting: a fixed cap let a burst of slow
+                // clients starve every new connect (the GUI's typing among
+                // them). Each client costs one short-lived thread; if the OS
+                // refuses another, this one connection is dropped and its
+                // client retries (it never reached the daemon).
                 let server = server.clone();
-                let active = active.clone();
+                let counted = active.clone();
                 active.fetch_add(1, Ordering::AcqRel);
-                std::thread::spawn(move || {
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let active = counted;
                     struct Guard(Arc<AtomicUsize>);
                     impl Drop for Guard {
                         fn drop(&mut self) {
@@ -571,6 +567,11 @@ pub fn run(config: Config) -> Result<()> {
                         ipc::wake_listener();
                     }
                 });
+                if let Err(error) = spawned {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!("crow-term daemon: cannot serve a client now: {error}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             Err(error) => bail!("IPC accept: {error}"),
         }
