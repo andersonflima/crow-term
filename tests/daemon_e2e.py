@@ -206,5 +206,16 @@ class DaemonTests(DaemonHarness):
         self.eventually(lambda: self.output_line(pane,"CROW_TMUX_DETACHED"))
 
 
+class DebugEncodeKeyTests(unittest.TestCase):
+    def test_key_encoding_aid_never_starts_a_daemon(self):
+        with tempfile.TemporaryDirectory(prefix="crow-e2e-") as temp:
+            runtime = Path(temp) / "runtime"
+            env = dict(os.environ, CROW_TERM_RUNTIME_DIR=str(runtime))
+            result = subprocess.run([str(BIN), "debug-encode-key", "/", "--mod", "ctrl", "--flags", "1"],
+                                    env=env, capture_output=True, timeout=10)
+            self.assertEqual(result.stdout, b"\x1b[47;5u", result.stderr)
+            self.assertFalse(runtime.exists() and any(runtime.iterdir()), "a daemon runtime was created")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

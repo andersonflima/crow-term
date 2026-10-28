@@ -308,6 +308,35 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
+    // Pure key encoding (test aid): never needs or starts the daemon.
+    if let Some(Action::DebugEncodeKey {
+        key,
+        flags,
+        modify_other_keys,
+        mods,
+        release,
+    }) = &cli.command
+    {
+        use std::io::Write;
+        use winit::keyboard::ModifiersState;
+        let mut state = ModifiersState::empty();
+        for name in mods {
+            state |= match name.as_str() {
+                "shift" => ModifiersState::SHIFT,
+                "ctrl" => ModifiersState::CONTROL,
+                "alt" => ModifiersState::ALT,
+                other => bail!("unknown modifier {other}"),
+            };
+        }
+        let modes = Modes {
+            keyboard: *flags,
+            modify_other_keys: *modify_other_keys,
+            ..Modes::default()
+        };
+        let bytes = ui::encode_named_key(key, state, *release, &modes);
+        std::io::stdout().write_all(&bytes)?;
+        return Ok(());
+    }
     ensure_daemon(cli.config.as_ref())?;
     match cli.command.as_ref() {
         Some(Action::ListSessions) => print_response(ipc::rpc(&Request::List)?),
@@ -346,33 +375,6 @@ fn main() -> Result<()> {
                 window: *window,
                 name: name.clone(),
             })?)
-        }
-        Some(Action::DebugEncodeKey {
-            key,
-            flags,
-            modify_other_keys,
-            mods,
-            release,
-        }) => {
-            use std::io::Write;
-            use winit::keyboard::ModifiersState;
-            let mut state = ModifiersState::empty();
-            for name in mods {
-                state |= match name.as_str() {
-                    "shift" => ModifiersState::SHIFT,
-                    "ctrl" => ModifiersState::CONTROL,
-                    "alt" => ModifiersState::ALT,
-                    other => bail!("unknown modifier {other}"),
-                };
-            }
-            let modes = Modes {
-                keyboard: *flags,
-                modify_other_keys: *modify_other_keys,
-                ..Modes::default()
-            };
-            let bytes = ui::encode_named_key(key, state, *release, &modes);
-            std::io::stdout().write_all(&bytes)?;
-            Ok(())
         }
         Some(Action::ResizePane { pane, rows, cols }) => {
             print_response(ipc::rpc(&Request::Resize {
