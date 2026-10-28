@@ -31,7 +31,7 @@ SECONDS = float(os.environ.get("CROW_STRESS_SECONDS", "12"))
 # daemon's own log is checked for slow snapshots.
 SNAPSHOT_P95 = float(os.environ.get("CROW_STRESS_SNAPSHOT_P95", "0.5"))
 SNAPSHOT_MAX = 2.0
-DAEMON_SLOW_MS = 1000
+DAEMON_SLOW_MS = 250
 ECHO_P99 = 0.2
 # The producers run at the lowest CPU priority: they model background output,
 # and on a 3-core runner eight unthrottled producers would otherwise starve
@@ -62,6 +62,13 @@ def p99(samples):
 
 
 class LinkUnderLoad(daemon_e2e.DaemonHarness):
+    def setUp(self):
+        # The daemon logs every Watch snapshot with its duration: the
+        # daemon-side cost is asserted, not only the client's wall time.
+        os.environ["CROW_TERM_SLOW_MS"] = "0"
+        self.addCleanup(os.environ.pop, "CROW_TERM_SLOW_MS", None)
+        super().setUp()
+
     def run_python(self, pane, script):
         python = sys.executable
         command = f"& {python} {script}" if os.name == "nt" else f"{shlex.quote(python)} {shlex.quote(str(script))}"
@@ -79,7 +86,18 @@ class LinkUnderLoad(daemon_e2e.DaemonHarness):
             self.run_python(pane, script)
         self.eventually(lambda: "crow flood" in self.capture(panes[-1]), timeout=20)
         echo = self.rpc("new-session", "echo")["Created"]["pane"]
-        self.eventually(lambda: self.capture(echo).strip(), timeout=20)  # prompt drawn
+        # Measure typing, not shell start-up: wait until the shell's prompt is
+        # drawn and the screen has been quiet for a second (a login shell may
+        # still be reading its profile under this load).
+        quiet = {"screen": None, "since": time.monotonic()}
+
+        def ready():
+            screen = self.capture(echo)
+            if screen != quiet["screen"]:
+                quiet.update(screen=screen, since=time.monotonic())
+                return False
+            return screen.strip() and time.monotonic() - quiet["since"] >= 1.0
+        self.eventually(ready, timeout=60)
 
         snapshots, errors = [], []
         until = time.monotonic() + SECONDS
@@ -112,8 +130,13 @@ class LinkUnderLoad(daemon_e2e.DaemonHarness):
         self.assertEqual(errors, [], report)
         self.assertLess(percentile(snapshots, 0.95), SNAPSHOT_P95, report)
         self.assertLess(max(snapshots), SNAPSHOT_MAX, report)
-        slow = [int(ms) for ms in re.findall(r"Watch snapshot of \d+ pane\(s\) took (\d+) ms", self.daemon_log())]
-        self.assertFalse([ms for ms in slow if ms > DAEMON_SLOW_MS], f"daemon snapshots: {slow} ms; {report}")
+        log = (self.runtime / "test-daemon.log").read_text(errors="replace")
+        daemon = [int(ms) for ms in re.findall(r"Watch snapshot of 8 pane\(s\) took (\d+) ms", log)]
+        self.assertTrue(daemon, "the daemon logged no Watch snapshot timings")
+        daemon_report = (f"daemon-side snapshots of 8 panes: {len(daemon)}, p50 {percentile(daemon, 0.5)} ms, "
+                         f"p99 {percentile(daemon, 0.99)} ms, max {max(daemon)} ms")
+        print(daemon_report, file=sys.stderr)
+        self.assertLess(max(daemon), DAEMON_SLOW_MS, f"{daemon_report}; {report}")
         self.assertLess(p99(echoes), ECHO_P99, report)
 
 

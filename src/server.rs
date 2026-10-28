@@ -53,8 +53,19 @@ fn stall_for_tests(session: &str) {
 /// Concurrent client connections served; further clients wait to be accepted.
 const MAX_CLIENTS: usize = 256;
 
-/// Requests slower than this are logged to daemon.log with their cause.
-const SLOW: Duration = Duration::from_millis(500);
+/// Requests slower than this are logged to daemon.log with their cause
+/// (`CROW_TERM_SLOW_MS` overrides it; 0 logs every Watch, for measurements).
+fn slow() -> Duration {
+    static SLOW: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SLOW.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("CROW_TERM_SLOW_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+                .unwrap_or(500),
+        )
+    })
+}
 
 #[derive(Default)]
 struct Signals {
@@ -178,10 +189,29 @@ impl Server {
             .collect();
         drop(registry);
         // Read the revision BEFORE snapshots: an output racing with snapshot is never lost.
-        let screens = engines
-            .into_iter()
-            .map(|(id, engine)| Ok((id, engine.snapshot()?)))
-            .collect::<Result<_>>()?;
+        // Panes are snapshotted concurrently: the cost is the slowest pane,
+        // not the sum, and one busy pane cannot delay the others.
+        let screens = if engines.len() > 1 {
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = engines
+                    .iter()
+                    .map(|(id, engine)| (*id, scope.spawn(|| engine.snapshot())))
+                    .collect();
+                jobs.into_iter()
+                    .map(|(id, job)| {
+                        let screen = job
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("pane snapshot panicked"))??;
+                        Ok((id, screen))
+                    })
+                    .collect::<Result<_>>()
+            })?
+        } else {
+            engines
+                .into_iter()
+                .map(|(id, engine)| Ok((id, engine.snapshot()?)))
+                .collect::<Result<_>>()?
+        };
         Ok(View {
             revision,
             sessions,
@@ -202,7 +232,7 @@ impl Server {
                 let started = std::time::Instant::now();
                 let view = self.view(Some(&session), window, Some(since))?;
                 let elapsed = started.elapsed();
-                if elapsed > SLOW {
+                if elapsed >= slow() {
                     // The GUI keeps waiting (a slow reply is not a disconnect);
                     // the log says why it was slow.
                     eprintln!(
@@ -502,7 +532,7 @@ pub fn run(config: Config) -> Result<()> {
                             other => other,
                         }
                         .context("write IPC response");
-                        if started.elapsed() > SLOW {
+                        if started.elapsed() >= slow() && slow() > Duration::ZERO {
                             eprintln!(
                                 "crow-term daemon: sending a reply took {} ms (slow or stalled client)",
                                 started.elapsed().as_millis()
