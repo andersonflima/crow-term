@@ -208,7 +208,22 @@ fn transfer<T>(operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
 fn read_exact(reader: &mut impl Read, buffer: &mut [u8]) -> Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
-        let count = transfer(|| reader.read(&mut buffer[offset..]))?;
+        let count = transfer(|| {
+            let result = reader.read(&mut buffer[offset..]);
+            #[cfg(windows)]
+            let result = result.map_err(|error| {
+                // PIPE_NOWAIT reports ERROR_NO_DATA (232) when the pipe is
+                // connected but no bytes are available. Interprocess preserves
+                // that raw error rather than mapping it to WouldBlock.
+                // Only reads retry it; a write-side 232 still means failure.
+                if error.raw_os_error() == Some(232) {
+                    std::io::Error::from(std::io::ErrorKind::WouldBlock)
+                } else {
+                    error
+                }
+            });
+            result
+        })?;
         if count == 0 {
             bail!("Truncated IPC frame");
         }
