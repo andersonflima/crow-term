@@ -197,28 +197,39 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
                 " local s = '' for c = 1, 8 do s = s .. vim.fn.screenstring(p.row, c) end return s end)()")
             def drawn_by_neovim():
                 cells = self.report(grid)
-                return any(sign in cells for sign in "▎┃▍") and cells
+                return next((sign for sign in "▎┃▍" if sign in cells), None)
+            def terminal_shows(sign):
+                screen = self.rpc("capture-pane", self.pane, "--json")
+                last[0] = "\n".join("".join(cell["text"] for cell in row) for row in screen["cells"])
+                row = next((r for r in screen["cells"]
+                            if "crowcompletionword = 2" in "".join(c["text"] for c in r)), None)
+                return row is not None and any(cell["text"] == sign for cell in row[:8])
             try:
                 self.eventually(signed, timeout=10)
             except AssertionError:
-                try:
-                    neovim = self.eventually(drawn_by_neovim, timeout=10)
-                except AssertionError:
-                    # gitsigns has not drawn anything: it can stay detached when
-                    # the buffer was read before the plugin loaded (LazyFile) on a
-                    # busy runner, or still be computing the diff. That is editor
-                    # timing, not the terminal: attach and let it draw.
+                sign = drawn_by_neovim()
+                if sign:
+                    # Neovim had already drawn it while the terminal showed no
+                    # sign for 10 s: a terminal defect. No retry, so the redraw
+                    # caused by the report command cannot repair it.
+                    if not terminal_shows(sign):
+                        raise AssertionError(
+                            f"Neovim drew {sign!r} in the sign column but the terminal shows:\n{last[0]}") from None
+                else:
+                    # gitsigns has not drawn anything: detached (buffer read before
+                    # the plugin loaded on a busy runner) or still diffing. Editor
+                    # timing, not the terminal: attach and let Neovim draw.
                     self.ex("Gitsigns attach")
                     try:
-                        neovim = self.eventually(drawn_by_neovim, timeout=30)
+                        sign = self.eventually(drawn_by_neovim, timeout=30)
                     except AssertionError:
                         raise AssertionError(f"Neovim never drew a gitsigns sign:\n{last[0]}") from None
                     print("gitsigns: attached explicitly", file=sys.stderr)
-                try:
-                    self.eventually(signed, timeout=5)
-                except AssertionError:
-                    raise AssertionError(
-                        f"Neovim drew {neovim!r} in the sign column but the terminal shows:\n{last[0]}") from None
+                    try:
+                        self.eventually(lambda: terminal_shows(sign), timeout=5)
+                    except AssertionError:
+                        raise AssertionError(
+                            f"Neovim drew {sign!r} in the sign column but the terminal shows:\n{last[0]}") from None
         with self.subTest("treesitter highlight"):
             active = self.report("vim.treesitter.highlighter.active[vim.api.nvim_get_current_buf()] ~= nil")
             self.assertTrue(active)
