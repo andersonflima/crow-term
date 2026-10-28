@@ -436,6 +436,9 @@ def j6_paste(ctx):
     gui = start_nvim(ctx)
     normal_mode(ctx, gui)
     ctx.driver.set_clipboard("pasted one\npasted two")
+    ready = getattr(ctx.driver, "clipboard_ready", None)
+    if ready is not None:
+        ctx.info.setdefault("clipboard_ready_seconds", []).append(ready)
     # Insert mode on a new last line: the paste becomes exactly two lines.
     ctx.driver.type(gui, "Go")
     ctx.driver.key(gui, ctx.driver.paste_chord)
@@ -449,7 +452,7 @@ def j6_paste(ctx):
     lines = eventually(saved, 10, what="pasted lines saved")
     frame = gui.wait_frame(what="frame after paste")
     paste_events = [e for e in events(ctx) if e.startswith("PASTE")]
-    return f"Neovim vim.paste saw {paste_events} (bracketed); file ends {lines[-2:]}", [ctx.save_frame("j6-paste", frame)]
+    return f"Neovim vim.paste saw {paste_events} (bracketed); file ends {lines[-2:]}; clipboard owned after {ready}s", [ctx.save_frame("j6-paste", frame)]
 
 
 @journey("J7", "mouse click moves the Neovim cursor")

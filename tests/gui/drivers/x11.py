@@ -21,6 +21,20 @@ def run(*args, timeout=15, check=True, input=None):
     return result.stdout.strip()
 
 
+def wait_for_selection(reader, text, timeout=10):
+    """Seconds until `reader` returns `text`: the selection is owned and served.
+    A paste issued earlier finds no selection ("Clipboard unavailable")."""
+    started = time.monotonic()
+    last = None
+    while time.monotonic() - started < timeout:
+        result = subprocess.run(reader, capture_output=True, timeout=5)
+        last = result
+        if result.returncode == 0 and result.stdout.decode(errors="replace") == text:
+            return round(time.monotonic() - started, 3)
+        time.sleep(0.05)
+    raise AssertionError(f"{reader[0]} never returned the copied text (last: {last!r})")
+
+
 # xdotool keysym names for the chords the journeys use.
 KEYSYMS = {"slash": "slash", "Return": "Return", "Escape": "Escape"}
 
@@ -101,7 +115,7 @@ class X11(Driver):
         holder.stdin.write(text.encode())
         holder.stdin.close()
         self.helpers.append(("clipboard", holder))
-        time.sleep(0.2)
+        self.clipboard_ready = wait_for_selection(["xclip", "-o", "-selection", "clipboard"], text)
 
     def stop_clipboard(self):
         for name, process in [h for h in self.helpers if h[0] == "clipboard"]:
