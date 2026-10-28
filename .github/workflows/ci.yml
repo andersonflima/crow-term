@@ -48,6 +48,14 @@ jobs:
           cargo build --profile stress --locked
           exe=target/stress/crow-term; [[ "${RUNNER_OS}" == "Windows" ]] && exe="${exe}.exe"
           CROW_TERM_BIN="${exe}" python tests/link_stress.py
+      - name: macOS login-shell fixtures
+        if: runner.os == 'macOS'
+        run: brew install fish
+      - name: Login shells (bash, zsh, fish, pwsh, sh, dash; launchd-like environment)
+        if: runner.os != 'Windows'
+        env:
+          CROW_REQUIRE_SHELLS: ${{ runner.os == 'Linux' && 'bash,zsh,fish,pwsh,sh,dash' || 'bash,zsh,fish,pwsh,sh' }}
+        run: python tests/login_shell_e2e.py
       - name: Offline shell profiles (Unix/WSL contract)
         if: runner.os != 'Windows'
         run: python tests/shell_setup.py

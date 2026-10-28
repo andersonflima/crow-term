@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod keyboard;
 pub mod lanes;
 pub mod link;
+pub mod login;
 pub mod model;
 pub mod server;
 pub mod ui;

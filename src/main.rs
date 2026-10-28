@@ -172,6 +172,7 @@ fn shell(config: &Config, cli: &Cli) -> Result<ShellSpec> {
     if cli.tmux.is_none()
         && let Some(program) = &cli.shell
     {
+        spec.args = config.shell_args_for(program);
         spec.program = program.clone();
     }
     Ok(spec)
@@ -212,6 +213,20 @@ fn main() -> Result<()> {
                 cli.config.clone().unwrap_or(Config::path()?).display()
             );
             println!("runtime: {}", ipc::runtime_dir()?.display());
+            let (program, source) = crow_term::login::default_shell(config.shell.as_deref());
+            let args = config.shell_args_for(&program);
+            let login = crow_term::login::login_args(&program)
+                .is_some_and(|login| !login.is_empty() && args.starts_with(&login));
+            println!(
+                "shell: {program} {} ({}; {})",
+                args.join(" "),
+                source.label(),
+                if login {
+                    "login shell"
+                } else {
+                    "not a login shell"
+                }
+            );
             for tool in ["fish", "zsh", "tmux", "nvim", "vim", "wsl.exe"] {
                 println!(
                     "{tool}: {}",

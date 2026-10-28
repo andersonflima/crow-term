@@ -530,6 +530,7 @@ dependencies = [
  "cosmic-text",
  "directories",
  "interprocess",
+ "libc",
  "portable-pty",
  "postcard",
  "rustix 1.1.6",
