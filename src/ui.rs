@@ -331,7 +331,9 @@ impl Renderer {
         for data in [REGULAR, BOLD, ITALIC, BOLD_ITALIC] {
             // Reuse the embedded read-only bytes instead of copying all four
             // font faces (~38 MiB) into a second heap allocation.
-            fonts.db_mut().load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data)));
+            fonts
+                .db_mut()
+                .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data)));
         }
         fonts.db_mut().set_monospace_family(&config.font_family);
         let mut renderer = Self {

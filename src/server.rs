@@ -39,7 +39,7 @@ impl Signals {
 struct Registry {
     sessions: BTreeMap<String, Vec<WindowInfo>>,
     panes: HashMap<u64, Arc<Engine>>,
-    profiles: HashMap<String,ShellSpec>,
+    profiles: HashMap<String, ShellSpec>,
     next_id: u64,
 }
 impl Registry {
@@ -177,7 +177,7 @@ impl Server {
                 let pane = registry.id();
                 let window = registry.id();
                 registry.panes.insert(pane, engine);
-                registry.profiles.insert(session.clone(),shell);
+                registry.profiles.insert(session.clone(), shell);
                 registry.sessions.insert(
                     session,
                     vec![WindowInfo {
@@ -191,7 +191,7 @@ impl Server {
             }
             Request::NewWindow {
                 session,
-                shell:_,
+                shell: _,
                 size,
             } => {
                 let mut registry = self.lock()?;
@@ -205,7 +205,13 @@ impl Server {
                     "Window limit (32) reached"
                 );
                 ensure!(registry.panes.len() < 128, "Pane limit (128) reached");
-                let engine = self.spawn(registry.profiles.get(&session).context("Session shell profile missing")?, size)?;
+                let engine = self.spawn(
+                    registry
+                        .profiles
+                        .get(&session)
+                        .context("Session shell profile missing")?,
+                    size,
+                )?;
                 let pane = registry.id();
                 let window = registry.id();
                 registry.panes.insert(pane, engine);
@@ -226,7 +232,7 @@ impl Server {
                 window,
                 pane,
                 axis,
-                shell:_,
+                shell: _,
                 size,
             } => {
                 let mut registry = self.lock()?;
@@ -239,7 +245,13 @@ impl Server {
                     "Pane/window limit (16) reached"
                 );
                 ensure!(registry.panes.len() < 128, "Pane limit (128) reached");
-                let engine = self.spawn(registry.profiles.get(&session).context("Session shell profile missing")?, size)?;
+                let engine = self.spawn(
+                    registry
+                        .profiles
+                        .get(&session)
+                        .context("Session shell profile missing")?,
+                    size,
+                )?;
                 let new = registry.id();
                 ensure!(
                     registry

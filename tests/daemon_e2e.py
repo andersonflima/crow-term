@@ -75,7 +75,10 @@ class DaemonTests(unittest.TestCase):
         pane, window = first["pane"], first["window"]
         self.send(pane, "echo CROW_REAL_PTY")
         self.eventually(lambda: "CROW_REAL_PTY" in self.capture(pane))
-        second = self.rpc("--session", "alpha", "new-window")["Created"]
+        # Reattaching with another CLI default must not change a session's shell profile.
+        second = self.rpc("--session", "alpha", "--shell", "crow-nonexistent-shell-fixture", "new-window")["Created"]
+        self.send(second["pane"],"echo CROW_ORIGINAL_PROFILE")
+        self.eventually(lambda: "CROW_ORIGINAL_PROFILE" in self.capture(second["pane"]))
         split = self.rpc("--session", "alpha", "split-pane", pane, "--window", window, "--horizontal")["Created"]
         sessions = self.rpc("list-sessions")["View"]["sessions"]
         self.assertEqual(len(sessions), 1)
