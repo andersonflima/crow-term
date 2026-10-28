@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "plugins": [
+    {
+      "name": "fisher",
+      "repository": "https://github.com/jorgebucaran/fisher",
+      "commit": "791da644d33d392216f6b1a9b5fc1e470db6d7f2",
+      "archive_url": "https://codeload.github.com/jorgebucaran/fisher/tar.gz/791da644d33d392216f6b1a9b5fc1e470db6d7f2",
+      "archive_sha256": "3450711cf552c2032e93e775c3cebb082c0a321ee1dd046d2d41cbc7b77d707f",
+      "files": {
+        "LICENSE.md": "f101c761d255d0dddc77dd8a9327733b03d381798ec54a1bb718367207b48a8e",
+        "functions/fisher.fish": "0fb6c81ae3003e95b5671766fa6c25c3597066e29965b7772f6c1b007387356d",
+        "completions/fisher.fish": "6ef51da07e11ed534ce828770dfa3135551bafe9aa3c28700cee1fc5f053cd48"
+      }
+    },
+    {
+      "name": "z",
+      "repository": "https://github.com/jethrokuan/z",
+      "commit": "26a50962bc68f5cb60fc488ee008b3d4d5be75f4",
+      "archive_url": "https://codeload.github.com/jethrokuan/z/tar.gz/26a50962bc68f5cb60fc488ee008b3d4d5be75f4",
+      "archive_sha256": "58bbb82d1b5e8e9a5f4a9d793115c99d20a183bb1dfbd5d4e2285f8c5579582d",
+      "files": {
+        "LICENSE": "6768e40ee8241d60df364bcf60a1d2dba0dfa7ecb699a658c186c4ef98157e02",
+        "conf.d/z.fish": "8d8499125844a249b29a5a312182373ac268bfafe9c1468c764edde6081b7f62",
+        "functions/__z.fish": "f379818b6ec429db4f8fe1d4cf0baeb57fc9dabbd8603fb219b21b1164c7d6e0",
+        "functions/__z_add.fish": "98c54603a89ff2f4c9262a127a66b072f22e6ad752dd2ad97adb17b4f98da1dc",
+        "functions/__z_clean.fish": "dafc74f9cd1f9607c0ece6727402ea7ac3e7bf4554626fe9eb237e1b07440215",
+        "functions/__z_complete.fish": "73a08d410621594a0730128d9c997e5fb0008f278c9c42ff156a460014a42328"
+      }
+    },
+    {
+      "name": "zsh-autosuggestions",
+      "repository": "https://github.com/zsh-users/zsh-autosuggestions",
+      "commit": "85919cd1ffa7d2d5412f6d3fe437ebdbeeec4fc5",
+      "archive_url": "https://codeload.github.com/zsh-users/zsh-autosuggestions/tar.gz/85919cd1ffa7d2d5412f6d3fe437ebdbeeec4fc5",
+      "archive_sha256": "20665e469e720e674964a66854d5534b9af78cdfd438512746ecd1ade8e819ce",
+      "files": {
+        "LICENSE": "4598a6be0b8d7f2b708da5259d2a30d4e15e59b3c66781bab9e27744a9f859d8",
+        "zsh-autosuggestions.zsh": "eec7ba8f7a71414ace0ea0fab0908d005b24cf65d83b169c0ff97815d3cfc51a"
+      }
+    },
+    {
+      "name": "zsh-syntax-highlighting",
+      "repository": "https://github.com/zsh-users/zsh-syntax-highlighting",
+      "commit": "e6683f20e5c38d3e5447f45845d04ddda75d0f23",
+      "archive_url": "https://codeload.github.com/zsh-users/zsh-syntax-highlighting/tar.gz/e6683f20e5c38d3e5447f45845d04ddda75d0f23",
+      "archive_sha256": "6e8258a74e6f3cac03e1bb5ee72504bc4d819904e9aa742d62f60833168db265",
+      "files": {
+        "COPYING.md": "d810908db3cb75d30e46f5e55b18c8f483e1bc625b8f7dc5a581f5ad353af82e",
+        ".version": "97fd9d491486c9c26ce918b0ad429584dddd807f34655f2342872d8175383094",
+        ".revision-hash": "0e4e0c3aaec5a3efe933c7b41cb940fe5e6c28874f5075a9f68427f63135abde",
+        "zsh-syntax-highlighting.zsh": "156ebe9530eb991dcef54d476967e2ff4338d35dabaaff9e5462673a287cc63b",
+        "highlighters/brackets/brackets-highlighter.zsh": "b3ac4a66edf133b8f029332e787b7d36e2e1d7cabec0d271f7e5fe6724490dd3",
+        "highlighters/cursor/cursor-highlighter.zsh": "bd6ef3aae900fee57ff132360b3dd9d68df5aab150a33e32259fd5adbe8efd49",
+        "highlighters/line/line-highlighter.zsh": "1a12c094770bc00276395dc71a398a63fd768c433453d35f4e47e5d315dfacf0",
+        "highlighters/main/main-highlighter.zsh": "1f59176bc1e5fd8ac8eaa85dd7a4cd2a95083ee7c689a430ff4a5e2e9eee0061",
+        "highlighters/pattern/pattern-highlighter.zsh": "c2d5b50db13936421672b5ce16c0d7ec4f1abfeded34ea3a23bb39d2499b953b",
+        "highlighters/regexp/regexp-highlighter.zsh": "f567458da4fb89cae8ea220b8febea11ed67ab6f6c8f5e0d6723ea7285e932e7",
+        "highlighters/root/root-highlighter.zsh": "7a038444d4cd60f9eaf07993b6a14d0055ad8706e09a32780cb65ea0a90530ee"
+      }
+    }
+  ]
+}

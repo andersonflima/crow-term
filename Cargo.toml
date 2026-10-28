@@ -1,0 +1,41 @@
+[package]
+name = "crow-term"
+version = "0.1.0-alpha.1"
+edition = "2024"
+license = "MIT"
+description = "A native Crow terminal, built in Rust"
+repository = "https://github.com/andersonflima/crow-term"
+
+[dependencies]
+anyhow = "1"
+alacritty_terminal = "0.26"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+toml = "0.9"
+directories = "6"
+interprocess = "2.4"
+winit = "0.30"
+softbuffer = "0.4"
+cosmic-text = "0.19"
+arboard = "3.7"
+clap = { version = "4", features = ["derive"] }
+which = "8"
+unicode-width = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+widestring = "1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_Security","Win32_System_Threading","Win32_System_Pipes"] }

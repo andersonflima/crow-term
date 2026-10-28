@@ -1,0 +1,19 @@
+# Public Crowquill-inspired personal profile, not an export of private dotfiles.
+# Keys match src/config.rs. Select a separate shell profile as documented in
+# docs/shell-integration.md; no install occurs when this file is loaded.
+font_family = "Crowquill Mono"
+font_size = 18.0
+line_height = 1.25
+ligatures = true
+scrollback = 10000
+background = "#111111"
+foreground = "#EAEAEA"
+selection = "#444444"
+cursor = "#FFFFFF"
+prefix = "Ctrl-t"
+palette = [
+    "#2A2A2A", "#C4C4C4", "#CCCCCC", "#D4D4D4",
+    "#B8B8B8", "#BEBEBE", "#C8C8C8", "#E4E4E4",
+    "#9A9A9A", "#D8D8D8", "#E0E0E0", "#E8E8E8",
+    "#D0D0D0", "#D6D6D6", "#DEDEDE", "#FFFFFF",
+]
