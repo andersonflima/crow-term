@@ -41,12 +41,12 @@ jobs:
       - name: Journeys
         shell: bash
         run: |
-          # J15 runs but is not required: ConPTY reads console input into its own
-          # buffer even when the program does not (8 MiB accepted without
-          # back-pressure), so there is no stuck pane to detect (reported as degraded).
+          # J15: ConPTY reads console input into its own buffer even when the
+          # program does not (8 MiB accepted without back-pressure), so only its
+          # "pane detected as stuck" assertion is skipped here; the rest is required.
           python tests/gui/journeys.py --driver windows --goldens windows --artifacts gui-artifacts --require-goldens \
             ${{ inputs.update_goldens && '--update-goldens' || '' }} \
-            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9,J16,J17,J11,J14,J12,J13
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9,J15,J16,J17,J11,J14,J12,J13
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
