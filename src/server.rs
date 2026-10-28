@@ -272,6 +272,7 @@ impl Server {
                 validate_size(size)?;
                 self.pane(pane)?.resize(size)?;
             }
+            Request::PaneCwd { pane } => return Ok(Response::Cwd(self.pane(pane)?.cwd())),
             Request::Scroll { pane, lines } => {
                 self.pane(pane)?.scroll(lines.clamp(-10000, 10000))?;
             }
