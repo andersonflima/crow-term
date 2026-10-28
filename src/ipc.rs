@@ -1,11 +1,11 @@
 //! Local-only, length-framed IPC. No TCP listener and no shell interpolation.
 use crate::model::{Request, Response};
 use anyhow::{Context, Result, bail};
-#[cfg(unix)]
-use interprocess::local_socket::GenericFilePath;
 #[cfg(windows)]
 use interprocess::local_socket::GenericNamespaced;
-use interprocess::local_socket::{ListenerOptions, Stream, prelude::*};
+#[cfg(unix)]
+use interprocess::local_socket::{GenericFilePath, ListenerOptions};
+use interprocess::local_socket::{Stream, prelude::*};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::{Read, Write},
@@ -15,6 +15,31 @@ use std::{
 
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
+
+#[cfg(unix)]
+pub type IpcListener = interprocess::local_socket::Listener;
+#[cfg(windows)]
+pub struct IpcListener(
+    interprocess::os::windows::named_pipe::PipeListener<
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+    >,
+);
+#[cfg(windows)]
+impl IpcListener {
+    pub fn accept(&self) -> std::io::Result<Stream> {
+        let stream =
+            interprocess::os::windows::named_pipe::local_socket::Stream::from(self.0.accept()?);
+        Ok(stream.into())
+    }
+}
+#[cfg(windows)]
+fn windows_pipe_basename() -> Result<String> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    runtime_dir()?.hash(&mut hash);
+    Ok(format!("crow-term-v2-{:x}", hash.finish()))
+}
 
 /// The Windows PIPE_NOWAIT transport can report a successful zero-byte read
 /// while still connected. Keep this quirk out of the generic framing reader,
@@ -126,28 +151,15 @@ fn socket_name() -> Result<interprocess::local_socket::Name<'static>> {
     }
     #[cfg(windows)]
     {
-        // Separate names for separate profiles/test runtime roots.
-        use std::hash::{Hash, Hasher};
-        let mut hash = std::collections::hash_map::DefaultHasher::new();
-        runtime_dir()?.hash(&mut hash);
-        Ok(format!("crow-term-v2-{:x}", hash.finish())
+        Ok(windows_pipe_basename()?
             .to_ns_name::<GenericNamespaced>()?
             .into_owned())
     }
 }
 
-pub fn listen() -> Result<interprocess::local_socket::Listener> {
+#[cfg(unix)]
+pub fn listen() -> Result<IpcListener> {
     let options = ListenerOptions::new().name(socket_name()?);
-    #[cfg(windows)]
-    let options = {
-        use interprocess::os::windows::{
-            local_socket::ListenerOptionsExt, security_descriptor::SecurityDescriptor,
-        };
-        // Protected ACL: object owner and SYSTEM only, not all local users.
-        let sddl = widestring::U16CString::from_str("D:P(A;;GA;;;OW)(A;;GA;;;SY)")?;
-        let sd = SecurityDescriptor::deserialize(&sddl)?;
-        options.security_descriptor(sd)
-    };
     let listener = options
         .create_sync()
         .context("Cannot bind Crow daemon (already running or stale socket; use doctor)")?;
@@ -162,6 +174,27 @@ pub fn listen() -> Result<interprocess::local_socket::Listener> {
         )?;
     }
     Ok(listener)
+}
+
+#[cfg(windows)]
+pub fn listen() -> Result<IpcListener> {
+    use interprocess::os::windows::{
+        named_pipe::{PipeListenerOptions, pipe_mode::Bytes},
+        security_descriptor::SecurityDescriptor,
+    };
+    let sddl = widestring::U16CString::from_str("D:P(A;;GA;;;OW)(A;;GA;;;SY)")?;
+    let mut options =
+        PipeListenerOptions::new().path(format!(r"\\.\pipe\{}", windows_pipe_basename()?));
+    // The generic adapter requests 512-byte buffers. Bounded larger buffers
+    // amortize scheduler round trips without changing peer authentication.
+    options.input_buffer_size_hint = 64 * 1024;
+    options.output_buffer_size_hint = 64 * 1024;
+    options.security_descriptor = Some(SecurityDescriptor::deserialize(&sddl)?);
+    Ok(IpcListener(
+        options
+            .create_duplex::<Bytes>()
+            .context("Cannot bind Crow daemon")?,
+    ))
 }
 
 pub fn check_peer(stream: &Stream) -> Result<()> {
@@ -319,10 +352,10 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
     let deadline = Instant::now() + DEADLINE;
     let mut offset = 0;
     while offset < framed.len() {
-        // Keep Windows writes within Interprocess's 512-byte buffer-size hint;
+        // Bounded Windows writes amortize system calls within our 64-KiB hints;
         // the receiver drains between chunks. Unix sockets can accept the rest.
         let end = if cfg!(windows) {
-            (offset + 512).min(framed.len())
+            (offset + 4096).min(framed.len())
         } else {
             framed.len()
         };
@@ -429,7 +462,7 @@ mod tests {
             data: Vec::new(),
         };
         write_frame(&mut writer, &value).unwrap();
-        assert!(writer.max <= 512);
+        assert!(writer.max <= 4096);
         assert_eq!(
             read_frame::<Vec<u8>>(&mut writer.data.as_slice()).unwrap(),
             value
