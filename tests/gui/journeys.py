@@ -689,6 +689,17 @@ def link_gui(ctx):
 LINK_FAILURE_WORDS = ("disconnect", "stopped", "could not")
 
 
+RECORDER = """import sys
+out = open(sys.argv[1], "w", newline="\\n")
+print("RECORDER_READY", flush=True)
+for line in sys.stdin:
+    out.write(line.rstrip("\\r\\n") + "\\n")
+    out.flush()
+    if line.strip() == "AFTER_0123456789":
+        break
+"""
+
+
 def flood(ctx, held):
     """Fill the daemon's accept queue (Unix): connections nobody accepts while
     it is frozen, kept open afterwards as idle clients."""
@@ -730,34 +741,39 @@ def j17_backlog(ctx):
                 statuses.append(current[1]["status"])
             time.sleep(0.1)
 
-    def lines():
-        return [l.strip() for l in ctx.run.capture(pane).splitlines()]
+    # The pane runs a recorder of its input: the assertion is on the bytes
+    # the program received, in order, not on screen rows (a long prompt
+    # soft-wraps the echoed command; typeahead echoes inside output).
+    recorded = ctx.run.work / "j17-input.txt"
+    recorder = ctx.run.work / "j17_recorder.py"
+    recorder.write_text(RECORDER)
+    command = f"'{sys.executable}' '{recorder}' '{recorded}'"
+    ctx.run.send_keys(pane, ("& " if os.name == "nt" else "") + command + "\r")
+    eventually(lambda: any(l.strip() == "RECORDER_READY" for l in ctx.run.capture(pane).splitlines()), 30,
+               what="input recorder started")
+
+    def received():
+        return recorded.read_text().splitlines() if recorded.exists() else []
     try:
         try:
             with frozen(daemon_pid(ctx)):
                 how = flood(ctx, held)
-                ctx.driver.type(gui, "echo BACKLOG_0123456789")
+                ctx.driver.type(gui, "BACKLOG_0123456789")
                 ctx.driver.key(gui, "Return")
                 watch(3)
-            eventually(lambda: "BACKLOG_0123456789" in lines(), 30, what="typing with the accept backlog full")
-            # Wait for the prompt: typing during the first command's output
-            # would be echoed in the middle of it (tty typeahead), which says
-            # nothing about the order of the bytes.
-            quiet_screen(ctx, pane)
+            eventually(lambda: received()[:1] == ["BACKLOG_0123456789"], 30,
+                       what="typing with the accept backlog full")
             # The queued clients now hold connections open without a request:
             # they must not starve the GUI's next connects.
-            ctx.driver.type(gui, "echo AFTER_0123456789")
+            ctx.driver.type(gui, "AFTER_0123456789")
             ctx.driver.key(gui, "Return")
-            eventually(lambda: "AFTER_0123456789" in lines(), 30, what="typing while idle clients hold connections")
+            eventually(lambda: len(received()) >= 2, 30, what="typing while idle clients hold connections")
             watch(1)
         finally:
             for client in held:
                 client.close()
-        output = lines()
-        commands = [l for l in output if l.endswith("echo BACKLOG_0123456789") or l.endswith("echo AFTER_0123456789")]
-        counts = (output.count("BACKLOG_0123456789"), output.count("AFTER_0123456789"))
-        if counts != (1, 1) or len(commands) != 2 or output.index("BACKLOG_0123456789") > output.index("AFTER_0123456789"):
-            raise AssertionError(f"typed lines out of order or not exactly once: {counts} in {output}")
+        if received() != ["BACKLOG_0123456789", "AFTER_0123456789"]:
+            raise AssertionError(f"the program did not receive both lines once, in order: {received()}")
         bad = [s for s in statuses if any(word in s.lower() for word in COMMAND_FAILURE_WORDS)]
         if bad:
             raise AssertionError(f"a busy daemon was reported as an error: {bad}")
