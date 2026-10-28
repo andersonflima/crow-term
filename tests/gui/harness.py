@@ -150,11 +150,12 @@ class Run:
     def close(self):
         for gui in self.guis:
             gui.kill()
+        # Always: a GUI may have started a replacement daemon (journey J12).
+        try:
+            self.cli("stop", "--force", timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
         if self.daemon.poll() is None:
-            try:
-                self.cli("stop", "--force", timeout=10)
-            except (OSError, subprocess.SubprocessError):
-                pass
             try:
                 self.daemon.wait(timeout=8)
             except subprocess.TimeoutExpired:

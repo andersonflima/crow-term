@@ -1,6 +1,8 @@
 //! A session daemon owns PTYs, not GUI windows. Detaching never sends SIGHUP.
 use crate::{config::Config, engine::Engine, ipc, model::*};
+// Unix: the generic listener's accept(); Windows uses ipc::IpcListener directly.
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(unix)]
 use interprocess::local_socket::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -10,6 +12,57 @@ use std::{
     },
     time::Duration,
 };
+
+/// Test-only (cargo feature `test-hooks`, never in release builds): when
+/// `<runtime>/test-stall-watch-ms` exists, the next Watch removes it and sleeps
+/// that long, simulating a daemon that is alive but slow to answer.
+#[cfg(feature = "test-hooks")]
+fn stall_for_tests(session: &str) {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let Ok(path) = ipc::runtime_dir().map(|dir| dir.join("test-stall-watch")) else {
+        return;
+    };
+    // "<ms> <count> <session>": the next <count> Watches of <session> stall.
+    let ms = {
+        let _guard = LOCK.lock();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let mut parts = text.split_whitespace();
+        let (Some(Ok(ms)), Some(Ok(count)), Some(target)) = (
+            parts.next().map(str::parse::<u64>),
+            parts.next().map(str::parse::<u32>),
+            parts.next(),
+        ) else {
+            return;
+        };
+        if target != session || count == 0 {
+            return;
+        }
+        if count == 1 {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(&path, format!("{ms} {} {target}", count - 1));
+        }
+        ms
+    };
+    eprintln!("crow-term daemon: test hook stalls a Watch of {session} for {ms} ms");
+    std::thread::sleep(Duration::from_millis(ms.min(60_000)));
+}
+
+/// Requests slower than this are logged to daemon.log with their cause
+/// (`CROW_TERM_SLOW_MS` overrides it; 0 logs every Watch, for measurements).
+fn slow() -> Duration {
+    static SLOW: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *SLOW.get_or_init(|| {
+        Duration::from_millis(
+            std::env::var("CROW_TERM_SLOW_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+                .unwrap_or(500),
+        )
+    })
+}
 
 #[derive(Default)]
 struct Signals {
@@ -71,6 +124,8 @@ impl Registry {
 }
 
 pub struct Server {
+    /// Random per process; see `View::instance`.
+    instance: u64,
     registry: Mutex<Registry>,
     signals: Arc<Signals>,
     stopped: AtomicBool,
@@ -78,7 +133,17 @@ pub struct Server {
 }
 impl Server {
     pub fn new(config: &Config) -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        // RandomState is seeded randomly per process; mix in time and pid.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos()),
+        );
+        hasher.write_u32(std::process::id());
         Self {
+            instance: hasher.finish().max(1),
             registry: Mutex::new(Registry::default()),
             signals: Arc::default(),
             stopped: AtomicBool::new(false),
@@ -133,11 +198,31 @@ impl Server {
             .collect();
         drop(registry);
         // Read the revision BEFORE snapshots: an output racing with snapshot is never lost.
-        let screens = engines
-            .into_iter()
-            .map(|(id, engine)| Ok((id, engine.snapshot()?)))
-            .collect::<Result<_>>()?;
+        // Panes are snapshotted concurrently: the cost is the slowest pane,
+        // not the sum, and one busy pane cannot delay the others.
+        let screens = if engines.len() > 1 {
+            std::thread::scope(|scope| {
+                let jobs: Vec<_> = engines
+                    .iter()
+                    .map(|(id, engine)| (*id, scope.spawn(|| engine.snapshot())))
+                    .collect();
+                jobs.into_iter()
+                    .map(|(id, job)| {
+                        let screen = job
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("pane snapshot panicked"))??;
+                        Ok((id, screen))
+                    })
+                    .collect::<Result<_>>()
+            })?
+        } else {
+            engines
+                .into_iter()
+                .map(|(id, engine)| Ok((id, engine.snapshot()?)))
+                .collect::<Result<_>>()?
+        };
         Ok(View {
+            instance: self.instance,
             revision,
             sessions,
             screens,
@@ -145,6 +230,17 @@ impl Server {
     }
     pub fn handle(&self, request: Request) -> Result<Response> {
         match request {
+            Request::Guarded { instance, request } => {
+                ensure!(
+                    instance == self.instance,
+                    "Daemon instance changed: command for a previous daemon ignored"
+                );
+                ensure!(
+                    !matches!(*request, Request::Guarded { .. } | Request::Watch { .. }),
+                    "Invalid guarded request"
+                );
+                return self.handle(*request);
+            }
             Request::List => return Ok(Response::View(self.view(None, 0, None)?)),
             Request::Watch {
                 session,
@@ -152,11 +248,21 @@ impl Server {
                 since,
             } => {
                 self.signals.wait(since);
-                return Ok(Response::View(self.view(
-                    Some(&session),
-                    window,
-                    Some(since),
-                )?));
+                #[cfg(feature = "test-hooks")]
+                stall_for_tests(&session);
+                let started = std::time::Instant::now();
+                let view = self.view(Some(&session), window, Some(since))?;
+                let elapsed = started.elapsed();
+                if elapsed >= slow() {
+                    // The GUI keeps waiting (a slow reply is not a disconnect);
+                    // the log says why it was slow.
+                    eprintln!(
+                        "crow-term daemon: Watch snapshot of {} pane(s) took {} ms",
+                        view.screens.len(),
+                        elapsed.as_millis()
+                    );
+                }
+                return Ok(Response::View(view));
             }
             Request::Ensure {
                 session,
@@ -357,6 +463,10 @@ impl Server {
                 registry.panes.clear();
                 registry.sessions.clear();
                 registry.profiles.clear();
+                // GUIs must not restart a daemon the user stopped on purpose.
+                if let Ok(dir) = ipc::runtime_dir() {
+                    let _ = std::fs::write(dir.join(ipc::STOPPED_MARKER), b"stopped\n");
+                }
                 self.stopped.store(true, Ordering::Release);
             }
         }
@@ -387,6 +497,10 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 pub fn run(config: Config) -> Result<()> {
+    // Held for the daemon's whole life: starters use it to tell a live but
+    // unresponsive daemon from a dead one (never replace a live daemon).
+    let _alive = ipc::hold_daemon_lock()?;
+    let _ = std::fs::remove_file(ipc::runtime_dir()?.join(ipc::STOPPED_MARKER));
     let listener = ipc::listen()?;
     let server = Arc::new(Server::new(&config));
     let active = Arc::new(AtomicUsize::new(0));
@@ -396,14 +510,16 @@ pub fn run(config: Config) -> Result<()> {
                 if server.stopped.load(Ordering::Acquire) {
                     break;
                 }
-                if active.load(Ordering::Acquire) >= 64 {
-                    drop(stream);
-                    continue;
-                }
+                // Never stop accepting: a fixed cap let a burst of slow
+                // clients starve every new connect (the GUI's typing among
+                // them). Each client costs one short-lived thread; if the OS
+                // refuses another, this one connection is dropped and its
+                // client retries (it never reached the daemon).
                 let server = server.clone();
-                let active = active.clone();
+                let counted = active.clone();
                 active.fetch_add(1, Ordering::AcqRel);
-                std::thread::spawn(move || {
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let active = counted;
                     struct Guard(Arc<AtomicUsize>);
                     impl Drop for Guard {
                         fn drop(&mut self) {
@@ -413,15 +529,36 @@ pub fn run(config: Config) -> Result<()> {
                     let _guard = Guard(active);
                     let result = (|| -> Result<()> {
                         ipc::check_peer(&stream).context("authenticate IPC client")?;
-                        stream
-                            .set_nonblocking(true)
-                            .context("set server IPC nonblocking mode")?;
+                        ipc::prepare(&stream).context("configure server IPC stream")?;
                         let mut stream = ipc::FramedStream::new(stream);
                         let request = ipc::read_frame(&mut stream).context("read IPC request")?;
                         let response = server
                             .handle(request)
                             .unwrap_or_else(|e| Response::Error(format!("{e:#}")));
-                        ipc::write_frame(&mut stream, &response).context("write IPC response")
+                        let started = std::time::Instant::now();
+                        let written = match ipc::write_frame(&mut stream, &response) {
+                            // Too large to send (e.g. a giant multi-pane window):
+                            // answer with an error the GUI can show, never a cut stream.
+                            Err(error) if error.to_string().contains("exceeds limit") => {
+                                eprintln!("crow-term daemon: reply too large: {error:#}");
+                                ipc::write_frame(
+                                    &mut stream,
+                                    &Response::Error(
+                                        "This window's screen is too large to send (16 MiB IPC limit)"
+                                            .into(),
+                                    ),
+                                )
+                            }
+                            other => other,
+                        }
+                        .context("write IPC response");
+                        if started.elapsed() >= slow() && slow() > Duration::ZERO {
+                            eprintln!(
+                                "crow-term daemon: sending a reply took {} ms (slow or stalled client)",
+                                started.elapsed().as_millis()
+                            );
+                        }
+                        written
                     })();
                     if let Err(error) = result {
                         eprintln!("crow-term IPC: {error:#}");
@@ -430,6 +567,11 @@ pub fn run(config: Config) -> Result<()> {
                         ipc::wake_listener();
                     }
                 });
+                if let Err(error) = spawned {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    eprintln!("crow-term daemon: cannot serve a client now: {error}");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             Err(error) => bail!("IPC accept: {error}"),
         }
@@ -447,6 +589,48 @@ pub fn run(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guarded_commands_run_only_on_the_daemon_instance_they_were_made_for() {
+        // Two daemons in a row reuse pane ids from 1: a command made for the
+        // first must never reach a pane of the second (another GUI's session).
+        let first = Server::new(&Config::default());
+        let second = Server::new(&Config::default());
+        assert_ne!(first.instance, second.instance);
+        let View { instance, .. } = first.view(None, 0, None).unwrap();
+        assert_eq!(instance, first.instance);
+        let stale = Request::Guarded {
+            instance: first.instance,
+            request: Box::new(Request::Input {
+                pane: 1,
+                bytes: b"rm -rf ~".to_vec(),
+            }),
+        };
+        let error = second.handle(stale).unwrap_err().to_string();
+        assert!(error.contains("instance changed"), "{error}");
+        // The right instance reaches the request itself (here: no such pane).
+        let current = Request::Guarded {
+            instance: second.instance,
+            request: Box::new(Request::Input {
+                pane: 1,
+                bytes: b"x".to_vec(),
+            }),
+        };
+        assert!(
+            second
+                .handle(current)
+                .unwrap_err()
+                .to_string()
+                .contains("Pane not found")
+        );
+        let nested = Request::Guarded {
+            instance: second.instance,
+            request: Box::new(Request::Guarded {
+                instance: 0,
+                request: Box::new(Request::List),
+            }),
+        };
+        assert!(second.handle(nested).is_err());
+    }
     #[test]
     fn validates_sizes_and_names() {
         assert!(validate_size(Size { rows: 0, cols: 80 }).is_err());

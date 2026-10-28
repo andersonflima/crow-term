@@ -226,6 +226,69 @@ class DaemonTests(DaemonHarness):
         self.eventually(lambda: self.output_line(pane,"CROW_TMUX_DETACHED"))
 
 
+class UnresponsiveDaemonTests(DaemonHarness):
+    @unittest.skipIf(os.name == "nt", "POSIX stty/head/wc")
+    def test_a_large_paste_into_a_program_that_is_not_reading_is_delivered_whole(self):
+        """Repro: ~800 KB pasted while the program sleeps. The daemon used to
+        give up after 5 s of PTY back-pressure and drop the rest; now every
+        byte arrives, in order, once the program reads."""
+        pane = self.rpc("new-session", "paste")["Created"]["pane"]
+        total = 40 * 20000
+        self.send(pane, f"stty raw -echo; sleep 8; head -c {total} | wc -c; stty sane")
+        time.sleep(0.5)
+        for index in range(40):
+            result = subprocess.run([str(BIN), "send-keys", str(pane), "x" * 20000], env=self.env,
+                                    capture_output=True, text=True, timeout=90)
+            self.assertEqual(result.returncode, 0, f"chunk {index}: {result.stderr}")
+        self.eventually(lambda: any(l.strip() == str(total) for l in self.capture(pane).splitlines()), timeout=60)
+
+
+    @unittest.skipIf(os.name == "nt", "SIGSTOP")
+    def test_a_frozen_daemon_is_never_replaced(self):
+        """A live daemon that neither answers nor accepts (SIGSTOP + full accept
+        backlog, so connecting is refused) keeps its socket and sessions; a CLI
+        call waits and fails instead of starting a second daemon."""
+        import signal
+        import socket
+        pane = self.rpc("new-session", "keep")["Created"]["pane"]
+        path = next(self.runtime.glob("daemon-v*.sock"))
+        held = []
+        os.kill(self.daemon.pid, signal.SIGSTOP)
+        try:
+            refused = False
+            for _ in range(4096):
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.setblocking(False)
+                try:
+                    client.connect(str(path))
+                except BlockingIOError:
+                    pass
+                except (ConnectionRefusedError, OSError):
+                    client.close()
+                    refused = True
+                    break
+                held.append(client)
+            result = None if not refused else subprocess.run([str(BIN), "list-sessions"], env=self.env, capture_output=True,
+                                    text=True, timeout=60)
+        finally:
+            for client in held:
+                client.close()
+            os.kill(self.daemon.pid, signal.SIGCONT)
+        if result is None:
+            # Linux queues connections to a full Unix-socket backlog (EAGAIN)
+            # instead of refusing them: a live daemon is never "unreachable".
+            self.skipTest("this kernel does not refuse connections to a live socket")
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        # Busy, not gone: the refusal of a live daemon is never "not running".
+        self.assertRegex(result.stderr, "not answering|alive but not accepting")
+        self.assertNotIn("not running", result.stderr)
+        self.assertTrue(path.exists(), "the live daemon's socket was removed")
+        sessions = self.rpc("list-sessions")["View"]["sessions"]
+        self.assertEqual([s["name"] for s in sessions], ["keep"], "the original daemon still serves")
+        self.assertIsNone(self.daemon.poll())
+        self.assertTrue(self.capture(pane) is not None)
+
+
 class DebugEncodeKeyTests(unittest.TestCase):
     def test_key_encoding_aid_never_starts_a_daemon(self):
         with tempfile.TemporaryDirectory(prefix="crow-e2e-") as temp:

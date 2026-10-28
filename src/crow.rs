@@ -1014,6 +1014,12 @@ pub fn spawn(
                 let focused = shared.focused.load(Ordering::Relaxed);
                 // Pane cwd + branch: one IPC + one targeted process query per tick.
                 let pane = shared.pane.load(Ordering::Relaxed);
+                // Another pane (focus change, reattach): earlier failures were
+                // about the old one.
+                if cwd_cache.as_ref().is_some_and(|(p, _, _)| *p != pane) {
+                    cwd_failures = 0;
+                    cwd_failed_at = None;
+                }
                 let (cwd, branch) = if config.status_bar {
                     // After 3 failures in a row (closed pane, daemon restart, or an older
                     // daemon that rejects the request and logs it) retry once a minute.

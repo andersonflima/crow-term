@@ -49,7 +49,7 @@ jobs:
         run: |
           nvim="$(python scripts/fetch_neovim.py 0.11.7 --dest "$RUNNER_TEMP/neovim")"
           echo "CROW_TERM_NVIM=$nvim" >> "$GITHUB_ENV"
-      - run: cargo build --locked --features frame-dump
+      - run: cargo build --locked --features frame-dump,test-hooks
       - name: Journeys on X11
         if: matrix.backend == 'x11'
         run: |
@@ -60,7 +60,7 @@ jobs:
           sleep 1
           python tests/gui/journeys.py --driver x11 --goldens linux-x11 --artifacts gui-artifacts --require-goldens \
             ${{ inputs.update_goldens && '--update-goldens' || '' }} \
-            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9,J15,J16,J17,J11,J14,J12,J13
       - name: Journeys on Wayland
         if: matrix.backend == 'wayland'
         run: |
@@ -76,7 +76,7 @@ jobs:
           swaymsg -t get_outputs | head -20
           python tests/gui/journeys.py --driver wayland --goldens linux-wayland --artifacts gui-artifacts --require-goldens \
             ${{ inputs.update_goldens && '--update-goldens' || '' }} \
-            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9,J15,J16,J17,J11,J14,J12,J13
       - name: Display server logs
         if: always()
         run: cp "$RUNNER_TEMP"/*.log "$RUNNER_TEMP/packages.txt" gui-artifacts/ 2>/dev/null || true

@@ -20,8 +20,32 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// v3: kitty keyboard flags and modifyOtherKeys level in `Modes`.
 /// v4: underline style and underline color in `Cell`.
 /// v5: cell pixel metrics on resize, bell count, hyperlinks, alternate scroll.
-pub const WIRE_VERSION: u32 = 5;
+/// v6: daemon instance in `View`, `Request::Guarded`.
+pub const WIRE_VERSION: u32 = 6;
 const DEADLINE: Duration = Duration::from_secs(5);
+/// Unix sockets block in the kernel for at most this long per call, so the
+/// frame deadline is still checked while no byte flows.
+#[cfg(unix)]
+const KERNEL_WAIT: Duration = Duration::from_millis(250);
+
+/// Configure a connected stream for framed I/O on both ends.
+///
+/// Unix: blocking calls with kernel timeouts. Nonblocking reads used to poll
+/// with a 1 ms sleep per would-block, and macOS socket buffers hold ~8 KiB:
+/// a multi-pane snapshot of a few MiB needed thousands of sleeps and took
+/// seconds, long enough to trip the 5 s deadline under load.
+/// Windows: PIPE_NOWAIT (see [`FramedStream`]), polled.
+pub fn prepare(stream: &Stream) -> Result<()> {
+    #[cfg(unix)]
+    {
+        stream.set_nonblocking(false)?;
+        stream.set_recv_timeout(Some(KERNEL_WAIT))?;
+        stream.set_send_timeout(Some(KERNEL_WAIT))?;
+    }
+    #[cfg(windows)]
+    stream.set_nonblocking(true)?;
+    Ok(())
+}
 
 #[cfg(unix)]
 pub type IpcListener = interprocess::local_socket::Listener;
@@ -199,8 +223,10 @@ pub fn listen() -> Result<IpcListener> {
         PipeListenerOptions::new().path(format!(r"\\.\pipe\{}", windows_pipe_basename()?));
     // The generic adapter requests 512-byte buffers. Bounded larger buffers
     // amortize scheduler round trips without changing peer authentication.
-    options.input_buffer_size_hint = 64 * 1024;
-    options.output_buffer_size_hint = 64 * 1024;
+    // 1 MiB: a multi-pane snapshot crosses in a few polls, not hundreds of
+    // timer-resolution sleeps (Windows sleeps are ~15 ms).
+    options.input_buffer_size_hint = 1024 * 1024;
+    options.output_buffer_size_hint = 1024 * 1024;
     options.security_descriptor = Some(SecurityDescriptor::deserialize(&sddl)?);
     Ok(IpcListener(
         options
@@ -298,24 +324,70 @@ fn check_windows_peer(pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn transfer<T>(deadline: Instant, operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
+/// When a frame transfer gives up. A patient deadline (GUI commands) is
+/// extended for as long as a daemon process is alive: a frozen or loaded
+/// daemon is waited for, never reported as a timeout; only its death ends it.
+pub struct Deadline<'a> {
+    at: std::cell::Cell<Instant>,
+    patient: bool,
+    /// Patient waits end here (CLI), if set.
+    limit: Option<Instant>,
+    /// Patient waits end as soon as this turns false (the GUI is closing).
+    running: Option<&'a std::sync::atomic::AtomicBool>,
+}
+impl<'a> Deadline<'a> {
+    pub fn new(patient: bool) -> Self {
+        Self {
+            at: std::cell::Cell::new(Instant::now() + DEADLINE),
+            patient,
+            limit: None,
+            running: None,
+        }
+    }
+    fn expired(&self) -> bool {
+        if self
+            .running
+            .is_some_and(|running| !running.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return true;
+        }
+        if Instant::now() < self.at.get() {
+            return false;
+        }
+        if self.patient && self.limit.is_none_or(|limit| Instant::now() < limit) && daemon_alive() {
+            self.at.set(Instant::now() + DEADLINE);
+            return false;
+        }
+        true
+    }
+}
+
+fn transfer<T>(deadline: &Deadline, operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
     let mut operation = operation;
     loop {
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
         }
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(1))
+            // Unix: the kernel timeout already waited. Windows: poll.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if cfg!(windows) {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
             }
             Err(error) => return Err(error.into()),
         }
     }
 }
 
-fn read_exact(reader: &mut impl Read, buffer: &mut [u8], deadline: Instant) -> Result<()> {
+fn read_exact(reader: &mut impl Read, buffer: &mut [u8], deadline: &Deadline) -> Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
         let count = transfer(deadline, || {
@@ -343,7 +415,13 @@ fn read_exact(reader: &mut impl Read, buffer: &mut [u8], deadline: Instant) -> R
 }
 
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
-    let deadline = Instant::now() + DEADLINE;
+    read_frame_by(reader, &Deadline::new(false))
+}
+
+pub fn read_frame_by<T: DeserializeOwned>(
+    reader: &mut impl Read,
+    deadline: &Deadline,
+) -> Result<T> {
     let mut length = [0; 4];
     read_exact(reader, &mut length, deadline)?;
     let length = u32::from_le_bytes(length) as usize;
@@ -356,18 +434,25 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
 }
 
 pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
+    write_frame_by(writer, value, &Deadline::new(false))
+}
+
+pub fn write_frame_by(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    deadline: &Deadline,
+) -> Result<()> {
     let data = postcard::to_allocvec(value)?;
     if data.len() > MAX_FRAME {
         bail!("IPC frame exceeds limit");
     }
     let framed = [(data.len() as u32).to_le_bytes().as_slice(), &data].concat();
-    let deadline = Instant::now() + DEADLINE;
     let mut offset = 0;
     while offset < framed.len() {
         // Bounded Windows writes amortize system calls within our 64-KiB hints;
         // the receiver drains between chunks. Unix sockets can accept the rest.
         let end = if cfg!(windows) {
-            (offset + 4096).min(framed.len())
+            (offset + 64 * 1024).min(framed.len())
         } else {
             framed.len()
         };
@@ -389,19 +474,253 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
     Ok(())
 }
 
+/// Written by the daemon when it is stopped on purpose (`crow-term stop`).
+pub const STOPPED_MARKER: &str = "daemon.stopped";
+const ALIVE_LOCK: &str = "daemon.alive";
+
+/// Take the daemon's lifetime lock (held until the process exits).
+pub fn hold_daemon_lock() -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(runtime_dir()?.join(ALIVE_LOCK))?;
+    // A starter's liveness probe holds the lock for an instant: retry briefly
+    // so that probe never makes a starting daemon give up.
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                bail!("A Crow daemon is already running for this runtime directory")
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("lock daemon lifetime file");
+            }
+        }
+    }
+}
+
+/// Whether a daemon process holds the lifetime lock (alive, even if it does not
+/// answer or accept right now).
+pub fn daemon_alive() -> bool {
+    let Ok(dir) = runtime_dir() else {
+        return false;
+    };
+    let path = dir.join(ALIVE_LOCK);
+    // No lock file but a socket: a daemon may run whose lock file was removed
+    // (runtime-dir clean-up) or an older one without it. Unknown counts as
+    // alive: never replace it on a guess.
+    if !path.exists() {
+        #[cfg(unix)]
+        return dir.join(socket_file()).exists();
+        // Windows: a pipe exists only while its daemon serves it.
+        #[cfg(not(unix))]
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+        return true;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 pub fn rpc(request: &Request) -> Result<Response> {
-    let stream = Stream::connect(socket_name()?).context("Crow daemon is not running")?;
-    check_peer(&stream).context("authenticate IPC server")?;
-    stream
-        .set_nonblocking(true)
-        .context("set client IPC nonblocking mode")?;
+    rpc_by(request, false)
+}
+
+/// A command that waits for a live daemon however long it takes (GUI input,
+/// paste, splits): never a timeout while the daemon process exists. It ends
+/// within about a second once `running` turns false.
+pub fn rpc_patient(request: &Request, running: &std::sync::atomic::AtomicBool) -> Result<Response> {
+    let mut deadline = Deadline::new(true);
+    deadline.running = Some(running);
+    rpc_with(request, &deadline)
+}
+
+/// Patient up to `limit` (CLI commands: a frozen daemon should not hang a
+/// script forever unless asked to).
+pub fn rpc_patient_for(request: &Request, limit: Option<Duration>) -> Result<Response> {
+    let mut deadline = Deadline::new(true);
+    deadline.limit = limit.map(|limit| Instant::now() + limit);
+    rpc_with(request, &deadline)
+}
+
+fn rpc_by(request: &Request, patient: bool) -> Result<Response> {
+    rpc_with(request, &Deadline::new(patient))
+}
+
+fn rpc_with(request: &Request, deadline: &Deadline<'_>) -> Result<Response> {
+    use interprocess::{ConnectWaitMode, local_socket::ConnectOptions};
+    // Bounded connect: a full accept backlog makes Linux block in connect().
+    let stream = ConnectOptions::new()
+        .name(socket_name()?)
+        .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(1)))
+        .connect_sync()
+        .map_err(|error| {
+            // A refusal while the daemon process lives is a full accept
+            // backlog (macOS): busy, not gone.
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) && !daemon_alive()
+            {
+                anyhow::Error::new(crate::link::Unreachable(error))
+            } else {
+                anyhow::Error::new(crate::link::NotSent(error.into()))
+            }
+        })?;
+    let not_sent = |error: anyhow::Error| anyhow::Error::new(crate::link::NotSent(error));
+    check_peer(&stream)
+        .context("authenticate IPC server")
+        .map_err(not_sent)?;
+    prepare(&stream)
+        .context("configure client IPC stream")
+        .map_err(not_sent)?;
     let mut stream = FramedStream::new(stream);
-    write_frame(&mut stream, request).context("write IPC request")?;
-    let response = read_frame(&mut stream).context("read IPC response")?;
-    if let Response::Error(message) = &response {
-        bail!("{message}");
+    write_frame_by(&mut stream, request, deadline)
+        .context("write IPC request")
+        .map_err(not_sent)?;
+    let response = read_frame_by(&mut stream, deadline).context("read IPC response")?;
+    if let Response::Error(message) = response {
+        return Err(anyhow::Error::new(crate::link::Refused(message)));
     }
     Ok(response)
+}
+
+/// Make sure a daemon serves this runtime directory, starting one only when
+/// none accepts connections. A daemon that is merely slow to answer is never
+/// replaced (that would orphan its sessions): its replies are awaited.
+pub fn ensure_daemon(config: Option<&std::path::Path>) -> Result<()> {
+    start_daemon(config, true)
+}
+
+/// Like [`ensure_daemon`], for a GUI whose daemon disappeared: it never starts
+/// one while a daemon process is alive, nor after `crow-term stop`.
+pub fn restart_daemon(config: Option<&std::path::Path>) -> Result<()> {
+    start_daemon(config, false)
+}
+
+/// Why a GUI must not restart the daemon.
+#[derive(Debug)]
+pub enum NoRestart {
+    StoppedOnPurpose,
+    StillAlive,
+}
+impl std::fmt::Display for NoRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoRestart::StoppedOnPurpose => "the daemon was stopped with `crow-term stop`",
+            NoRestart::StillAlive => "the daemon process is alive but not accepting connections",
+        })
+    }
+}
+impl std::error::Error for NoRestart {}
+
+fn start_daemon(config: Option<&std::path::Path>, user_command: bool) -> Result<()> {
+    use crate::link::{Failure, classify};
+    use std::process::{Command, Stdio};
+    let busy_until = Instant::now() + Duration::from_secs(20);
+    loop {
+        match rpc(&Request::List) {
+            Ok(_) => return Ok(()),
+            Err(error) if classify(&error) == Failure::Unreachable => break,
+            Err(error) if Instant::now() >= busy_until => {
+                return Err(error).context("Crow daemon is running but not answering");
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let runtime = runtime_dir()?;
+    if !user_command && runtime.join(STOPPED_MARKER).exists() {
+        return Err(NoRestart::StoppedOnPurpose.into());
+    }
+    // One starter at a time per runtime directory (several GUIs or CLIs can
+    // notice a stopped daemon together): removing a stale socket must never
+    // race with another starter's fresh one.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(runtime.join("daemon.lock"))?;
+    lock.lock().context("lock daemon start")?;
+    if rpc(&Request::List).is_ok() {
+        return Ok(());
+    }
+    // A live daemon that refuses connections (full accept backlog, stopped by a
+    // debugger) keeps its socket and sessions: wait for it, never replace it.
+    let alive_until = Instant::now() + Duration::from_secs(20);
+    while daemon_alive() {
+        if !user_command || Instant::now() >= alive_until {
+            return Err(NoRestart::StillAlive.into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if rpc(&Request::List).is_ok() {
+            return Ok(());
+        }
+    }
+    let _ = std::fs::remove_file(runtime.join(STOPPED_MARKER));
+    #[cfg(unix)]
+    {
+        // No daemon process holds the lifetime lock (checked under the start
+        // lock): the socket file is left over from one that did not exit cleanly.
+        let socket = runtime.join(socket_file());
+        if socket.exists() {
+            match Stream::connect(socket_name()?) {
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(&socket).context("remove stale daemon socket")?;
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let log = options.open(runtime.join("daemon.log"))?;
+    let mut command = Command::new(std::env::current_exe()?);
+    if let Some(path) = config {
+        command.arg("--config").arg(path);
+    }
+    command
+        .arg("daemon")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x00000008 | 0x00000200);
+    }
+    let mut child = command.spawn().context("Could not start Crow daemon")?;
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if rpc(&Request::List).is_ok() {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            bail!(
+                "Daemon exited {status}; inspect {}",
+                runtime.join("daemon.log").display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    bail!(
+        "Daemon startup timed out; log: {}",
+        runtime.join("daemon.log").display()
+    )
 }
 
 pub fn wake_listener() {
@@ -416,9 +735,15 @@ mod tests {
     #[test]
     fn expired_deadline_stops_even_interrupted_operations() {
         assert!(
-            transfer::<()>(Instant::now(), || Err(
-                std::io::ErrorKind::Interrupted.into()
-            ))
+            transfer::<()>(
+                &Deadline {
+                    at: std::cell::Cell::new(Instant::now()),
+                    patient: false,
+                    limit: None,
+                    running: None,
+                },
+                || Err(std::io::ErrorKind::Interrupted.into())
+            )
             .is_err()
         );
     }
@@ -474,7 +799,7 @@ mod tests {
             data: Vec::new(),
         };
         write_frame(&mut writer, &value).unwrap();
-        assert!(writer.max <= 4096);
+        assert!(writer.max <= 64 * 1024);
         assert_eq!(
             read_frame::<Vec<u8>>(&mut writer.data.as_slice()).unwrap(),
             value

@@ -60,6 +60,8 @@ pub struct FrameMeta {
     pub prefix: bool,
     pub status: String,
     pub ime: String,
+    /// Pane whose program is not reading its input, if any (footer note).
+    pub stuck_pane: Option<u64>,
 }
 
 pub struct FrameDump {
@@ -187,6 +189,7 @@ mod tests {
             prefix: false,
             status: String::new(),
             ime: String::new(),
+            stuck_pane: None,
         }
     }
 

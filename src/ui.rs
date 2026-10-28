@@ -15,7 +15,6 @@ use std::num::NonZeroU32;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,6 +49,24 @@ enum UiEvent {
         activate_created: bool,
     },
     Error(String),
+    /// A pane is not reading its input (`None`: no pane is stuck).
+    Stuck(Option<(u64, usize)>),
+    /// A command failed; ignored when it addressed a daemon that was replaced.
+    CommandError {
+        epoch: u64,
+        message: String,
+    },
+    /// Link to the daemon: a status for the footer (`None` clears a link note);
+    /// `expires` clears it after a moment (the "reconnected" note).
+    Link {
+        status: Option<String>,
+        expires: bool,
+    },
+    /// The daemon was restarted: the GUI now shows this window and pane.
+    Reattached {
+        window: u64,
+        pane: u64,
+    },
     /// Crow agent status, published only when its rendered content changed.
     Crow(Box<CrowView>),
 }
@@ -85,40 +102,33 @@ impl ViewMailbox {
     }
 }
 
-struct Command {
-    request: Request,
-    activate_created: bool,
+/// Start a new daemon after the previous one stopped and recreate the session
+/// in it (the old daemon's programs ended with it).
+fn restart_daemon(
+    config: Option<&std::path::Path>,
+    session: &str,
+    shell: &ShellSpec,
+) -> Result<(u64, u64)> {
+    crate::ipc::restart_daemon(config)?;
+    recreate_session(session, shell)
 }
 
-// A paste is one Command in the queue. Drain all its chunks here before receiving
-// another command: no key, resize, or second paste can interleave bracket markers.
-const INPUT_CHUNK_BYTES: usize = 16 * 1024;
-fn execute_request(
-    request: &Request,
-    mut send: impl FnMut(&Request) -> Result<Response>,
-) -> Result<Response> {
-    let Request::Input { pane, bytes } = request else {
-        return send(request);
-    };
-    let mut sent = 0;
-    for chunk in bytes.chunks(INPUT_CHUNK_BYTES) {
-        let part = Request::Input {
-            pane: *pane,
-            bytes: chunk.to_vec(),
-        };
-        match send(&part) {
-            Ok(Response::Ok) => sent += chunk.len(),
-            Ok(Response::Error(message)) => anyhow::bail!("Input interrupted after {sent}/{} bytes: {message}", bytes.len()),
-            Ok(_) => anyhow::bail!("Unexpected input reply after {sent}/{} bytes", bytes.len()),
-            Err(error) => return Err(error).with_context(|| format!("Input interrupted after {sent}/{} acknowledged bytes; the last chunk may have reached the PTY", bytes.len())),
-        }
+/// Create (or find) the session in the running daemon.
+fn recreate_session(session: &str, shell: &ShellSpec) -> Result<(u64, u64)> {
+    match rpc(&Request::Ensure {
+        session: session.to_owned(),
+        shell: shell.clone(),
+        size: Size::default(),
+    })? {
+        Response::Created { window, pane } => Ok((window, pane)),
+        other => anyhow::bail!("unexpected Ensure reply {other:?}"),
     }
-    Ok(Response::Ok)
 }
 
 /// Attach a native GUI to a running persistent mux server. Closing the GUI only detaches.
 pub fn run(
     config: Config,
+    config_path: Option<std::path::PathBuf>,
     session: String,
     initial_window: u64,
     initial_pane: u64,
@@ -129,42 +139,61 @@ pub fn run(
     let proxy = event_loop.create_proxy();
     let running = Arc::new(AtomicBool::new(true));
     let active_window = Arc::new(AtomicU64::new(initial_window));
-    let (tx, rx) = mpsc::channel::<Command>();
     let command_proxy = proxy.clone();
     let crow_proxy = proxy.clone();
-    let command_running = running.clone();
-    let command_worker = thread::Builder::new()
-        .name("crow-ui-commands".into())
-        .spawn(move || {
-            while command_running.load(Ordering::Relaxed) {
-                let command = match rx.recv_timeout(Duration::from_millis(100)) {
-                    Ok(command) => command,
-                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                    Err(_) => break,
-                };
-                let event = match execute_request(&command.request, rpc) {
-                    Ok(response) => UiEvent::Reply {
-                        response,
-                        activate_created: command.activate_created,
-                    },
-                    Err(error) => UiEvent::Error(format!("Mux command: {error:#}")),
-                };
-                if command_proxy.send_event(event).is_err() {
-                    break;
-                }
+    // Input lanes per pane, a structural lane and a coalesced lane (see
+    // lanes.rs): a pane that does not read its input never holds up others.
+    let dispatcher = Arc::new(crate::lanes::Dispatcher::new(
+        running.clone(),
+        crate::ipc::rpc_patient,
+        |error| {
+            // Never reached a live daemon (full accept backlog, busy): the
+            // same bytes are sent again. A pane closed on purpose (or its
+            // program exited) drops what waited for it quietly.
+            if crate::link::not_sent(error) && crate::ipc::daemon_alive() {
+                crate::lanes::Outcome::Retry
+            } else if crate::link::pane_gone(error) {
+                crate::lanes::Outcome::PaneGone
+            } else {
+                crate::lanes::Outcome::Failed
             }
-        })?;
+        },
+        move |event| {
+            let event = match event {
+                crate::lanes::Event::Reply {
+                    response,
+                    activate_created,
+                } => UiEvent::Reply {
+                    response,
+                    activate_created,
+                },
+                crate::lanes::Event::Error { epoch, message } => {
+                    eprintln!("crow-term: {message}");
+                    UiEvent::CommandError { epoch, message }
+                }
+                crate::lanes::Event::Stuck(stuck) => UiEvent::Stuck(stuck),
+            };
+            command_proxy.send_event(event).is_ok()
+        },
+    ));
     let mailbox = Arc::new(ViewMailbox::default());
     let watch_mailbox = mailbox.clone();
     let watch_running = running.clone();
     let watch_window = active_window.clone();
     let watch_session = session.clone();
+    let watch_shell = shell.clone();
     let watch_worker = thread::Builder::new()
         .name("crow-ui-watch".into())
         .spawn(move || {
             let mut since = 0;
             let mut previous_window = initial_window;
-            let mut failures = 0;
+            // A slow reply is never a disconnect; only a daemon that stopped
+            // accepting connections is reported, restarted and reattached.
+            let mut link = crate::link::Link::default();
+            // Set by any failed exchange: a session missing from the daemon's
+            // reply afterwards means the daemon was restarted (possibly by
+            // another GUI), not that the user closed it.
+            let mut recovering = false;
             while watch_running.load(Ordering::Relaxed) {
                 let cycle_started = Instant::now();
                 let window = watch_window.load(Ordering::Relaxed);
@@ -177,8 +206,47 @@ pub fn run(
                     window,
                     since,
                 }) {
+                    Ok(Response::View(view))
+                        if recovering && !view.sessions.iter().any(|s| s.name == watch_session) =>
+                    {
+                        match recreate_session(&watch_session, &watch_shell) {
+                            Ok((window, pane)) => {
+                                recovering = false;
+                                link = crate::link::Link::default();
+                                watch_window.store(window, Ordering::Relaxed);
+                                previous_window = window;
+                                since = 0;
+                                if proxy
+                                    .send_event(UiEvent::Reattached { window, pane })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = proxy.send_event(UiEvent::Link {
+                                    status: Some(format!(
+                                        "Session could not be recreated ({error:#}); retrying"
+                                    )),
+                                    expires: false,
+                                });
+                                thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                        continue;
+                    }
                     Ok(Response::View(view)) => {
-                        failures = 0;
+                        recovering = false;
+                        if let Some(note) = link.ok()
+                            && proxy
+                                .send_event(UiEvent::Link {
+                                    status: Some(note.into()),
+                                    expires: true,
+                                })
+                                .is_err()
+                        {
+                            break;
+                        }
                         since = view.revision;
                         if watch_mailbox.push(window, view)
                             && proxy.send_event(UiEvent::ViewReady).is_err()
@@ -195,16 +263,96 @@ pub fn run(
                             .send_event(UiEvent::Error("Unexpected mux Watch response".into()));
                         break;
                     }
-                    Err(error) => {
-                        failures += 1;
-                        let _ = proxy.send_event(UiEvent::Error(format!(
-                            "Mux disconnected ({failures}/5): {error:#}"
-                        )));
-                        if failures >= 5 {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(250 * failures));
+                    // The daemon answered with an error (e.g. the session ended).
+                    // The daemon answered with an error: show it and keep watching.
+                    Err(error) if crate::link::refused(&error) => {
+                        let _ = proxy.send_event(UiEvent::Error(format!("{error:#}")));
+                        thread::sleep(Duration::from_secs(2));
+                        continue;
                     }
+                    Err(error) => match link.failed(crate::link::classify(&error)) {
+                        crate::link::Action::Retry { after, status } => {
+                            recovering = true;
+                            if let Some(status) = status {
+                                eprintln!("crow-term: daemon slow to answer: {error:#}");
+                                let _ = proxy.send_event(UiEvent::Link {
+                                    status: Some(status),
+                                    expires: false,
+                                });
+                            }
+                            thread::sleep(after);
+                            continue;
+                        }
+                        crate::link::Action::Restart { .. } if crate::ipc::daemon_alive() => {
+                            // Refusing connections while its process lives (full
+                            // backlog, paused): busy, never "stopped".
+                            recovering = true;
+                            let _ = proxy.send_event(UiEvent::Link {
+                                status: Some(crate::link::BUSY.into()),
+                                expires: false,
+                            });
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
+                        crate::link::Action::Restart { status } => {
+                            recovering = true;
+                            let _ = proxy.send_event(UiEvent::Link {
+                                status: Some(status),
+                                expires: false,
+                            });
+                            match restart_daemon(
+                                config_path.as_deref(),
+                                &watch_session,
+                                &watch_shell,
+                            ) {
+                                Ok((window, pane)) => {
+                                    // The restart note stands; no "reconnected" over it.
+                                    link = crate::link::Link::default();
+                                    watch_window.store(window, Ordering::Relaxed);
+                                    previous_window = window;
+                                    since = 0;
+                                    if proxy
+                                        .send_event(UiEvent::Reattached { window, pane })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(error) => match error.downcast_ref::<crate::ipc::NoRestart>() {
+                                    // Alive but not accepting right now: it is busy, not gone.
+                                    Some(crate::ipc::NoRestart::StillAlive) => {
+                                        let _ = proxy.send_event(UiEvent::Link {
+                                            status: Some(crate::link::BUSY.into()),
+                                            expires: false,
+                                        });
+                                        thread::sleep(Duration::from_millis(500));
+                                    }
+                                    Some(crate::ipc::NoRestart::StoppedOnPurpose) => {
+                                        let _ = proxy.send_event(UiEvent::Link {
+                                            status: Some(
+                                                "The daemon was stopped (crow-term stop): its sessions ended. Run crow-term to start again."
+                                                    .into(),
+                                            ),
+                                            expires: false,
+                                        });
+                                        // Keep looking: when the user starts crow-term
+                                        // again, this window reattaches to it.
+                                        thread::sleep(Duration::from_secs(2));
+                                    }
+                                    None => {
+                                        let _ = proxy.send_event(UiEvent::Link {
+                                            status: Some(format!(
+                                                "Daemon could not be restarted ({error:#}); retrying"
+                                            )),
+                                            expires: false,
+                                        });
+                                        thread::sleep(Duration::from_secs(2));
+                                    }
+                                },
+                            }
+                            continue;
+                        }
+                    },
                 }
                 // Bound snapshots during sustained PTY output; idle Watch already waits 1s.
                 if let Some(remaining) =
@@ -220,10 +368,19 @@ pub fn run(
             &config.crow,
             running.clone(),
             initial_pane,
-            |pane| match rpc(&Request::PaneCwd { pane }) {
-                Ok(Response::Cwd(cwd)) => Ok(cwd),
-                // rpc() already maps Response::Error (e.g. a closed pane) to Err.
-                _ => Err(()),
+            {
+                // Guarded like every pane-addressed request: never the cwd of a
+                // restarted daemon's pane that reuses this id.
+                let dispatcher = dispatcher.clone();
+                move |pane| match crate::lanes::guard(
+                    Request::PaneCwd { pane },
+                    dispatcher.instance(),
+                )
+                .map(|request| rpc(&request))
+                {
+                    Some(Ok(Response::Cwd(cwd))) => Ok(cwd),
+                    _ => Err(()),
+                }
             },
             move |view| crow_proxy.send_event(UiEvent::Crow(Box::new(view))).is_ok(),
         ) {
@@ -244,7 +401,7 @@ pub fn run(
         initial_window,
         initial_pane,
         shell,
-        tx,
+        dispatcher.clone(),
         active_window,
         running.clone(),
         mailbox,
@@ -258,8 +415,11 @@ pub fn run(
     }
     // Closing the event loop never sends ClosePane/KillSession to the mux.
     drop(app);
-    let _ = command_worker.join();
-    let _ = watch_worker.join();
+    // Lanes observe the shutdown within about a second even with a frozen
+    // daemon. The watch thread is left to end on its own (its long poll must
+    // not delay closing the window).
+    dispatcher.shutdown();
+    drop(watch_worker);
     result.context("native event loop")?;
     if let Some(error) = fatal_error {
         anyhow::bail!(error);
@@ -971,7 +1131,7 @@ struct App {
     pane_id: u64,
     shared_window: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
-    commands: mpsc::Sender<Command>,
+    dispatcher: Arc<crate::lanes::Dispatcher>,
     mailbox: Arc<ViewMailbox>,
     fatal_error: Option<String>,
     window: Option<Arc<Window>>,
@@ -1002,6 +1162,10 @@ struct App {
     /// Visual bell: panes flashing until the deadline.
     bell_flash: Option<(Instant, HashSet<u64>)>,
     window_title: String,
+    /// Clear `status` at this instant (transient link notes).
+    status_expires: Option<Instant>,
+    /// A pane whose program is not reading its input: (pane, KiB waiting).
+    stuck: Option<(u64, usize)>,
     clipboard: Option<arboard::Clipboard>,
     crow: Option<Arc<crow::Shared>>,
     crow_view: CrowView,
@@ -1020,7 +1184,7 @@ impl App {
         window_id: u64,
         pane_id: u64,
         shell: ShellSpec,
-        commands: mpsc::Sender<Command>,
+        dispatcher: Arc<crate::lanes::Dispatcher>,
         shared_window: Arc<AtomicU64>,
         running: Arc<AtomicBool>,
         mailbox: Arc<ViewMailbox>,
@@ -1036,7 +1200,7 @@ impl App {
             pane_id,
             shared_window,
             running,
-            commands,
+            dispatcher,
             mailbox,
             fatal_error: None,
             window: None,
@@ -1062,6 +1226,8 @@ impl App {
             clipboard_seqs: HashMap::new(),
             bell_flash: None,
             window_title: String::new(),
+            status_expires: None,
+            stuck: None,
             clipboard: None,
             crow,
             crow_view: CrowView::default(),
@@ -1122,10 +1288,12 @@ impl App {
         self.redraw();
     }
     fn send(&self, request: Request, activate_created: bool) {
-        let _ = self.commands.send(Command {
-            request,
-            activate_created,
-        });
+        match request {
+            Request::Input { pane, bytes } => self.dispatcher.input(pane, bytes),
+            Request::Resize { pane, size, cell } => self.dispatcher.resize(pane, size, cell),
+            Request::Scroll { pane, lines } => self.dispatcher.scroll(pane, lines),
+            other => self.dispatcher.structural(other, activate_created),
+        }
     }
     fn input(&mut self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
@@ -1536,7 +1704,18 @@ impl App {
             .as_mut()
             .and_then(|clipboard| clipboard.get_text().ok())
         {
-            Some(text) => self.input(paste_bytes(&text, self.modes().bracketed_paste)),
+            Some(text) => {
+                self.selection = None;
+                let bytes = paste_bytes(&text, self.modes().bracketed_paste);
+                if let Err(waiting) = self.dispatcher.paste(self.pane_id, bytes) {
+                    self.status = format!(
+                        "Paste refused: pane {} is not reading its input ({} KB already waiting)",
+                        self.pane_id, waiting
+                    );
+                    self.status_expires = None;
+                    self.redraw();
+                }
+            }
             None => {
                 self.status = "Clipboard unavailable or has no text".into();
                 self.redraw();
@@ -1576,7 +1755,13 @@ impl App {
         };
         if let Some(bytes) = encode_mouse(code, point, release, self.mods, sgr) {
             self.selection = None;
-            self.send(Request::Input { pane, bytes }, false);
+            // Motion reports (bit 32) supersede each other: coalesced in the
+            // pane's lane, never ahead of keys or clicks.
+            if code & 32 != 0 && !release {
+                self.dispatcher.motion(pane, bytes);
+            } else {
+                self.send(Request::Input { pane, bytes }, false);
+            }
         }
     }
     fn release_mouse_capture(&mut self, button: MouseButton) -> bool {
@@ -2190,6 +2375,13 @@ impl App {
             chrome.muted
         };
         let mut footer_items: Vec<(&str, u32)> = Vec::new();
+        // Shown whatever else the footer says: input is waiting, not lost.
+        let stuck = self.stuck.map(|(pane, kib)| {
+            format!("pane {pane}: the program is not reading input — {kib} KB waiting")
+        });
+        if let Some(stuck) = &stuck {
+            footer_items.push((stuck, chrome.text));
+        }
         let message_first = self.prefix || !self.status.is_empty();
         if message_first {
             footer_items.push((&hint, hint_color));
@@ -2312,6 +2504,7 @@ impl App {
                 prefix: self.prefix,
                 status: self.status.clone(),
                 ime: self.ime.clone(),
+                stuck_pane: self.stuck.map(|(pane, _)| pane),
             };
             if let Err(error) = dump.write(&frame, size.width, size.height, &meta) {
                 eprintln!(
@@ -2380,6 +2573,21 @@ impl ApplicationHandler<UiEvent> for App {
                 if window != self.window_id {
                     return;
                 }
+                self.dispatcher.set_instance(view.instance);
+                // Lanes of panes that no longer exist (closed, exited) end.
+                if view
+                    .sessions
+                    .iter()
+                    .any(|session| session.name == self.session)
+                {
+                    let live: Vec<u64> = view
+                        .sessions
+                        .iter()
+                        .flat_map(|session| &session.windows)
+                        .flat_map(|window| window.layout.panes())
+                        .collect();
+                    self.dispatcher.retain(&live);
+                }
                 let revision_changed = self
                     .view
                     .as_ref()
@@ -2431,6 +2639,46 @@ impl ApplicationHandler<UiEvent> for App {
             },
             UiEvent::Error(error) => {
                 self.status = error;
+                self.status_expires = None;
+                self.redraw();
+            }
+            UiEvent::Stuck(stuck) => {
+                self.stuck = stuck;
+                self.redraw();
+            }
+            UiEvent::CommandError { epoch, message } => {
+                // Pane ids of a replaced daemon mean nothing to the new one.
+                if epoch == self.dispatcher.epoch() {
+                    self.status = message;
+                    self.status_expires = None;
+                    self.redraw();
+                }
+            }
+            UiEvent::Link { status, expires } => {
+                self.status = status.unwrap_or_default();
+                self.status_expires = expires.then(|| Instant::now() + Duration::from_secs(3));
+                self.redraw();
+            }
+            UiEvent::Reattached { window, pane } => {
+                eprintln!(
+                    "crow-term: reattached to window {window}, pane {pane} (was window {}, pane {})",
+                    self.window_id, self.pane_id
+                );
+                self.dispatcher.reattached();
+                // Switch ids directly: the old ones belong to the replaced
+                // daemon and must not be resized or focused in the new one.
+                self.view = None;
+                self.sent_sizes.clear();
+                self.window_id = window;
+                self.shared_window.store(window, Ordering::Relaxed);
+                self.pane_id = pane;
+                self.pending_focus_in = None;
+                self.selection = None;
+                self.renderer.rows.clear();
+                self.status =
+                    "Daemon restarted — a new session replaced the one that ended with it".into();
+                self.status_expires = Some(Instant::now() + Duration::from_secs(10));
+                self.resize_panes();
                 self.redraw();
             }
             UiEvent::Crow(view) => {
@@ -2524,7 +2772,17 @@ impl ApplicationHandler<UiEvent> for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // The visual bell is the only timed redraw; otherwise stay event-driven.
+        if let Some(until) = self.status_expires {
+            if Instant::now() >= until {
+                self.status_expires = None;
+                self.status.clear();
+                self.redraw();
+            } else if self.bell_flash.is_none() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(until));
+                return;
+            }
+        }
+        // The visual bell is the only other timed redraw; otherwise stay event-driven.
         match &self.bell_flash {
             Some((until, _)) if Instant::now() >= *until => {
                 self.bell_flash = None;
@@ -3507,81 +3765,6 @@ mod tests {
         );
     }
     #[test]
-    fn large_bracketed_paste_is_chunked_as_one_ordered_command() {
-        let text = "é中".repeat(300_000);
-        let bytes = paste_bytes(&text, true);
-        assert!(bytes.len() > 1024 * 1024);
-        let mut received = Vec::new();
-        let mut panes = Vec::new();
-        let mut sender = |request: &Request| -> Result<Response> {
-            let Request::Input { pane, bytes } = request else {
-                panic!("input only")
-            };
-            assert!(bytes.len() <= INPUT_CHUNK_BYTES);
-            panes.push(*pane);
-            received.extend_from_slice(bytes);
-            Ok(Response::Ok)
-        };
-        assert!(matches!(
-            execute_request(
-                &Request::Input {
-                    pane: 7,
-                    bytes: bytes.clone()
-                },
-                &mut sender
-            )
-            .unwrap(),
-            Response::Ok
-        ));
-        execute_request(
-            &Request::Input {
-                pane: 8,
-                bytes: b"next".to_vec(),
-            },
-            &mut sender,
-        )
-        .unwrap();
-        assert_eq!(&received[..bytes.len()], bytes);
-        assert_eq!(&received[bytes.len()..], b"next");
-        assert_eq!(panes.pop(), Some(8));
-        assert!(panes.iter().all(|pane| *pane == 7));
-        assert_eq!(
-            received
-                .windows(6)
-                .filter(|window| *window == b"\x1b[200~")
-                .count(),
-            1
-        );
-        assert_eq!(
-            received
-                .windows(6)
-                .filter(|window| *window == b"\x1b[201~")
-                .count(),
-            1
-        );
-    }
-    #[test]
-    fn chunk_failure_reports_partial_progress_and_stops() {
-        let mut calls = 0;
-        let error = execute_request(
-            &Request::Input {
-                pane: 1,
-                bytes: vec![b'x'; INPUT_CHUNK_BYTES * 3],
-            },
-            |_| {
-                calls += 1;
-                Ok(if calls == 2 {
-                    Response::Error("pane closed".into())
-                } else {
-                    Response::Ok
-                })
-            },
-        )
-        .unwrap_err();
-        assert_eq!(calls, 2);
-        assert!(error.to_string().contains("16384/49152"));
-    }
-    #[test]
     fn modifier_presses_do_not_count_as_prefix_actions() {
         for named in [
             NamedKey::Shift,
@@ -3635,6 +3818,7 @@ mod tests {
         assert!(mailbox.push(
             1,
             View {
+                instance: 1,
                 revision: 2,
                 sessions: vec![],
                 screens: vec![(1, screen)]
@@ -3643,6 +3827,7 @@ mod tests {
         assert!(!mailbox.push(
             1,
             View {
+                instance: 1,
                 revision: 2,
                 sessions: vec![],
                 screens: vec![]
@@ -3653,6 +3838,7 @@ mod tests {
         assert!(mailbox.push(
             2,
             View {
+                instance: 1,
                 revision: 3,
                 sessions: vec![],
                 screens: vec![]

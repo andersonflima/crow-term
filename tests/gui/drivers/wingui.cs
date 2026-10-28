@@ -72,6 +72,8 @@ static class WinGui
                 case "close": PostMessage(Hwnd(args[1]), 0x0010, IntPtr.Zero, IntPtr.Zero); return 0;
                 case "screenshot": Screenshot(args[1]); return 0;
                 case "clipboard": return Clip(Encoding.UTF8.GetString(Convert.FromBase64String(args[1])));
+                // Large payloads: a command line is capped at 32K characters.
+                case "clipboard-file": return Clip(System.IO.File.ReadAllText(args[1], Encoding.UTF8));
                 case "sink": Sink(); return 0;
                 case "info": Info(); return 0;
             }

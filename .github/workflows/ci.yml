@@ -40,6 +40,14 @@ jobs:
         run: python tests/daemon_e2e.py
       - name: Terminal query reply matrix
         run: python tests/protocol_probe.py
+      - name: Daemon link under load (8 flooding panes, typing latency; optimized build)
+        shell: bash
+        run: |
+          # Latency is a property of the shipped (optimized) binary; a debug
+          # build is ~20x slower in snapshot code and measures the compiler.
+          cargo build --profile stress --locked
+          exe=target/stress/crow-term; [[ "${RUNNER_OS}" == "Windows" ]] && exe="${exe}.exe"
+          CROW_TERM_BIN="${exe}" python tests/link_stress.py
       - name: Offline shell profiles (Unix/WSL contract)
         if: runner.os != 'Windows'
         run: python tests/shell_setup.py
@@ -48,8 +56,8 @@ jobs:
       - name: GUI journey tooling (codecs, diff, grid lookup)
         run: python tests/gui_tools_test.py
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Test-only frame-dump hook (feature frame-dump)
-        run: cargo clippy --locked --all-targets --features frame-dump -- -D warnings
+      - name: Test-only hooks (features frame-dump, test-hooks)
+        run: cargo clippy --locked --all-targets --features frame-dump,test-hooks -- -D warnings
       - run: cargo test --locked --all-targets
       - name: Release binary
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'

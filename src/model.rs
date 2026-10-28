@@ -187,6 +187,10 @@ pub struct SessionInfo {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
+    /// Random per daemon process (wire v6): commands carry it so a restarted
+    /// daemon, whose pane ids start over, rejects commands meant for its
+    /// predecessor.
+    pub instance: u64,
     pub revision: u64,
     pub sessions: Vec<SessionInfo>,
     pub screens: Vec<(u64, Screen)>,
@@ -255,6 +259,12 @@ pub enum Request {
     /// Latest OSC 52 copy of a pane (appended last, wire v5).
     Clipboard {
         pane: u64,
+    },
+    /// `request` only if the daemon is still the instance the client saw
+    /// (wire v6). GUIs send every pane- or window-addressed command this way.
+    Guarded {
+        instance: u64,
+        request: Box<Request>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

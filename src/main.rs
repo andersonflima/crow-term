@@ -3,8 +3,7 @@ use clap::{Parser, Subcommand};
 use crow_term::{config::Config, ipc, model::*, server, ui};
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
+    process::Command,
 };
 
 #[derive(Parser)]
@@ -86,6 +85,9 @@ enum Action {
         text: String,
         #[arg(long)]
         enter: bool,
+        /// Seconds to wait for a busy or frozen daemon (0: until it exits).
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
     },
     CapturePane {
         pane: u64,
@@ -155,59 +157,6 @@ fn shell_setup_candidates_for(invoked: &Path) -> Result<Vec<PathBuf>> {
         .into_iter()
         .map(|base| base.join("shell/setup.py"))
         .collect())
-}
-
-fn ensure_daemon(config: Option<&PathBuf>) -> Result<()> {
-    let initial_error = match ipc::rpc(&Request::List) {
-        Ok(_) => return Ok(()),
-        Err(error) => error,
-    };
-    let runtime = ipc::runtime_dir()?;
-    let mut options = std::fs::OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let log = options.open(runtime.join("daemon.log"))?;
-    let mut command = Command::new(std::env::current_exe()?);
-    if let Some(path) = config {
-        command.arg("--config").arg(path);
-    }
-    command
-        .arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(log);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(0x00000008 | 0x00000200);
-    }
-    let mut child = command.spawn().context("Could not start Crow daemon")?;
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        if ipc::rpc(&Request::List).is_ok() {
-            return Ok(());
-        }
-        if let Some(status) = child.try_wait()? {
-            bail!(
-                "Daemon exited {status}; first connection failed: {initial_error:#}; inspect {} (a stale socket after crash must be removed manually, only when no daemon is running)",
-                runtime.join("daemon.log").display()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    bail!(
-        "Daemon startup timed out; log: {}",
-        runtime.join("daemon.log").display()
-    )
 }
 
 fn created(response: Response) -> Result<(u64, u64)> {
@@ -346,7 +295,7 @@ fn main() -> Result<()> {
         std::io::stdout().write_all(&bytes)?;
         return Ok(());
     }
-    ensure_daemon(cli.config.as_ref())?;
+    ipc::ensure_daemon(cli.config.as_deref())?;
     match cli.command.as_ref() {
         Some(Action::ListSessions) => print_response(ipc::rpc(&Request::List)?),
         Some(Action::KillSession { name }) => print_response(ipc::rpc(&Request::KillSession {
@@ -402,12 +351,22 @@ fn main() -> Result<()> {
                 pane: *pane,
             })?)
         }
-        Some(Action::SendKeys { pane, text, enter }) => {
+        Some(Action::SendKeys {
+            pane,
+            text,
+            enter,
+            wait,
+        }) => {
             let mut bytes = text.as_bytes().to_vec();
             if *enter {
                 bytes.push(b'\r');
             }
-            print_response(ipc::rpc(&Request::Input { pane: *pane, bytes })?)
+            // Like the GUI: waited for while the daemon lives, never a timeout.
+            let limit = (*wait > 0).then(|| std::time::Duration::from_secs(*wait));
+            print_response(ipc::rpc_patient_for(
+                &Request::Input { pane: *pane, bytes },
+                limit,
+            )?)
         }
         Some(Action::CapturePane { pane, json }) => {
             let Response::View(view) = ipc::rpc(&Request::List)? else {
@@ -484,7 +443,7 @@ fn main() -> Result<()> {
                     size: Size::default(),
                 })?)?
             };
-            ui::run(config, session, window, pane, spec)
+            ui::run(config, cli.config.clone(), session, window, pane, spec)
         }
         _ => unreachable!("local commands handled above"),
     }

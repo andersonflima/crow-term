@@ -77,7 +77,10 @@ class Windows(Driver):
         self.helper("resize", self.hwnd(gui), int(width), int(height))
 
     def set_clipboard(self, text):
-        self.helper("clipboard", base64.b64encode(text.encode()).decode())
+        # Through a file: a command line holds at most 32K characters.
+        path = self.build / "clipboard.txt"
+        path.write_text(text, encoding="utf-8", newline="")
+        self.helper("clipboard-file", path)
 
     def focus_away(self, gui):
         if self.sink is None:
