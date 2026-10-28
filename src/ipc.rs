@@ -27,9 +27,13 @@ impl FramedStream {
 }
 impl Read for FramedStream {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let count = self.0.read(buffer)?;
+        #[cfg(not(windows))]
+        return self.0.read(buffer);
         #[cfg(windows)]
-        if count == 0 && !buffer.is_empty() {
+        {
+            if buffer.is_empty() {
+                return Ok(0);
+            }
             use std::os::windows::io::{AsHandle, AsRawHandle};
             use windows_sys::Win32::System::Pipes::PeekNamedPipe;
             let Stream::NamedPipe(pipe) = &self.0;
@@ -46,15 +50,26 @@ impl Read for FramedStream {
                     std::ptr::null_mut(),
                 )
             };
-            if connected != 0 {
+            if connected == 0 {
+                let error = std::io::Error::last_os_error();
+                return if matches!(error.raw_os_error(), Some(109 | 232 | 233)) {
+                    Ok(0)
+                } else {
+                    Err(error)
+                };
+            }
+            if available == 0 {
                 return Err(std::io::ErrorKind::WouldBlock.into());
             }
-            let error = std::io::Error::last_os_error();
-            if !matches!(error.raw_os_error(), Some(109 | 232 | 233)) {
-                return Err(error);
+            // Request only queued bytes. An empty/oversized NOWAIT ReadFileEx
+            // must never stall both sides while a larger frame is being sent.
+            let length = buffer.len().min(available as usize);
+            let count = self.0.read(&mut buffer[..length])?;
+            if count == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
             }
+            Ok(count)
         }
-        Ok(count)
     }
 }
 impl Write for FramedStream {
@@ -304,11 +319,10 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
     let deadline = Instant::now() + DEADLINE;
     let mut offset = 0;
     while offset < framed.len() {
-        // PIPE_NOWAIT cannot make progress on an oversized atomic pipe write.
-        // Keep Windows writes within the default kernel pipe-buffer quantum;
+        // Keep Windows writes within Interprocess's 512-byte buffer-size hint;
         // the receiver drains between chunks. Unix sockets can accept the rest.
         let end = if cfg!(windows) {
-            (offset + 4096).min(framed.len())
+            (offset + 512).min(framed.len())
         } else {
             framed.len()
         };
@@ -415,7 +429,7 @@ mod tests {
             data: Vec::new(),
         };
         write_frame(&mut writer, &value).unwrap();
-        assert!(writer.max <= 4096);
+        assert!(writer.max <= 512);
         assert_eq!(
             read_frame::<Vec<u8>>(&mut writer.data.as_slice()).unwrap(),
             value
