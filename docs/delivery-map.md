@@ -105,6 +105,11 @@ Only allowlisted font/theme/plugin sources were copied, retaining licenses and
 hashes. Existing user dotfiles, histories, credentials, MCPs, shells and installed
 terminals were not modified. The public tree was scanned for secret/machine-path
 patterns before publication; this does not claim a formal full dependency audit.
+`THIRD_PARTY_LICENSES.txt` preserves notices for the locked all-target Cargo graph;
+`scripts/third_party_notices.py --check` checks freshness. Missing crate-package
+notices are cached from immutable official upstream revisions. Two upstream
+source trees omit original license files; their MIT declarations and a labelled
+standard template are explicitly distinguished from original copyright notices.
 OSC52 clipboard access from terminal output is disabled; explicit user clipboard
 shortcuts remain enabled. Nonexistent/unknown config fields fail explicitly.
 
