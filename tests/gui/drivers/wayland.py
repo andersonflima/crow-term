@@ -38,6 +38,20 @@ def run(*args, timeout=15, check=True):
     return result.stdout.strip()
 
 
+def wait_for_selection(reader, text, timeout=10):
+    """Seconds until `reader` returns `text`: the clipboard is owned and offers
+    it. A paste issued earlier finds no selection ("Clipboard unavailable")."""
+    started = time.monotonic()
+    last = None
+    while time.monotonic() - started < timeout:
+        result = subprocess.run(reader, capture_output=True, timeout=5)
+        last = result
+        if result.returncode == 0 and result.stdout.decode(errors="replace").replace("\r\n", "\n") == text:
+            return round(time.monotonic() - started, 3)
+        time.sleep(0.05)
+    raise AssertionError(f"{reader[0]} never returned the copied text (last: {last!r})")
+
+
 def walk(node):
     yield node
     for child in node.get("nodes", []) + node.get("floating_nodes", []):
@@ -197,7 +211,7 @@ class Wayland(Driver):
                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.clipboard.stdin.write(text.encode())
         self.clipboard.stdin.close()
-        time.sleep(0.2)
+        self.clipboard_ready = wait_for_selection(["wl-paste", "--no-newline"], text)
 
     def focus_away(self, gui):
         run("swaymsg", "workspace", "2")
