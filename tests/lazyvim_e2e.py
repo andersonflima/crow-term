@@ -189,26 +189,47 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
                         # (An empty cell text is not a sign: "" is in every string.)
                         return any(cell["text"] and cell["text"] in "▎┃▍" for cell in row[:8]) and line
                 return False
+            # Oracle: the terminal must show what Neovim itself drew. Read
+            # Neovim's own screen grid (screenstring) for the modified line's
+            # sign column, then require the same sign in the captured pane.
+            grid = (
+                "(function() local p = vim.fn.screenpos(0, 1, 1) if p.row == 0 then return '' end"
+                " local s = '' for c = 1, 8 do s = s .. vim.fn.screenstring(p.row, c) end return s end)()")
+            def drawn_by_neovim():
+                cells = self.report(grid)
+                return next((sign for sign in "▎┃▍" if sign in cells), None)
+            def terminal_shows(sign):
+                screen = self.rpc("capture-pane", self.pane, "--json")
+                last[0] = "\n".join("".join(cell["text"] for cell in row) for row in screen["cells"])
+                row = next((r for r in screen["cells"]
+                            if "crowcompletionword = 2" in "".join(c["text"] for c in r)), None)
+                return row is not None and any(cell["text"] == sign for cell in row[:8])
             try:
-                # gitsigns attaches asynchronously; when the buffer was read before
-                # the plugin loaded (LazyFile) it can stay detached on a busy
-                # runner. What this scenario proves is that the sign renders
-                # through the terminal, so attach explicitly if it has not.
                 self.eventually(signed, timeout=10)
             except AssertionError:
-                # Only a detached gitsigns may be attached by hand: if it already
-                # tracks the change, a missing sign is a terminal defect.
-                tracked = self.report(
-                    "vim.b.gitsigns_status_dict ~= nil and ((vim.b.gitsigns_status_dict.changed or 0)"
-                    " + (vim.b.gitsigns_status_dict.added or 0)) > 0")
-                if tracked:
-                    raise AssertionError(f"gitsigns tracks the change but no sign is drawn:\n{last[0]}") from None
-                self.ex("Gitsigns attach")
-                try:
-                    self.eventually(signed, timeout=20)
-                except AssertionError:
-                    raise AssertionError(f"no gitsigns sign on the modified line:\n{last[0]}") from None
-                print("gitsigns: attached explicitly", file=sys.stderr)
+                sign = drawn_by_neovim()
+                if sign:
+                    # Neovim had already drawn it while the terminal showed no
+                    # sign for 10 s: a terminal defect. No retry, so the redraw
+                    # caused by the report command cannot repair it.
+                    if not terminal_shows(sign):
+                        raise AssertionError(
+                            f"Neovim drew {sign!r} in the sign column but the terminal shows:\n{last[0]}") from None
+                else:
+                    # gitsigns has not drawn anything: detached (buffer read before
+                    # the plugin loaded on a busy runner) or still diffing. Editor
+                    # timing, not the terminal: attach and let Neovim draw.
+                    self.ex("Gitsigns attach")
+                    try:
+                        sign = self.eventually(drawn_by_neovim, timeout=30)
+                    except AssertionError:
+                        raise AssertionError(f"Neovim never drew a gitsigns sign:\n{last[0]}") from None
+                    print("gitsigns: attached explicitly", file=sys.stderr)
+                    try:
+                        self.eventually(lambda: terminal_shows(sign), timeout=5)
+                    except AssertionError:
+                        raise AssertionError(
+                            f"Neovim drew {sign!r} in the sign column but the terminal shows:\n{last[0]}") from None
         with self.subTest("treesitter highlight"):
             active = self.report("vim.treesitter.highlighter.active[vim.api.nvim_get_current_buf()] ~= nil")
             self.assertTrue(active)
