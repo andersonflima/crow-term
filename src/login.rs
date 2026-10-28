@@ -145,12 +145,18 @@ pub fn env_command(program: &str) -> Option<Vec<String>> {
     let script = match name.as_str() {
         "nu" => format!("print {MARKER}; ^/usr/bin/env -0"),
         "pwsh" | "pwsh-preview" => format!("Write-Output {MARKER}; & /usr/bin/env -0"),
-        "tcsh" | "csh" => {
-            // csh-family accepts -l only as the sole argument: no -c with it.
-            return None;
-        }
+        // csh-family accepts -l only as its sole argument: no -c with it, so
+        // its login environment is not captured (its panes are still login shells).
+        "tcsh" | "csh" => return None,
         _ => format!("echo {MARKER}; /usr/bin/env -0"),
     };
+    // zsh and bash read their interactive rc (.zshrc/.bashrc, where oh-my-zsh,
+    // nvm and most PATH edits live) only when interactive: capture like the
+    // pane runs them, as an interactive login shell. Prompt and plugin output
+    // before the marker is ignored.
+    if matches!(name.as_str(), "zsh" | "bash") {
+        args.push("-i".into());
+    }
     let switch = if name.starts_with("pwsh") {
         "-Command"
     } else {
@@ -165,19 +171,40 @@ const MARKER: &str = "CROW_LOGIN_ENV_BEGIN";
 
 /// Parse `env -0` output after the marker (profiles may print before it).
 pub fn parse_env(output: &[u8]) -> Option<BTreeMap<OsString, OsString>> {
-    let text = String::from_utf8_lossy(output);
-    let start = text.rfind(MARKER)? + MARKER.len();
-    let body = text[start..].trim_start_matches(['\r', '\n']);
+    let marker = MARKER.as_bytes();
+    let start = output
+        .windows(marker.len())
+        .rposition(|window| window == marker)?
+        + marker.len();
+    let mut body = &output[start..];
+    while let [b'\r' | b'\n', rest @ ..] = body {
+        body = rest;
+    }
     let mut env = BTreeMap::new();
-    for entry in body.split('\0') {
-        if let Some((key, value)) = entry.split_once('=')
-            && !key.is_empty()
-            && !key.contains(['\n', ' '])
-        {
-            env.insert(OsString::from(key), OsString::from(value));
+    for entry in body.split(|byte| *byte == 0) {
+        let Some(equals) = entry.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let (key, value) = (&entry[..equals], &entry[equals + 1..]);
+        if key.is_empty() || key.iter().any(|byte| matches!(byte, b'\n' | b' ')) {
+            continue;
         }
+        env.insert(os_string(key), os_string(value));
     }
     (!env.is_empty() && env.contains_key(&OsString::from("PATH"))).then_some(env)
+}
+
+/// Bytes as an OS string: exact on Unix (values need not be UTF-8).
+fn os_string(bytes: &[u8]) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(bytes.to_vec())
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 /// Variables the daemon keeps from its own environment.
@@ -210,39 +237,95 @@ pub fn capture_login_env(
     program: &str,
     timeout: Duration,
 ) -> Result<BTreeMap<OsString, OsString>, String> {
-    let args = env_command(program).ok_or_else(|| format!("{program}: no known login mode"))?;
-    let mut child = Command::new(program)
+    capture_with(program, timeout, None)
+}
+
+fn capture_with(
+    program: &str,
+    timeout: Duration,
+    home: Option<&Path>,
+) -> Result<BTreeMap<OsString, OsString>, String> {
+    let args = env_command(program).ok_or_else(|| {
+        format!("{program}: login environment capture not supported for this shell")
+    })?;
+    let mut command = Command::new(program);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(home) = home {
+        command.env("HOME", home);
+    }
+    // Own process group: on timeout the whole group goes, including background
+    // jobs a profile started that would otherwise keep the pipe open.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("{program}: {error}"))?;
     let mut stdout = child.stdout.take().ok_or("no stdout")?;
-    let reader = std::thread::spawn(move || {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut output = Vec::new();
         let _ = std::io::Read::read_to_end(&mut stdout, &mut output);
-        output
+        let _ = sender.send(output);
     });
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(20))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{program}: login environment not printed within {timeout:?}"
-                ));
-            }
+    let deadline = Instant::now() + timeout;
+    // The output ends when every holder of the pipe exits, not only the shell.
+    let output = receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    let kill_group = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        if let Some(group) = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
         }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let Ok(output) = output else {
+        kill_group(&mut child);
+        return Err(format!(
+            "{program}: login environment not printed within {timeout:?}"
+        ));
+    };
+    // The shell printed everything; reap it (and any straggler of its group).
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        kill_group(&mut child);
     }
-    let output = reader.join().map_err(|_| "reader panicked")?;
     parse_env(&output)
         .ok_or_else(|| format!("{program}: no environment in the login shell's output"))
+}
+
+/// The environment a daemon started outside a terminal should run with: the
+/// user's login environment merged over the current one. `None` when the
+/// caller is in a terminal (`TERM` set: its environment is already the user's),
+/// when login shells are disabled, or when capture fails (logged by caller).
+pub fn daemon_environment(
+    shell: &str,
+    login_shell: bool,
+    timeout: Duration,
+) -> Option<Result<Vec<(OsString, OsString)>, String>> {
+    if std::env::var_os("TERM").is_some() || cfg!(windows) || !login_shell {
+        return None;
+    }
+    Some(capture_login_env(shell, timeout).map(|login| {
+        let current = std::env::vars_os().collect();
+        merge(&current, &login)
+    }))
+}
+
+/// Whether `args` start the shell as a login shell.
+pub fn is_login(program: &str, args: &[String]) -> bool {
+    login_args(program).is_some_and(|login| !login.is_empty() && args.starts_with(&login))
+        || args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-l" | "--login" | "-Login" | "-login"))
 }
 
 #[cfg(test)]
@@ -318,8 +401,15 @@ mod tests {
     fn env_commands_use_each_shell_syntax() {
         assert_eq!(
             env_command("/bin/zsh").unwrap(),
-            ["-l", "-c", "echo CROW_LOGIN_ENV_BEGIN; /usr/bin/env -0"]
+            [
+                "-l",
+                "-i",
+                "-c",
+                "echo CROW_LOGIN_ENV_BEGIN; /usr/bin/env -0"
+            ]
         );
+        assert_eq!(env_command("/bin/bash").unwrap()[..3], ["-l", "-i", "-c"]);
+        assert_eq!(env_command("/bin/dash").unwrap()[..2], ["-l", "-c"]);
         assert_eq!(env_command("/opt/homebrew/bin/fish").unwrap()[0], "-l");
         assert!(env_command("/usr/local/bin/nu").unwrap()[2].starts_with("print "));
         let pwsh = env_command("/usr/local/bin/pwsh").unwrap();
@@ -371,6 +461,32 @@ mod tests {
                 ("EDITOR".into(), "nvim".into()),
                 ("PATH".into(), "/opt/homebrew/bin:/usr/bin".into())
             ]
+        );
+    }
+
+    #[test]
+    fn login_state_is_recognized_in_any_spelling() {
+        assert!(is_login("/bin/zsh", &["-l".into()]));
+        assert!(is_login("/bin/bash", &["--login".into()]));
+        assert!(is_login("/usr/bin/pwsh", &["-Login".into()]));
+        assert!(!is_login("/bin/zsh", &[]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_profile_that_leaves_a_background_job_cannot_hold_the_capture() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".profile"), "sleep 30 &\n").unwrap();
+        let started = Instant::now();
+        let captured = capture_with("/bin/sh", Duration::from_secs(2), Some(home.path()));
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            captured.is_err(),
+            "the background job holds stdout past the limit"
         );
     }
 
