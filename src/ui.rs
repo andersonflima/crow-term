@@ -3728,6 +3728,26 @@ mod tests {
         );
     }
     #[test]
+    fn modifier_presses_do_not_count_as_prefix_actions() {
+        for named in [
+            NamedKey::Shift,
+            NamedKey::Control,
+            NamedKey::Alt,
+            NamedKey::AltGraph,
+            NamedKey::Super,
+            NamedKey::CapsLock,
+        ] {
+            assert!(is_modifier_key(&Key::Named(named)), "{named:?}");
+        }
+        for key in [
+            Key::Named(NamedKey::Tab),
+            Key::Named(NamedKey::Escape),
+            Key::Character("%".into()),
+        ] {
+            assert!(!is_modifier_key(&key), "{key:?}");
+        }
+    }
+    #[test]
     fn tmux_passthrough_never_consumes_its_prefix() {
         let key = Key::Character("t".into());
         assert!(prefix_matches("Ctrl-t", &key, ModifiersState::CONTROL));
