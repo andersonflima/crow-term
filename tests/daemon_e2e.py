@@ -279,7 +279,9 @@ class UnresponsiveDaemonTests(DaemonHarness):
             # instead of refusing them: a live daemon is never "unreachable".
             self.skipTest("this kernel does not refuse connections to a live socket")
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("alive but not accepting", result.stderr)
+        # Busy, not gone: the refusal of a live daemon is never "not running".
+        self.assertRegex(result.stderr, "not answering|alive but not accepting")
+        self.assertNotIn("not running", result.stderr)
         self.assertTrue(path.exists(), "the live daemon's socket was removed")
         sessions = self.rpc("list-sessions")["View"]["sessions"]
         self.assertEqual([s["name"] for s in sessions], ["keep"], "the original daemon still serves")

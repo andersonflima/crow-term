@@ -43,7 +43,7 @@ jobs:
         run: |
           python tests/gui/journeys.py --driver windows --goldens windows --artifacts gui-artifacts --require-goldens \
             ${{ inputs.update_goldens && '--update-goldens' || '' }} \
-            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9,J11,J12,J13
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9,J15,J11,J12,J13
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

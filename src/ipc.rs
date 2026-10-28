@@ -327,22 +327,34 @@ fn check_windows_peer(pid: u32) -> Result<()> {
 /// When a frame transfer gives up. A patient deadline (GUI commands) is
 /// extended for as long as a daemon process is alive: a frozen or loaded
 /// daemon is waited for, never reported as a timeout; only its death ends it.
-pub struct Deadline {
+pub struct Deadline<'a> {
     at: std::cell::Cell<Instant>,
     patient: bool,
+    /// Patient waits end here (CLI), if set.
+    limit: Option<Instant>,
+    /// Patient waits end as soon as this turns false (the GUI is closing).
+    running: Option<&'a std::sync::atomic::AtomicBool>,
 }
-impl Deadline {
+impl<'a> Deadline<'a> {
     pub fn new(patient: bool) -> Self {
         Self {
             at: std::cell::Cell::new(Instant::now() + DEADLINE),
             patient,
+            limit: None,
+            running: None,
         }
     }
     fn expired(&self) -> bool {
+        if self
+            .running
+            .is_some_and(|running| !running.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return true;
+        }
         if Instant::now() < self.at.get() {
             return false;
         }
-        if self.patient && daemon_alive() {
+        if self.patient && self.limit.is_none_or(|limit| Instant::now() < limit) && daemon_alive() {
             self.at.set(Instant::now() + DEADLINE);
             return false;
         }
@@ -519,13 +531,28 @@ pub fn rpc(request: &Request) -> Result<Response> {
     rpc_by(request, false)
 }
 
-/// A command that waits for a live daemon however long it takes (input,
-/// paste, splits): never a timeout while the daemon process exists.
-pub fn rpc_patient(request: &Request) -> Result<Response> {
-    rpc_by(request, true)
+/// A command that waits for a live daemon however long it takes (GUI input,
+/// paste, splits): never a timeout while the daemon process exists. It ends
+/// within about a second once `running` turns false.
+pub fn rpc_patient(request: &Request, running: &std::sync::atomic::AtomicBool) -> Result<Response> {
+    let mut deadline = Deadline::new(true);
+    deadline.running = Some(running);
+    rpc_with(request, &deadline)
+}
+
+/// Patient up to `limit` (CLI commands: a frozen daemon should not hang a
+/// script forever unless asked to).
+pub fn rpc_patient_for(request: &Request, limit: Option<Duration>) -> Result<Response> {
+    let mut deadline = Deadline::new(true);
+    deadline.limit = limit.map(|limit| Instant::now() + limit);
+    rpc_with(request, &deadline)
 }
 
 fn rpc_by(request: &Request, patient: bool) -> Result<Response> {
+    rpc_with(request, &Deadline::new(patient))
+}
+
+fn rpc_with(request: &Request, deadline: &Deadline<'_>) -> Result<Response> {
     use interprocess::{ConnectWaitMode, local_socket::ConnectOptions};
     // Bounded connect: a full accept backlog makes Linux block in connect().
     let stream = ConnectOptions::new()
@@ -533,10 +560,13 @@ fn rpc_by(request: &Request, patient: bool) -> Result<Response> {
         .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(1)))
         .connect_sync()
         .map_err(|error| {
+            // A refusal while the daemon process lives is a full accept
+            // backlog (macOS): busy, not gone.
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) {
+            ) && !daemon_alive()
+            {
                 anyhow::Error::new(crate::link::Unreachable(error))
             } else {
                 anyhow::Error::new(crate::link::NotSent(error.into()))
@@ -550,11 +580,10 @@ fn rpc_by(request: &Request, patient: bool) -> Result<Response> {
         .context("configure client IPC stream")
         .map_err(not_sent)?;
     let mut stream = FramedStream::new(stream);
-    let deadline = Deadline::new(patient);
-    write_frame_by(&mut stream, request, &deadline)
+    write_frame_by(&mut stream, request, deadline)
         .context("write IPC request")
         .map_err(not_sent)?;
-    let response = read_frame_by(&mut stream, &deadline).context("read IPC response")?;
+    let response = read_frame_by(&mut stream, deadline).context("read IPC response")?;
     if let Response::Error(message) = response {
         return Err(anyhow::Error::new(crate::link::Refused(message)));
     }
@@ -709,7 +738,9 @@ mod tests {
             transfer::<()>(
                 &Deadline {
                     at: std::cell::Cell::new(Instant::now()),
-                    patient: false
+                    patient: false,
+                    limit: None,
+                    running: None,
                 },
                 || Err(std::io::ErrorKind::Interrupted.into())
             )

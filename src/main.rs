@@ -85,6 +85,9 @@ enum Action {
         text: String,
         #[arg(long)]
         enter: bool,
+        /// Seconds to wait for a busy or frozen daemon (0: until it exits).
+        #[arg(long, default_value_t = 30)]
+        wait: u64,
     },
     CapturePane {
         pane: u64,
@@ -348,13 +351,22 @@ fn main() -> Result<()> {
                 pane: *pane,
             })?)
         }
-        Some(Action::SendKeys { pane, text, enter }) => {
+        Some(Action::SendKeys {
+            pane,
+            text,
+            enter,
+            wait,
+        }) => {
             let mut bytes = text.as_bytes().to_vec();
             if *enter {
                 bytes.push(b'\r');
             }
             // Like the GUI: waited for while the daemon lives, never a timeout.
-            print_response(ipc::rpc_patient(&Request::Input { pane: *pane, bytes })?)
+            let limit = (*wait > 0).then(|| std::time::Duration::from_secs(*wait));
+            print_response(ipc::rpc_patient_for(
+                &Request::Input { pane: *pane, bytes },
+                limit,
+            )?)
         }
         Some(Action::CapturePane { pane, json }) => {
             let Response::View(view) = ipc::rpc(&Request::List)? else {

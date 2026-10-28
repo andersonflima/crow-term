@@ -539,6 +539,88 @@ def j9_reattach(ctx):
     return f"{how} (exit {code}); reattached GUI renders the unsaved line from the same Neovim", [ctx.save_frame("j9-reattached", frame)]
 
 
+def quiet_screen(ctx, pane, seconds=1.0, timeout=60):
+    """Wait until the pane shows something and stops changing (shell ready)."""
+    state = {"screen": None, "since": time.monotonic()}
+
+    def ready():
+        screen = ctx.run.capture(pane)
+        if screen != state["screen"]:
+            state.update(screen=screen, since=time.monotonic())
+            return False
+        return screen.strip() and time.monotonic() - state["since"] >= seconds
+    return eventually(ready, timeout, what=f"pane {pane} ready")
+
+
+@journey("J15", "a pane that does not read its input never blocks typing, splits or closing elsewhere")
+def j15_stuck_pane(ctx):
+    ctx.need("keys", "clipboard")
+    gui = ctx.run.launch("lanes", name="lanes")
+    pane_a = eventually(lambda: first_pane(ctx, "lanes"), 15, what="lanes session")
+    gui.wait_frame(lambda m, i: m["revision"] > 0, what="lanes frame")
+    ctx.driver.attach(gui)
+    quiet_screen(ctx, pane_a)
+    # Pane A runs a program that never reads its input.
+    ctx.run.send_keys(pane_a, ("Start-Sleep 600" if os.name == "nt" else "stty raw -echo; sleep 600") + "\r")
+    time.sleep(1)
+    ctx.driver.set_clipboard("x" * (600 * 1024))
+    ctx.driver.key(gui, ctx.driver.paste_chord)
+    if os.name == "nt":
+        # ConPTY buffers console input itself: the paste may never back up.
+        stuck = gui.wait_frame(what="frame after the paste")
+    else:
+        stuck = gui.wait_frame(lambda m, i: m.get("stuck_pane") == pane_a, timeout=20,
+                               what="footer note that pane A is not reading its input")
+    # Typing elsewhere and splitting still work while A is stuck.
+    ctx.driver.key(gui, "ctrl+t")
+    ctx.driver.type(gui, "%")
+    pane_b = eventually(lambda: [p for p in panes_of(ctx.run.session("lanes")["windows"][0]["layout"]) if p != pane_a][0],
+                        15, what="split while pane A is stuck")
+    gui.wait_frame(lambda m, i: m["pane"] == pane_b, what="focus on the new pane")
+    quiet_screen(ctx, pane_b)
+    ctx.driver.type(gui, "echo LANE_B_OK")
+    ctx.driver.key(gui, "Return")
+    eventually(lambda: any(l.strip() == "LANE_B_OK" for l in ctx.run.capture(pane_b).splitlines()), 15,
+               what="typing in pane B while pane A is stuck")
+    # Closing the stuck pane works too.
+    ctx.driver.key(gui, "ctrl+t")
+    ctx.driver.type(gui, "h")
+    gui.wait_frame(lambda m, i: m["pane"] == pane_a, what="focus back on pane A")
+    ctx.driver.key(gui, "ctrl+t")
+    ctx.driver.type(gui, "x")
+    eventually(lambda: panes_of(ctx.run.session("lanes")["windows"][0]["layout"]) == [pane_b], 15,
+               what="closing the stuck pane")
+    frame = gui.wait_frame(lambda m, i: m.get("stuck_pane") is None, what="stuck note cleared")
+    gui.kill()
+    return (f"pane {pane_a} not reading (note shown: {stuck[1]['stuck_pane']}); split, typing in pane {pane_b} "
+            f"and closing pane {pane_a} all worked"), [ctx.save_frame("j15-after-close", frame)]
+
+
+@journey("J16", "closing the window with the daemon frozen finishes in under 2 s")
+def j16_exit_frozen(ctx):
+    ctx.need("close")
+    if os.name == "nt":
+        raise Skip("the daemon cannot be frozen with SIGSTOP on Windows")
+    import signal
+    gui = ctx.run.launch("exit", name="exit")
+    gui.wait_frame(lambda m, i: m["revision"] > 0, what="exit frame")
+    ctx.driver.attach(gui)
+    os.kill(ctx.run.daemon.pid, signal.SIGSTOP)
+    try:
+        if "keys" in ctx.driver.caps:
+            ctx.driver.type(gui, "typed while frozen")
+        time.sleep(1)
+        started = time.monotonic()
+        ctx.driver.close(gui)
+        code = gui.wait_exit(timeout=15)
+        elapsed = time.monotonic() - started
+    finally:
+        os.kill(ctx.run.daemon.pid, signal.SIGCONT)
+    if elapsed >= 2.0:
+        raise AssertionError(f"window took {elapsed:.2f} s to close with the daemon frozen")
+    return f"closed in {elapsed:.2f} s (exit {code}) with the daemon stopped", []
+
+
 def link_gui(ctx):
     """The GUI still attached after J9 (Neovim) or the fixture GUI, with its
     session and pane."""
@@ -650,7 +732,7 @@ def j13_stop(ctx):
 
 
 JOURNEYS = [j1_launch, j2_text, j3_split, j4_resize, j5_nvim_edit, j6_paste, j7_mouse, j8_focus, j10_chords, j9_reattach,
-            j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
+            j15_stuck_pane, j16_exit_frozen, j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
 
 
 def summary_markdown(ctx):

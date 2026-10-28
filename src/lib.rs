@@ -5,6 +5,7 @@ pub mod frame_dump;
 pub mod intercept;
 pub mod ipc;
 pub mod keyboard;
+pub mod lanes;
 pub mod link;
 pub mod model;
 pub mod server;
