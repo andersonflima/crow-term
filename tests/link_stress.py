@@ -12,6 +12,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -73,7 +74,16 @@ class LinkUnderLoad(daemon_e2e.DaemonHarness):
         # daemon-side cost is asserted, not only the client's wall time.
         os.environ["CROW_TERM_SLOW_MS"] = "0"
         self.addCleanup(os.environ.pop, "CROW_TERM_SLOW_MS", None)
+        # This measures the terminal, not the runner's login profile: panes
+        # start plain shells (the login-shell behaviour has its own E2E).
+        config_dir = tempfile.mkdtemp(prefix="crow-stress-")
+        self.addCleanup(shutil.rmtree, config_dir, True)
+        self.config = Path(config_dir) / "stress.toml"
+        self.config.write_text("login_shell = false\n")
         super().setUp()
+
+    def command(self, *args, check=True):
+        return super().command("--config", self.config, *args, check=check)
 
     def run_python(self, pane, script):
         python = sys.executable
@@ -119,7 +129,10 @@ class LinkUnderLoad(daemon_e2e.DaemonHarness):
             token = f"crowkey{index:02d}"
             started = time.monotonic()
             self.command("send-keys", echo, token)
-            self.eventually(lambda: token in self.capture(echo), timeout=10)
+            try:
+                self.eventually(lambda: token in self.capture(echo), timeout=10)
+            except AssertionError:
+                raise AssertionError(f"typed {token!r} never shown; echo pane:\n{self.capture(echo)}") from None
             echoes.append(time.monotonic() - started)
             # Erase the typed line (keeps tokens from wrapping across rows).
             self.command("send-keys", echo, "\x15" if os.name != "nt" else "\x1b")
