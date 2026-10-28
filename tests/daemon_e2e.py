@@ -15,6 +15,20 @@ ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("CROW_TERM_BIN", ROOT / "target/debug" / ("crow-term.exe" if os.name == "nt" else "crow-term")))
 
 
+def neovim_binary(test):
+    """CROW_TERM_NVIM selects a pinned binary; CROW_TERM_REQUIRE_NVIM turns a skip into a failure."""
+    nvim = os.environ.get("CROW_TERM_NVIM") or shutil.which("nvim")
+    if not nvim:
+        if os.environ.get("CROW_TERM_REQUIRE_NVIM"):
+            test.fail("CROW_TERM_REQUIRE_NVIM is set but no Neovim binary was found")
+        test.skipTest("nvim not installed")
+    expected = os.environ.get("CROW_TERM_NVIM_VERSION")
+    if expected:
+        version = subprocess.run([nvim, "--version"], capture_output=True, text=True, timeout=20).stdout.splitlines()[0]
+        test.assertEqual(version, f"NVIM v{expected}", "pinned Neovim version mismatch")
+    return nvim
+
+
 class DaemonTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="crow-e2e-")
@@ -145,9 +159,7 @@ class DaemonTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "Neovim POSIX PTY fixture")
     def test_neovim_alternate_screen_input_and_clean_exit(self):
-        nvim = shutil.which("nvim")
-        if not nvim:
-            self.skipTest("nvim not installed")
+        nvim = neovim_binary(self)
         import shlex
         pane = self.rpc("new-session", "nvim")["Created"]["pane"]
         self.send(pane, shlex.quote(nvim) + " --clean -n -i NONE")

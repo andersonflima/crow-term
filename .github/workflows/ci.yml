@@ -59,3 +59,33 @@ jobs:
           path: dist/*.*
           if-no-files-found: error
           retention-days: 14
+  neovim:
+    # Pinned upstream Neovim releases (SHA-256 checked by scripts/fetch_neovim.py)
+    # against the real daemon PTY. LazyVim requires Neovim >= 0.11.2.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        nvim: ['0.11.7', '0.12.6']
+    name: neovim ${{ matrix.nvim }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      CROW_TERM_REQUIRE_NVIM: '1'
+      CROW_TERM_NVIM_VERSION: ${{ matrix.nvim }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Pinned Neovim
+        run: echo "CROW_TERM_NVIM=$(python scripts/fetch_neovim.py '${{ matrix.nvim }}' --dest "$RUNNER_TEMP/neovim")" >> "$GITHUB_ENV"
+      - run: cargo build --locked
+      - name: Neovim through the daemon PTY
+        run: python tests/daemon_e2e.py DaemonTests.test_neovim_alternate_screen_input_and_clean_exit
