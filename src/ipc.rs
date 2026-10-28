@@ -304,8 +304,16 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
     let deadline = Instant::now() + DEADLINE;
     let mut offset = 0;
     while offset < framed.len() {
+        // PIPE_NOWAIT cannot make progress on an oversized atomic pipe write.
+        // Keep Windows writes within the default kernel pipe-buffer quantum;
+        // the receiver drains between chunks. Unix sockets can accept the rest.
+        let end = if cfg!(windows) {
+            (offset + 4096).min(framed.len())
+        } else {
+            framed.len()
+        };
         let count = transfer(deadline, || {
-            let count = writer.write(&framed[offset..])?;
+            let count = writer.write(&framed[offset..end])?;
             // PIPE_NOWAIT writes can succeed with no progress when its byte
             // buffer is full. Preserve the offset and retry only on Windows.
             #[cfg(windows)]
@@ -383,6 +391,35 @@ mod tests {
             Request::List
         ));
         assert!(read_frame::<Request>(&mut reader).is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_large_frames_use_bounded_pipe_writes() {
+        struct Capture {
+            max: usize,
+            data: Vec<u8>,
+        }
+        impl Write for Capture {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.max = self.max.max(b.len());
+                self.data.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let value = vec![42u8; 200000];
+        let mut writer = Capture {
+            max: 0,
+            data: Vec::new(),
+        };
+        write_frame(&mut writer, &value).unwrap();
+        assert!(writer.max <= 4096);
+        assert_eq!(
+            read_frame::<Vec<u8>>(&mut writer.data.as_slice()).unwrap(),
+            value
+        );
     }
     #[cfg(windows)]
     #[test]
