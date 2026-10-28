@@ -36,12 +36,12 @@ jobs:
         run: |
           nvim="$(python scripts/fetch_neovim.py 0.11.7 --dest "$RUNNER_TEMP/neovim")"
           echo "CROW_TERM_NVIM=$nvim" >> "$GITHUB_ENV"
-      - run: cargo build --locked --features frame-dump
+      - run: cargo build --locked --features frame-dump,test-hooks
       - name: Journeys
         run: |
           python tests/gui/journeys.py --driver macos --goldens macos --artifacts gui-artifacts --require-goldens --screen-tolerance 40 \
             ${{ inputs.update_goldens && '--update-goldens' || '' }} \
-            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9,J11,J12
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:

@@ -11,6 +11,26 @@ use std::{
     time::Duration,
 };
 
+/// Test-only (cargo feature `test-hooks`, never in release builds): when
+/// `<runtime>/test-stall-watch-ms` exists, the next Watch removes it and sleeps
+/// that long, simulating a daemon that is alive but slow to answer.
+#[cfg(feature = "test-hooks")]
+fn stall_for_tests() {
+    let Ok(path) = ipc::runtime_dir().map(|dir| dir.join("test-stall-watch-ms")) else {
+        return;
+    };
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && std::fs::remove_file(&path).is_ok()
+        && let Ok(ms) = text.trim().parse::<u64>()
+    {
+        eprintln!("crow-term daemon: test hook stalls this Watch for {ms} ms");
+        std::thread::sleep(Duration::from_millis(ms.min(60_000)));
+    }
+}
+
+/// Requests slower than this are logged to daemon.log with their cause.
+const SLOW: Duration = Duration::from_millis(500);
+
 #[derive(Default)]
 struct Signals {
     revision: Mutex<u64>,
@@ -152,11 +172,21 @@ impl Server {
                 since,
             } => {
                 self.signals.wait(since);
-                return Ok(Response::View(self.view(
-                    Some(&session),
-                    window,
-                    Some(since),
-                )?));
+                #[cfg(feature = "test-hooks")]
+                stall_for_tests();
+                let started = std::time::Instant::now();
+                let view = self.view(Some(&session), window, Some(since))?;
+                let elapsed = started.elapsed();
+                if elapsed > SLOW {
+                    // The GUI keeps waiting (a slow reply is not a disconnect);
+                    // the log says why it was slow.
+                    eprintln!(
+                        "crow-term daemon: Watch snapshot of {} pane(s) took {} ms",
+                        view.screens.len(),
+                        elapsed.as_millis()
+                    );
+                }
+                return Ok(Response::View(view));
             }
             Request::Ensure {
                 session,
@@ -413,15 +443,22 @@ pub fn run(config: Config) -> Result<()> {
                     let _guard = Guard(active);
                     let result = (|| -> Result<()> {
                         ipc::check_peer(&stream).context("authenticate IPC client")?;
-                        stream
-                            .set_nonblocking(true)
-                            .context("set server IPC nonblocking mode")?;
+                        ipc::prepare(&stream).context("configure server IPC stream")?;
                         let mut stream = ipc::FramedStream::new(stream);
                         let request = ipc::read_frame(&mut stream).context("read IPC request")?;
                         let response = server
                             .handle(request)
                             .unwrap_or_else(|e| Response::Error(format!("{e:#}")));
-                        ipc::write_frame(&mut stream, &response).context("write IPC response")
+                        let started = std::time::Instant::now();
+                        let written =
+                            ipc::write_frame(&mut stream, &response).context("write IPC response");
+                        if started.elapsed() > SLOW {
+                            eprintln!(
+                                "crow-term daemon: sending a reply took {} ms (slow or stalled client)",
+                                started.elapsed().as_millis()
+                            );
+                        }
+                        written
                     })();
                     if let Err(error) = result {
                         eprintln!("crow-term IPC: {error:#}");

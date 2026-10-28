@@ -29,6 +29,9 @@ unicode-width = "0.2"
 # Test-only: write each presented GUI frame to $CROW_TERM_FRAME_DUMP/frame.ppm
 # (tests/gui). Never enabled in release builds.
 frame-dump = []
+# Test-only: daemon fault injection for the GUI journeys (tests/gui). Never
+# enabled in release builds.
+test-hooks = []
 
 [profile.release]
 lto = "thin"

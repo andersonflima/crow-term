@@ -50,6 +50,17 @@ enum UiEvent {
         activate_created: bool,
     },
     Error(String),
+    /// Link to the daemon: a status for the footer (`None` clears a link note);
+    /// `expires` clears it after a moment (the "reconnected" note).
+    Link {
+        status: Option<String>,
+        expires: bool,
+    },
+    /// The daemon was restarted: the GUI now shows this window and pane.
+    Reattached {
+        window: u64,
+        pane: u64,
+    },
     /// Crow agent status, published only when its rendered content changed.
     Crow(Box<CrowView>),
 }
@@ -116,9 +127,28 @@ fn execute_request(
     Ok(Response::Ok)
 }
 
+/// Start a new daemon after the previous one stopped and recreate the session
+/// in it (the old daemon's programs ended with it).
+fn restart_daemon(
+    config: Option<&std::path::Path>,
+    session: &str,
+    shell: &ShellSpec,
+) -> Result<(u64, u64)> {
+    crate::ipc::ensure_daemon(config)?;
+    match rpc(&Request::Ensure {
+        session: session.to_owned(),
+        shell: shell.clone(),
+        size: Size::default(),
+    })? {
+        Response::Created { window, pane } => Ok((window, pane)),
+        other => anyhow::bail!("unexpected Ensure reply {other:?}"),
+    }
+}
+
 /// Attach a native GUI to a running persistent mux server. Closing the GUI only detaches.
 pub fn run(
     config: Config,
+    config_path: Option<std::path::PathBuf>,
     session: String,
     initial_window: u64,
     initial_pane: u64,
@@ -159,12 +189,15 @@ pub fn run(
     let watch_running = running.clone();
     let watch_window = active_window.clone();
     let watch_session = session.clone();
+    let watch_shell = shell.clone();
     let watch_worker = thread::Builder::new()
         .name("crow-ui-watch".into())
         .spawn(move || {
             let mut since = 0;
             let mut previous_window = initial_window;
-            let mut failures = 0;
+            // A slow reply is never a disconnect; only a daemon that stopped
+            // accepting connections is reported, restarted and reattached.
+            let mut link = crate::link::Link::default();
             while watch_running.load(Ordering::Relaxed) {
                 let cycle_started = Instant::now();
                 let window = watch_window.load(Ordering::Relaxed);
@@ -178,7 +211,16 @@ pub fn run(
                     since,
                 }) {
                     Ok(Response::View(view)) => {
-                        failures = 0;
+                        if let Some(note) = link.ok()
+                            && proxy
+                                .send_event(UiEvent::Link {
+                                    status: Some(note.into()),
+                                    expires: true,
+                                })
+                                .is_err()
+                        {
+                            break;
+                        }
                         since = view.revision;
                         if watch_mailbox.push(window, view)
                             && proxy.send_event(UiEvent::ViewReady).is_err()
@@ -195,16 +237,59 @@ pub fn run(
                             .send_event(UiEvent::Error("Unexpected mux Watch response".into()));
                         break;
                     }
-                    Err(error) => {
-                        failures += 1;
-                        let _ = proxy.send_event(UiEvent::Error(format!(
-                            "Mux disconnected ({failures}/5): {error:#}"
-                        )));
-                        if failures >= 5 {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(250 * failures));
+                    // The daemon answered with an error (e.g. the session ended).
+                    Err(error) if crate::link::refused(&error) => {
+                        let _ = proxy.send_event(UiEvent::Error(format!("{error:#}")));
+                        break;
                     }
+                    Err(error) => match link.failed(crate::link::classify(&error)) {
+                        crate::link::Action::Retry { after, status } => {
+                            if let Some(status) = status {
+                                eprintln!("crow-term: daemon slow to answer: {error:#}");
+                                let _ = proxy.send_event(UiEvent::Link {
+                                    status: Some(status),
+                                    expires: false,
+                                });
+                            }
+                            thread::sleep(after);
+                            continue;
+                        }
+                        crate::link::Action::Restart { status } => {
+                            let _ = proxy.send_event(UiEvent::Link {
+                                status: Some(status),
+                                expires: false,
+                            });
+                            match restart_daemon(
+                                config_path.as_deref(),
+                                &watch_session,
+                                &watch_shell,
+                            ) {
+                                Ok((window, pane)) => {
+                                    // The restart note stands; no "reconnected" over it.
+                                    link = crate::link::Link::default();
+                                    watch_window.store(window, Ordering::Relaxed);
+                                    previous_window = window;
+                                    since = 0;
+                                    if proxy
+                                        .send_event(UiEvent::Reattached { window, pane })
+                                        .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = proxy.send_event(UiEvent::Link {
+                                        status: Some(format!(
+                                            "Daemon could not be restarted ({error:#}); retrying"
+                                        )),
+                                        expires: false,
+                                    });
+                                    thread::sleep(Duration::from_secs(2));
+                                }
+                            }
+                            continue;
+                        }
+                    },
                 }
                 // Bound snapshots during sustained PTY output; idle Watch already waits 1s.
                 if let Some(remaining) =
@@ -1002,6 +1087,8 @@ struct App {
     /// Visual bell: panes flashing until the deadline.
     bell_flash: Option<(Instant, HashSet<u64>)>,
     window_title: String,
+    /// Clear `status` at this instant (transient link notes).
+    status_expires: Option<Instant>,
     clipboard: Option<arboard::Clipboard>,
     crow: Option<Arc<crow::Shared>>,
     crow_view: CrowView,
@@ -1062,6 +1149,7 @@ impl App {
             clipboard_seqs: HashMap::new(),
             bell_flash: None,
             window_title: String::new(),
+            status_expires: None,
             clipboard: None,
             crow,
             crow_view: CrowView::default(),
@@ -2431,6 +2519,23 @@ impl ApplicationHandler<UiEvent> for App {
             },
             UiEvent::Error(error) => {
                 self.status = error;
+                self.status_expires = None;
+                self.redraw();
+            }
+            UiEvent::Link { status, expires } => {
+                self.status = status.unwrap_or_default();
+                self.status_expires = expires.then(|| Instant::now() + Duration::from_secs(3));
+                self.redraw();
+            }
+            UiEvent::Reattached { window, pane } => {
+                self.view = None;
+                self.sent_sizes.clear();
+                self.activate_window(window);
+                self.focus_pane(pane);
+                self.status =
+                    "Daemon restarted — a new session replaced the one that ended with it".into();
+                self.status_expires = Some(Instant::now() + Duration::from_secs(10));
+                self.resize_panes();
                 self.redraw();
             }
             UiEvent::Crow(view) => {
@@ -2524,7 +2629,17 @@ impl ApplicationHandler<UiEvent> for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // The visual bell is the only timed redraw; otherwise stay event-driven.
+        if let Some(until) = self.status_expires {
+            if Instant::now() >= until {
+                self.status_expires = None;
+                self.status.clear();
+                self.redraw();
+            } else if self.bell_flash.is_none() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(until));
+                return;
+            }
+        }
+        // The visual bell is the only other timed redraw; otherwise stay event-driven.
         match &self.bell_flash {
             Some((until, _)) if Instant::now() >= *until => {
                 self.bell_flash = None;
