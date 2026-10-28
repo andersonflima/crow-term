@@ -23,6 +23,17 @@ pub enum ColorSpec {
     Indexed(u8),
     Rgb(u8, u8, u8),
 }
+/// SGR 4 / 4:x underline variants. `None` when the cell is not underlined.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cell {
     pub text: String,
@@ -30,9 +41,15 @@ pub struct Cell {
     pub bg: ColorSpec,
     pub bold: bool,
     pub italic: bool,
+    /// Any underline style; kept for consumers of the JSON capture.
     pub underline: bool,
     pub strike: bool,
     pub wide_spacer: bool,
+    #[serde(default)]
+    pub underline_style: UnderlineStyle,
+    /// SGR 58 underline color; `None` draws in the foreground color.
+    #[serde(default)]
+    pub underline_color: Option<ColorSpec>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Cursor {

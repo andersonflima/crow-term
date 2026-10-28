@@ -528,17 +528,29 @@ impl Renderer {
                     );
                 }
             }
+            let cell_width = self.cell_width as usize;
             for (col, cell) in cells.iter().enumerate() {
                 let color = resolve_color(config, cell.fg);
-                for y in [
-                    (cell.underline, height.saturating_sub(2)),
-                    (cell.strike, height / 2),
-                ] {
-                    if y.0 && width > 0 {
-                        let start = y.1 * width + col * self.cell_width as usize;
-                        pixels[start..start + self.cell_width as usize].fill(color);
-                    }
+                if cell.strike && width > 0 {
+                    let start = height / 2 * width + col * cell_width;
+                    pixels[start..start + cell_width].fill(color);
                 }
+                let style = match cell.underline_style {
+                    // Snapshots from producers that only set the boolean.
+                    UnderlineStyle::None if cell.underline => UnderlineStyle::Single,
+                    style => style,
+                };
+                let color = cell
+                    .underline_color
+                    .map_or(color, |spec| resolve_color(config, spec));
+                draw_underline(
+                    &mut pixels,
+                    width,
+                    height,
+                    col * cell_width..(col + 1) * cell_width,
+                    style,
+                    color,
+                );
             }
             self.rows.insert(
                 key,
@@ -599,6 +611,67 @@ impl Renderer {
             }
         }
         width
+    }
+}
+
+/// Rasterize one cell's underline into a row buffer. Pure and bounds-checked,
+/// so a later GPU renderer can share the geometry. Positions use row-absolute
+/// x, which keeps curly and dashed patterns continuous across cells.
+fn draw_underline(
+    pixels: &mut [u32],
+    width: usize,
+    height: usize,
+    columns: std::ops::Range<usize>,
+    style: UnderlineStyle,
+    color: u32,
+) {
+    if style == UnderlineStyle::None || width == 0 || height < 2 {
+        return;
+    }
+    let thickness = (height / 20).max(1);
+    let bottom = height - 1;
+    let mut plot = |x: usize, y: usize| {
+        if x < width && y < height {
+            pixels[y * width + x] = color;
+        }
+    };
+    let line = |plot: &mut dyn FnMut(usize, usize), x: usize, top: usize| {
+        for dy in 0..thickness {
+            plot(x, top + dy);
+        }
+    };
+    let single_top = height.saturating_sub(1 + thickness);
+    for x in columns.start..columns.end.min(width) {
+        match style {
+            UnderlineStyle::None => {}
+            UnderlineStyle::Single => line(&mut plot, x, single_top),
+            UnderlineStyle::Double => {
+                line(&mut plot, x, bottom + 1 - thickness);
+                line(&mut plot, x, bottom.saturating_sub(3 * thickness) + 1);
+            }
+            UnderlineStyle::Dotted => {
+                if (x / (thickness * 2).max(2)).is_multiple_of(2) {
+                    line(&mut plot, x, single_top);
+                }
+            }
+            UnderlineStyle::Dashed => {
+                let dash = (columns.len() / 2).max(3);
+                if (x / dash).is_multiple_of(2) {
+                    line(&mut plot, x, single_top);
+                }
+            }
+            UnderlineStyle::Curly => {
+                let amplitude = (height / 8).clamp(1, 4) as f32;
+                let period = (columns.len().max(4)) as f32;
+                let phase = (x as f32 / period) * std::f32::consts::TAU;
+                let offset = (amplitude * (1.0 - phase.cos()) / 2.0).round() as usize;
+                line(
+                    &mut plot,
+                    x,
+                    (bottom + 1).saturating_sub(thickness + offset),
+                );
+            }
+        }
     }
 }
 
@@ -2541,6 +2614,8 @@ mod tests {
             underline: false,
             strike: false,
             wide_spacer: false,
+            underline_style: UnderlineStyle::None,
+            underline_color: None,
         }
     }
     #[test]
@@ -2666,6 +2741,51 @@ mod tests {
             ),
             b"\x1b[24;3~"
         );
+    }
+    #[test]
+    fn underline_styles_rasterize_distinct_shapes_inside_the_cell() {
+        let (width, height) = (24usize, 20usize);
+        let render = |style| {
+            let mut pixels = vec![0u32; width * height];
+            draw_underline(&mut pixels, width, height, 8..16, style, 0xff0000);
+            pixels
+        };
+        let rows = |pixels: &[u32]| {
+            (0..height)
+                .filter(|y| pixels[y * width..(y + 1) * width].contains(&0xff0000))
+                .collect::<Vec<_>>()
+        };
+        let lit = |pixels: &[u32]| pixels.iter().filter(|&&p| p == 0xff0000).count();
+        assert_eq!(lit(&render(UnderlineStyle::None)), 0);
+        let single = render(UnderlineStyle::Single);
+        assert_eq!(rows(&single), [height - 2]);
+        assert_eq!(lit(&single), 8);
+        // Nothing is drawn outside the cell's columns.
+        for pixels in [
+            UnderlineStyle::Double,
+            UnderlineStyle::Curly,
+            UnderlineStyle::Dotted,
+            UnderlineStyle::Dashed,
+        ]
+        .map(render)
+        {
+            for y in 0..height {
+                for x in (0..8).chain(16..width) {
+                    assert_eq!(pixels[y * width + x], 0);
+                }
+            }
+        }
+        assert_eq!(rows(&render(UnderlineStyle::Double)).len(), 2);
+        assert!(
+            rows(&render(UnderlineStyle::Curly)).len() >= 2,
+            "undercurl is not flat"
+        );
+        assert!(lit(&render(UnderlineStyle::Dotted)) < 8);
+        assert!(lit(&render(UnderlineStyle::Dashed)) < 8);
+        // Tiny rows and out-of-range columns never index outside the buffer.
+        let mut tiny = vec![0u32; 4];
+        draw_underline(&mut tiny, 4, 1, 0..100, UnderlineStyle::Curly, 1);
+        draw_underline(&mut tiny, 2, 2, 0..100, UnderlineStyle::Double, 1);
     }
     #[test]
     fn key_routing_follows_the_application_keyboard_mode() {

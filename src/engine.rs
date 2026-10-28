@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::intercept::{Interceptor, Out, Query};
-use crate::model::{Cell, ColorSpec, Cursor, Modes, Screen, ShellSpec, Size};
+use crate::model::{Cell, ColorSpec, Cursor, Modes, Screen, ShellSpec, Size, UnderlineStyle};
 
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
@@ -231,6 +231,11 @@ impl State {
                 wide_spacer: cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                underline_style: underline_style(cell.flags),
+                underline_color: cell
+                    .underline_color()
+                    .filter(|_| cell.flags.intersects(Flags::ALL_UNDERLINES))
+                    .map(|color| convert_color(color, content.colors, &self.default_colors)),
             });
             if row.len() == self.size.cols as usize {
                 cells.push(std::mem::replace(
@@ -277,6 +282,22 @@ impl State {
             alive,
             display_offset: content.display_offset,
         }
+    }
+}
+
+fn underline_style(flags: Flags) -> UnderlineStyle {
+    if flags.contains(Flags::UNDERCURL) {
+        UnderlineStyle::Curly
+    } else if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineStyle::Double
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineStyle::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineStyle::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        UnderlineStyle::Single
+    } else {
+        UnderlineStyle::None
     }
 }
 
@@ -973,6 +994,35 @@ mod tests {
                 .any(|text| text.contains("rgb:0000/0000/0000")),
             "{replies:?}"
         );
+    }
+    #[test]
+    fn underline_styles_and_colors_survive_the_snapshot() {
+        let screen = vt(
+            Size { rows: 2, cols: 20 },
+            0,
+            b"\x1b[4ma\x1b[4:2mb\x1b[4:3;58:2::1:2:3mc\x1b[4:4;58;5;9md\x1b[4:5;59me\x1b[24mf\x1b[58:2::9:9:9mg",
+        );
+        let cells = &screen.cells[0];
+        let styles: Vec<_> = cells[..7].iter().map(|c| c.underline_style).collect();
+        assert_eq!(
+            styles,
+            [
+                UnderlineStyle::Single,
+                UnderlineStyle::Double,
+                UnderlineStyle::Curly,
+                UnderlineStyle::Dotted,
+                UnderlineStyle::Dashed,
+                UnderlineStyle::None,
+                UnderlineStyle::None,
+            ]
+        );
+        assert!(cells[..5].iter().all(|c| c.underline) && !cells[5].underline);
+        assert_eq!(cells[0].underline_color, None);
+        assert_eq!(cells[2].underline_color, Some(ColorSpec::Rgb(1, 2, 3)));
+        assert_eq!(cells[3].underline_color, Some(ColorSpec::Indexed(9)));
+        // SGR 59 resets the color; a color without an underline is not reported.
+        assert_eq!(cells[4].underline_color, None);
+        assert_eq!(cells[6].underline_color, None);
     }
     fn replies(state: &mut State) -> Vec<String> {
         let (writer, writes) = mpsc::sync_channel(64);

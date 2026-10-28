@@ -158,6 +158,12 @@ class DaemonTests(DaemonHarness):
         self.assertTrue(any(c["fg"] == {"Rgb": [1, 2, 3]} for row in screen["cells"] for c in row))
         self.assertTrue(any(c["wide_spacer"] for row in screen["cells"] for c in row))
         self.assertIn("界", self.capture(pane))
+        self.send(pane, "printf '\\033[4:3;58:2::1:2:3mCROW_CURL\\033[0m\\n'")
+        self.eventually(lambda: self.output_line(pane, "CROW_CURL"))
+        cells = [c for row in self.rpc("capture-pane", pane, "--json")["cells"] for c in row]
+        curly = [c for c in cells if c["underline_style"] == "Curly"]
+        self.assertEqual("".join(c["text"] for c in curly), "CROW_CURL")
+        self.assertTrue(all(c["underline_color"] == {"Rgb": [1, 2, 3]} and c["underline"] for c in curly))
         self.command("kill-session", "pid")
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)

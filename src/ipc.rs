@@ -18,7 +18,8 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// never decodes frames of a daemon built from another model revision: a newer
 /// client starts its own daemon and older sessions keep their own.
 /// v3: kitty keyboard flags and modifyOtherKeys level in `Modes`.
-pub const WIRE_VERSION: u32 = 3;
+/// v4: underline style and underline color in `Cell`.
+pub const WIRE_VERSION: u32 = 4;
 const DEADLINE: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
