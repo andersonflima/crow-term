@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import zipfile
 
 # Upstream: https://github.com/neovim/neovim/releases (asset digests as published).
 PINS = {
@@ -24,20 +25,24 @@ PINS = {
         "nvim-linux-arm64.tar.gz": "99bb3c53604e83ce18fc0b459e34cf1a5e212f4e5fbe2eb136b3c18092ae9905",
         "nvim-macos-arm64.tar.gz": "9c84686ce84bbab725ff3d88ca3ac1d6da5a72128b68d9dd8094e34d4049a126",
         "nvim-macos-x86_64.tar.gz": "014649c0c75e188fd70d40f787ee7cb83e7c2926264cd4e72c300d0198922371",
+        "nvim-win64.zip": "7b10e6e08b14bf256422b72cfe706ef0452fd9c0a40e138426e1af09803d697f",
     },
     "0.12.6": {
         "nvim-linux-x86_64.tar.gz": "474430d53e6264f6d6dd18db42d6dc9df3a1b56ca9e88a325bbf860e1a811d87",
         "nvim-linux-arm64.tar.gz": "8f1f64a0bdb97247034038c3823c6cbad5bdf9ecd5751b85494b71c3ee04c815",
         "nvim-macos-arm64.tar.gz": "1dbd148222b051ba6c307c4d17a318ed083df018a4f6a5a0ce46955ffc9ab87b",
         "nvim-macos-x86_64.tar.gz": "481424f1dbc85f637d57e47d27d042aa9c883e5a4fe9ee64fc4ee9573b221998",
+        "nvim-win64.zip": "4e12b7103b601ffc8f25954b4da100f339faa73dccb69a5b135e897fa3d893ed",
     },
 }
 USER_AGENT = "crow-term-ci-fetch/1"
 
 
 def asset_name() -> str:
-    system = {"Linux": "linux", "Darwin": "macos"}.get(platform.system())
     machine = platform.machine().lower()
+    if platform.system() == "Windows" and machine in ("amd64", "x86_64"):
+        return "nvim-win64.zip"
+    system = {"Linux": "linux", "Darwin": "macos"}.get(platform.system())
     arch = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "arm64", "aarch64": "arm64"}.get(machine)
     if not system or not arch:
         sys.exit(f"unsupported platform for pinned Neovim: {platform.system()} {machine}")
@@ -45,6 +50,16 @@ def asset_name() -> str:
 
 
 def safe_extract(archive: Path, destination: Path) -> None:
+    if archive.name.endswith(".zip"):
+        root = destination.resolve()
+        with zipfile.ZipFile(archive) as bundle:
+            for member in bundle.infolist():
+                target = (destination / member.filename).resolve()
+                # Zip entries carry no symlinks for extractall; only paths are checked.
+                if not target.is_relative_to(root):
+                    sys.exit(f"refusing archive member outside destination: {member.filename}")
+            bundle.extractall(destination)
+        return
     if not hasattr(tarfile, "data_filter"):
         sys.exit("Python with tarfile extraction filters (3.12+, or a 3.8-3.11 security release) is required")
     root = destination.resolve()
@@ -78,7 +93,8 @@ def main() -> None:
     if not expected:
         sys.exit(f"no pinned digest for {name} {args.version}")
     destination = args.dest.resolve() / f"nvim-{args.version}"
-    executable = destination / name.removesuffix(".tar.gz") / "bin" / "nvim"
+    stem = name.removesuffix(".tar.gz").removesuffix(".zip")
+    executable = destination / stem / "bin" / ("nvim.exe" if name.endswith(".zip") else "nvim")
     if installed(executable, args.version, expected):
         print(executable)
         return
