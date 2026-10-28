@@ -94,10 +94,14 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
         self.key("Enter")
 
     def screen_has(self, *needles, timeout=15):
+        last = [""]
         def found():
-            text = self.capture(self.pane)
-            return all(needle in text for needle in needles) and text
-        return self.eventually(found, timeout=timeout)
+            last[0] = self.capture(self.pane)
+            return all(needle in last[0] for needle in needles) and last[0]
+        try:
+            return self.eventually(found, timeout=timeout)
+        except AssertionError:
+            raise AssertionError(f"screen lacks {needles}:\n{last[0]}") from None
 
     def screen_lacks(self, needle, timeout=10):
         return self.eventually(lambda: needle not in self.capture(self.pane), timeout=timeout)
@@ -116,8 +120,16 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
         with self.subTest("dashboard"):
             self.screen_has("Find File", "Restore Session", "Neovim loaded", timeout=30)
         with self.subTest("which-key"):
-            self.key("Space")
-            self.screen_has("+buffer", "+git", "+search")
+            # which-key loads on VeryLazy, after the dashboard is drawn: retry
+            # the leader press until its popup is up.
+            def popup():
+                self.key("Space")
+                try:
+                    return self.screen_has("+buffer", "+git", "+search", timeout=4)
+                except AssertionError:
+                    self.key("Escape")
+                    return False
+            self.eventually(popup, timeout=30)
             self.key("Escape")
             self.screen_lacks("+buffer")
         with self.subTest("noice cmdline"):

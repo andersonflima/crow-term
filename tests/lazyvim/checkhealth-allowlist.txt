@@ -10,3 +10,7 @@ your terminal does not support the kitty graphics protocol
 `tree-sitter \(CLI\)` is not installed
 # snacks.lazygit: lazygit is not installed in CI.
 \{lazygit\} not installed
+# snacks.image: ImageMagick and Ghostscript are not installed on the Linux runner.
+None of the tools found: 'magick', 'convert'
+Tool not found: 'gs'
+`magick` is required to convert images
