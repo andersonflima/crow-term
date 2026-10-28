@@ -1,0 +1,17 @@
+# Canonical Crowquill Ink Light. Default selected by the owner.
+# Keys match src/config.rs. Select a separate shell profile as documented in
+# docs/shell-integration.md; no install occurs when this file is loaded.
+font_family = "Crowquill Mono"
+font_size = 18.0
+line_height = 1.25
+ligatures = true
+scrollback = 10000
+background = "#FFFFFF"
+foreground = "#444444"
+selection = "#DADADA"
+cursor = "#000000"
+prefix = "Ctrl-t"
+palette = [
+  "#000000","#3C3C3C","#4E4E4E","#606060","#525252","#444444","#363636","#8A8A8A",
+  "#6C6C6C","#2A2A2A","#383838","#4A4A4A","#3E3E3E","#303030","#202020","#000000",
+]
