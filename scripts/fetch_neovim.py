@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -44,15 +45,27 @@ def asset_name() -> str:
 
 
 def safe_extract(archive: Path, destination: Path) -> None:
+    if not hasattr(tarfile, "data_filter"):
+        sys.exit("Python with tarfile extraction filters (3.12+, or a 3.8-3.11 security release) is required")
     root = destination.resolve()
     with tarfile.open(archive, "r:gz") as tar:
         for member in tar.getmembers():
             target = (destination / member.name).resolve()
-            if not target.is_relative_to(root) or member.issym() and Path(member.linkname).is_absolute():
+            link = (target.parent / member.linkname).resolve() if member.issym() else root
+            if not target.is_relative_to(root) or not link.is_relative_to(root):
                 sys.exit(f"refusing archive member outside destination: {member.name}")
             if not (member.isfile() or member.isdir() or member.issym()):
                 sys.exit(f"refusing special archive member: {member.name}")
-        tar.extractall(destination, filter="data") if hasattr(tarfile, "data_filter") else tar.extractall(destination)
+        tar.extractall(destination, filter="data")
+
+
+def installed(executable: Path, version: str, digest: str) -> bool:
+    """A cached tree counts only if it records this archive digest and reports the version."""
+    marker = executable.parents[2] / "archive.sha256"
+    if not executable.is_file() or not marker.is_file() or marker.read_text().strip() != digest:
+        return False
+    result = subprocess.run([str(executable), "--version"], capture_output=True, text=True, timeout=30)
+    return result.returncode == 0 and result.stdout.splitlines()[:1] == [f"NVIM v{version}"]
 
 
 def main() -> None:
@@ -66,7 +79,7 @@ def main() -> None:
         sys.exit(f"no pinned digest for {name} {args.version}")
     destination = args.dest.resolve() / f"nvim-{args.version}"
     executable = destination / name.removesuffix(".tar.gz") / "bin" / "nvim"
-    if executable.is_file():
+    if installed(executable, args.version, expected):
         print(executable)
         return
     url = f"https://github.com/neovim/neovim/releases/download/v{args.version}/{name}"
@@ -84,11 +97,12 @@ def main() -> None:
         staging = Path(temp) / "unpacked"
         staging.mkdir()
         safe_extract(archive, staging)
+        (staging / "archive.sha256").write_text(expected + "\n")
         if destination.exists():
             shutil.rmtree(destination)
         os.replace(staging, destination)
-    if not executable.is_file():
-        sys.exit(f"archive did not contain {executable}")
+    if not installed(executable, args.version, expected):
+        sys.exit(f"archive did not contain a working Neovim {args.version} at {executable}")
     print(executable)
 
 

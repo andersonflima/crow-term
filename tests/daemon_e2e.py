@@ -17,10 +17,11 @@ BIN = Path(os.environ.get("CROW_TERM_BIN", ROOT / "target/debug" / ("crow-term.e
 
 def neovim_binary(test):
     """CROW_TERM_NVIM selects a pinned binary; CROW_TERM_REQUIRE_NVIM turns a skip into a failure."""
-    nvim = os.environ.get("CROW_TERM_NVIM") or shutil.which("nvim")
+    required = os.environ.get("CROW_TERM_REQUIRE_NVIM")
+    nvim = os.environ.get("CROW_TERM_NVIM") or (None if required else shutil.which("nvim"))
     if not nvim:
-        if os.environ.get("CROW_TERM_REQUIRE_NVIM"):
-            test.fail("CROW_TERM_REQUIRE_NVIM is set but no Neovim binary was found")
+        if required:
+            test.fail("CROW_TERM_REQUIRE_NVIM is set but CROW_TERM_NVIM names no binary")
         test.skipTest("nvim not installed")
     expected = os.environ.get("CROW_TERM_NVIM_VERSION")
     if expected:

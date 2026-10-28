@@ -85,7 +85,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev
       - name: Pinned Neovim
-        run: echo "CROW_TERM_NVIM=$(python scripts/fetch_neovim.py '${{ matrix.nvim }}' --dest "$RUNNER_TEMP/neovim")" >> "$GITHUB_ENV"
+        run: |
+          nvim="$(python scripts/fetch_neovim.py '${{ matrix.nvim }}' --dest "$RUNNER_TEMP/neovim")"
+          echo "CROW_TERM_NVIM=$nvim" >> "$GITHUB_ENV"
       - run: cargo build --locked
       - name: Neovim through the daemon PTY
         run: python tests/daemon_e2e.py DaemonTests.test_neovim_alternate_screen_input_and_clean_exit
