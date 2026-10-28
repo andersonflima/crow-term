@@ -33,6 +33,9 @@ jobs:
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev fish zsh tmux neovim fonts-noto-color-emoji
       - run: cargo fmt --check
       - run: cargo build --locked
+      - name: Check locked dependency notice bundle
+        if: runner.os == 'Linux'
+        run: python scripts/third_party_notices.py --check
       - name: Isolated daemon and real PTY integration
         run: python tests/daemon_e2e.py
       - name: Offline shell profiles (Unix/WSL contract)

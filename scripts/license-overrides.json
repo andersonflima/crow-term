@@ -1,0 +1,354 @@
+{
+  "block2 0.5.1": {
+    "files": [
+      "licenses/upstream/objc2-4fc083f1c6d6/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt"
+    ]
+  },
+  "clipboard-win 5.4.3": {
+    "files": [
+      "licenses/upstream/clipboard-win-ed27008ae5d1/LICENSE"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/DoumanAsh/clipboard-win/ed27008ae5d1f10cfbb266de039f0fb35fd05a56/LICENSE"
+    ]
+  },
+  "dispatch 0.2.0": {
+    "files": [
+      "licenses/upstream/rust-dispatch-82d6c7a5b75d/Cargo.toml",
+      "licenses/upstream/spdx-MIT-template.txt"
+    ],
+    "note": "UPSTREAM OMISSION: the exact source tree has no original license/copyright file. Cargo.toml declares MIT and identifies authors. Cargo.toml below is original source evidence; spdx-MIT-template.txt is a standard MIT template, NOT an original upstream copyright notice. No copyright identity or year has been fabricated.",
+    "sources": [
+      "https://raw.githubusercontent.com/SSheldon/rust-dispatch/82d6c7a5b75dc0c71c3f46f87bb6c16a476f7748/Cargo.toml",
+      "https://raw.githubusercontent.com/spdx/license-list-data/f715b3660bb164c3d0b81cba9ce94e3c558c4048/text/MIT.txt"
+    ]
+  },
+  "dispatch2 0.3.1": {
+    "files": [
+      "licenses/upstream/objc2-8852b424193c/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/8852b424193ca41602281b3d7540d7c8ed51e49a/LICENSE.md"
+    ]
+  },
+  "drm-fourcc 2.2.0": {
+    "files": [
+      "licenses/upstream/drm-fourcc-rs-7b9f80060ffd/Cargo.toml",
+      "licenses/upstream/spdx-MIT-template.txt"
+    ],
+    "note": "UPSTREAM OMISSION: the exact source tree has no original license/copyright file. Cargo.toml declares MIT and identifies authors. Cargo.toml below is original source evidence; spdx-MIT-template.txt is a standard MIT template, NOT an original upstream copyright notice. No copyright identity or year has been fabricated.",
+    "sources": [
+      "https://raw.githubusercontent.com/danielzfranklin/drm-fourcc-rs/7b9f80060ffd4b35cd236437e65a17fb517d163c/Cargo.toml",
+      "https://raw.githubusercontent.com/spdx/license-list-data/f715b3660bb164c3d0b81cba9ce94e3c558c4048/text/MIT.txt"
+    ]
+  },
+  "harfrust 0.5.2": {
+    "files": [
+      "licenses/upstream/harfrust-efdae3142ab7/LICENSE"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/harfbuzz/harfrust/efdae3142ab76a2f1524d72cff9e3dfdc5afd7ca/LICENSE"
+    ]
+  },
+  "jni 0.22.4": {
+    "files": [
+      "licenses/upstream/jni-rs-5ae9458a4ec4/LICENSE-APACHE",
+      "licenses/upstream/jni-rs-5ae9458a4ec4/LICENSE-MIT"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/jni-rs/jni-rs/5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/jni-rs/jni-rs/5ae9458a4ec44c5318f37ddc7569c1d4ae8a69e7/LICENSE-MIT"
+    ]
+  },
+  "jni-macros 0.22.4": {
+    "files": [
+      "licenses/upstream/jni-rs-33045a124105/LICENSE-APACHE",
+      "licenses/upstream/jni-rs-33045a124105/LICENSE-MIT"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/jni-rs/jni-rs/33045a124105c939d1e2cbdcb5a39e5d868ffa03/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/jni-rs/jni-rs/33045a124105c939d1e2cbdcb5a39e5d868ffa03/LICENSE-MIT"
+    ]
+  },
+  "jni-sys-macros 0.4.1": {
+    "files": [
+      "licenses/upstream/jni-sys-64d77b7a5f11/LICENSE-APACHE",
+      "licenses/upstream/jni-sys-64d77b7a5f11/LICENSE-MIT"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/jni-rs/jni-sys/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/jni-rs/jni-sys/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-MIT"
+    ]
+  },
+  "ndk 0.9.0": {
+    "files": [
+      "licenses/upstream/ndk-49bbbba16c58/LICENSE-APACHE",
+      "licenses/upstream/ndk-49bbbba16c58/LICENSE-MIT"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/rust-mobile/ndk/49bbbba16c58ff63cb8a0ad0eca5a9fb7ecaec25/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/rust-mobile/ndk/49bbbba16c58ff63cb8a0ad0eca5a9fb7ecaec25/LICENSE-MIT"
+    ]
+  },
+  "ndk-context 0.1.1": {
+    "files": [
+      "licenses/upstream/android-ndk-rs-10f2ba388fca/LICENSE-APACHE",
+      "licenses/upstream/android-ndk-rs-10f2ba388fca/LICENSE-MIT"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/rust-windowing/android-ndk-rs/10f2ba388fca20f7349996ebae26ccda7a6fda5c/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/rust-windowing/android-ndk-rs/10f2ba388fca20f7349996ebae26ccda7a6fda5c/LICENSE-MIT"
+    ]
+  },
+  "ndk-sys 0.6.0+11769913": {
+    "files": [
+      "licenses/upstream/ndk-49bbbba16c58/LICENSE-APACHE",
+      "licenses/upstream/ndk-49bbbba16c58/LICENSE-MIT"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/rust-mobile/ndk/49bbbba16c58ff63cb8a0ad0eca5a9fb7ecaec25/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/rust-mobile/ndk/49bbbba16c58ff63cb8a0ad0eca5a9fb7ecaec25/LICENSE-MIT"
+    ]
+  },
+  "objc-sys 0.3.5": {
+    "files": [
+      "licenses/upstream/objc2-4fc083f1c6d6/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt"
+    ]
+  },
+  "objc2 0.5.3": {
+    "files": [
+      "licenses/upstream/objc2-5237cbf081d0/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/5237cbf081d04ef75a1f6a207b4018e7c1ae7438/LICENSE.txt"
+    ]
+  },
+  "objc2 0.6.5": {
+    "files": [
+      "licenses/upstream/objc2-d7d2fa23ceaa/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/d7d2fa23ceaa5e6096c923b081040e5d81b3b9df/LICENSE.md"
+    ]
+  },
+  "objc2-app-kit 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-app-kit 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
+  "objc2-cloud-kit 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-contacts 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-core-data 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-core-foundation 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
+  "objc2-core-graphics 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
+  "objc2-core-image 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-core-location 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-encode 4.1.0": {
+    "files": [
+      "licenses/upstream/objc2-8d214f547736/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/8d214f5477365ffcbcbb7de058c86ed9a518efb7/LICENSE.md"
+    ]
+  },
+  "objc2-foundation 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-foundation 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
+  "objc2-io-kit 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
+  "objc2-io-surface 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
+  "objc2-link-presentation 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-metal 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-quartz-core 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-quartz-core 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
+  "objc2-symbols 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-ui-kit 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-uniform-type-identifiers 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "objc2-user-notifications 0.2.2": {
+    "files": [
+      "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
+    ]
+  },
+  "r-efi 5.3.0": {
+    "files": [
+      "licenses/upstream/r-efi-97b55bed1c2c/AUTHORS"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/r-efi/r-efi/97b55bed1c2c91dcbf787674849f05337ff80b33/AUTHORS"
+    ]
+  },
+  "r-efi 6.0.0": {
+    "files": [
+      "licenses/upstream/r-efi-7e1b0322d31d/AUTHORS"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/r-efi/r-efi/7e1b0322d31d625f81a5656096330934f9cd835d/AUTHORS"
+    ]
+  },
+  "winapi-i686-pc-windows-gnu 0.4.0": {
+    "files": [
+      "licenses/upstream/winapi-rs-9497609ef44c/LICENSE-MIT",
+      "licenses/upstream/winapi-rs-9497609ef44c/LICENSE-APACHE"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/retep998/winapi-rs/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/LICENSE-MIT",
+      "https://raw.githubusercontent.com/retep998/winapi-rs/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/retep998/winapi-rs/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/i686/Cargo.toml"
+    ]
+  },
+  "winapi-x86_64-pc-windows-gnu 0.4.0": {
+    "files": [
+      "licenses/upstream/winapi-rs-9497609ef44c/LICENSE-MIT",
+      "licenses/upstream/winapi-rs-9497609ef44c/LICENSE-APACHE"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/retep998/winapi-rs/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/LICENSE-MIT",
+      "https://raw.githubusercontent.com/retep998/winapi-rs/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/retep998/winapi-rs/9497609ef44cc9bcd16cd2411c0ee6ccaf5483aa/x86_64/Cargo.toml"
+    ]
+  }
+}

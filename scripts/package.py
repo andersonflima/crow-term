@@ -18,7 +18,7 @@ shutil.copy2(root / "target/release" / binary, dest / binary)
 for directory in ["shell", "assets", "docs"]:
     shutil.copytree(root / directory, dest / directory, dirs_exist_ok=True,
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-for file in ["LICENSE", "NOTICE.md", "README.md", "Cargo.lock"]:
+for file in ["LICENSE", "NOTICE.md", "THIRD_PARTY_LICENSES.txt", "README.md", "Cargo.lock"]:
     shutil.copy2(root / file, dest / file)
 if system == "macos":
     contents = dest / "Crow Term.app/Contents"
