@@ -1018,6 +1018,17 @@ mod tests {
             state.advance(&payload);
         }
         assert!(state.snapshot(true).modes.keyboard != 0);
+        // Re-review reproduction: bytes >= 0x80 after ESC keep the parser in
+        // its escape state, so the following CSI is still a push.
+        for prefix in [&b"\x1b\x80"[..], b"\x1b\xc3\xa9", b"\x1b\x9c"] {
+            let mut flood = Vec::new();
+            for _ in 0..5000 {
+                flood.extend_from_slice(prefix);
+                flood.extend_from_slice(b"[>1u");
+            }
+            state.advance(&flood);
+        }
+        assert!(state.snapshot(true).modes.keyboard != 0);
         state.advance(b"\x1bc");
         let modes = state.snapshot(true).modes;
         assert_eq!((modes.keyboard, modes.modify_other_keys), (0, 0));

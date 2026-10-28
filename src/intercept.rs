@@ -200,7 +200,9 @@ impl Interceptor {
         match self.state {
             State::Ground => unreachable!("ground bytes are handled by scan"),
             State::Escape => match byte {
-                0x7f => self.hold(byte),
+                // The parser ignores DEL and bytes >= 0x80 after ESC and stays
+                // in its escape state: the next byte still starts the sequence.
+                0x7f..=0xff => self.hold(byte),
                 b'[' => {
                     self.hold(byte);
                     self.state = State::Csi;
@@ -459,6 +461,10 @@ mod tests {
             b"\x1b[<2:9u",
             b"\x1b[>1\x07u",
             b"\x1b[>\x18u",
+            b"\x1b\x80[>1u",
+            b"\x1b\x9c[>1u",
+            b"\x1b\xc3\xa9[>1u",
+            b"\x1b\x7f\xff[>1u",
             b"\x1b[>1$u",
             b"\x1b[>>1u",
             b"\x1b[1>u",
