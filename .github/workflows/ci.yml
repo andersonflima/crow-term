@@ -40,8 +40,14 @@ jobs:
         run: python tests/daemon_e2e.py
       - name: Terminal query reply matrix
         run: python tests/protocol_probe.py
-      - name: Daemon link under load (8 flooding panes, typing latency)
-        run: python tests/link_stress.py
+      - name: Daemon link under load (8 flooding panes, typing latency; optimized build)
+        shell: bash
+        run: |
+          # Latency is a property of the shipped (optimized) binary; a debug
+          # build is ~20x slower in snapshot code and measures the compiler.
+          cargo build --profile stress --locked
+          exe=target/stress/crow-term; [[ "${RUNNER_OS}" == "Windows" ]] && exe="${exe}.exe"
+          CROW_TERM_BIN="${exe}" python tests/link_stress.py
       - name: Offline shell profiles (Unix/WSL contract)
         if: runner.os != 'Windows'
         run: python tests/shell_setup.py

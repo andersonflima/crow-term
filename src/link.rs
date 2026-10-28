@@ -33,10 +33,11 @@ impl std::fmt::Display for NotSent {
 }
 impl std::error::Error for NotSent {}
 
+/// Only failures before the daemon got the bytes. Unreachable is excluded on
+/// purpose: a request for a daemon that died must not be replayed into the
+/// next daemon, whose panes reuse the same ids.
 pub fn not_sent(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.is::<NotSent>() || cause.is::<Unreachable>())
+    error.chain().any(|cause| cause.is::<NotSent>())
 }
 
 /// The daemon answered, with an error (e.g. the session no longer exists).

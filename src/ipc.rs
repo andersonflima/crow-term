@@ -433,27 +433,44 @@ pub fn hold_daemon_lock() -> Result<std::fs::File> {
         .truncate(false)
         .write(true)
         .open(runtime_dir()?.join(ALIVE_LOCK))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => {
-            bail!("A Crow daemon is already running for this runtime directory")
+    // A starter's liveness probe holds the lock for an instant: retry briefly
+    // so that probe never makes a starting daemon give up.
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < until => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                bail!("A Crow daemon is already running for this runtime directory")
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).context("lock daemon lifetime file");
+            }
         }
-        Err(std::fs::TryLockError::Error(error)) => Err(error).context("lock daemon lifetime file"),
     }
 }
 
 /// Whether a daemon process holds the lifetime lock (alive, even if it does not
 /// answer or accept right now).
 pub fn daemon_alive() -> bool {
-    let Ok(file) = runtime_dir().and_then(|dir| {
-        std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(ALIVE_LOCK))
-            .map_err(Into::into)
-    }) else {
+    let Ok(dir) = runtime_dir() else {
         return false;
+    };
+    let path = dir.join(ALIVE_LOCK);
+    // No lock file but a socket: a daemon may run whose lock file was removed
+    // (runtime-dir clean-up) or an older one without it. Unknown counts as
+    // alive: never replace it on a guess.
+    if !path.exists() {
+        #[cfg(unix)]
+        return dir.join(socket_file()).exists();
+        // Windows: a pipe exists only while its daemon serves it.
+        #[cfg(not(unix))]
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
+        return true;
     };
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }

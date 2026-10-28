@@ -21,8 +21,10 @@ import daemon_e2e  # noqa: E402
 
 PANES = 8
 SECONDS = float(os.environ.get("CROW_STRESS_SECONDS", "12"))
-# Thresholds for the debug build CI runs (release is several times faster).
-SNAPSHOT_P99 = 1.5
+# For an optimized build (CI: `cargo build --profile stress`). Before the fix
+# such a build needed ~2.4 s per snapshot here; after it, ~0.03-0.05 s locally.
+# A debug build is ~20x slower in snapshot code: set CROW_STRESS_SNAPSHOT_P99.
+SNAPSHOT_P99 = float(os.environ.get("CROW_STRESS_SNAPSHOT_P99", "0.5"))
 ECHO_P99 = 0.2
 FLOOD = "import sys\nline = 'crow flood ' * 15 + '\\n'\nwhile True:\n    sys.stdout.write(line)\n"
 

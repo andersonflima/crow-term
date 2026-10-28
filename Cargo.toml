@@ -33,6 +33,14 @@ frame-dump = []
 # enabled in release builds.
 test-hooks = []
 
+# Optimized like release but quick to build (no LTO, parallel codegen): the
+# binary CI measures for latency (tests/link_stress.py).
+[profile.stress]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

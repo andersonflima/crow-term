@@ -1,6 +1,8 @@
 //! A session daemon owns PTYs, not GUI windows. Detaching never sends SIGHUP.
 use crate::{config::Config, engine::Engine, ipc, model::*};
+// Unix: the generic listener's accept(); Windows uses ipc::IpcListener directly.
 use anyhow::{Context, Result, bail, ensure};
+#[cfg(unix)]
 use interprocess::local_socket::prelude::*;
 use std::{
     collections::{BTreeMap, HashMap},

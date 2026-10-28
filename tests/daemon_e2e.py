@@ -229,18 +229,42 @@ class DaemonTests(DaemonHarness):
 class UnresponsiveDaemonTests(DaemonHarness):
     @unittest.skipIf(os.name == "nt", "SIGSTOP")
     def test_a_frozen_daemon_is_never_replaced(self):
-        """A live daemon that does not answer (here: SIGSTOP) keeps its socket and
-        sessions; a CLI call waits and fails instead of starting a second one."""
+        """A live daemon that neither answers nor accepts (SIGSTOP + full accept
+        backlog, so connecting is refused) keeps its socket and sessions; a CLI
+        call waits and fails instead of starting a second daemon."""
         import signal
+        import socket
         pane = self.rpc("new-session", "keep")["Created"]["pane"]
+        path = next(self.runtime.glob("daemon-v*.sock"))
+        held = []
         os.kill(self.daemon.pid, signal.SIGSTOP)
         try:
-            result = subprocess.run([str(BIN), "list-sessions"], env=self.env, capture_output=True,
+            refused = False
+            for _ in range(4096):
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                client.setblocking(False)
+                try:
+                    client.connect(str(path))
+                except BlockingIOError:
+                    pass
+                except (ConnectionRefusedError, OSError):
+                    client.close()
+                    refused = True
+                    break
+                held.append(client)
+            result = None if not refused else subprocess.run([str(BIN), "list-sessions"], env=self.env, capture_output=True,
                                     text=True, timeout=60)
         finally:
+            for client in held:
+                client.close()
             os.kill(self.daemon.pid, signal.SIGCONT)
+        if result is None:
+            # Linux queues connections to a full Unix-socket backlog (EAGAIN)
+            # instead of refusing them: a live daemon is never "unreachable".
+            self.skipTest("this kernel does not refuse connections to a live socket")
         self.assertNotEqual(result.returncode, 0, result.stdout)
-        self.assertIn("not answering", result.stderr)
+        self.assertIn("alive but not accepting", result.stderr)
+        self.assertTrue(path.exists(), "the live daemon's socket was removed")
         sessions = self.rpc("list-sessions")["View"]["sessions"]
         self.assertEqual([s["name"] for s in sessions], ["keep"], "the original daemon still serves")
         self.assertIsNone(self.daemon.poll())

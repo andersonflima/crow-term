@@ -50,6 +50,11 @@ enum UiEvent {
         activate_created: bool,
     },
     Error(String),
+    /// A command failed; ignored when it addressed a daemon that was replaced.
+    CommandError {
+        epoch: u64,
+        message: String,
+    },
     /// Link to the daemon: a status for the footer (`None` clears a link note);
     /// `expires` clears it after a moment (the "reconnected" note).
     Link {
@@ -99,6 +104,8 @@ impl ViewMailbox {
 struct Command {
     request: Request,
     activate_created: bool,
+    /// Daemon generation the request was made for (bumped on reattach).
+    epoch: u64,
 }
 
 // A paste is one Command in the queue. Drain all its chunks here before receiving
@@ -127,11 +134,29 @@ fn execute_request(
     Ok(Response::Ok)
 }
 
+/// A request's kind and target, for logs (never the input bytes).
+fn request_kind(request: &Request) -> String {
+    match request {
+        Request::Input { pane, bytes } => format!("Input(pane {pane}, {} bytes)", bytes.len()),
+        Request::Resize { pane, .. } => format!("Resize(pane {pane})"),
+        Request::Scroll { pane, .. } => format!("Scroll(pane {pane})"),
+        Request::Split { window, pane, .. } => format!("Split(window {window}, pane {pane})"),
+        Request::ClosePane { window, pane, .. } => {
+            format!("ClosePane(window {window}, pane {pane})")
+        }
+        other => format!("{:?}", std::mem::discriminant(other)),
+    }
+}
+
 /// One request, retried while the link is only slow: a command never fails
 /// because the daemon was busy for a moment. Requests with effects (input,
 /// split, new window, close…) are retried only when they certainly did not
 /// reach the daemon, so nothing is doubled; idempotent ones on any slowness.
-fn rpc_patiently(request: &Request, running: &AtomicBool) -> Result<Response> {
+fn rpc_patiently(
+    request: &Request,
+    running: &AtomicBool,
+    current: impl Fn() -> bool,
+) -> Result<Response> {
     let idempotent = matches!(
         request,
         Request::Resize { .. } | Request::List | Request::PaneCwd { .. }
@@ -140,11 +165,14 @@ fn rpc_patiently(request: &Request, running: &AtomicBool) -> Result<Response> {
     let mut attempt = 0u32;
     loop {
         match rpc(request) {
+            // Never across a daemon replacement: pane ids are reused there.
             Err(error)
                 if !crate::link::refused(&error)
+                    && crate::link::classify(&error) == crate::link::Failure::Transient
                     && (idempotent || crate::link::not_sent(&error))
                     && Instant::now() < deadline
-                    && running.load(Ordering::Relaxed) =>
+                    && running.load(Ordering::Relaxed)
+                    && current() =>
             {
                 attempt += 1;
                 thread::sleep(Duration::from_millis((50 * u64::from(attempt)).min(500)));
@@ -195,6 +223,10 @@ pub fn run(
     let command_proxy = proxy.clone();
     let crow_proxy = proxy.clone();
     let command_running = running.clone();
+    // Daemon generation: commands made for a replaced daemon are dropped (its
+    // pane ids are reused by the next daemon; replaying them would misroute).
+    let epoch = Arc::new(AtomicU64::new(0));
+    let command_epoch = epoch.clone();
     let command_worker = thread::Builder::new()
         .name("crow-ui-commands".into())
         .spawn(move || {
@@ -204,14 +236,30 @@ pub fn run(
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => break,
                 };
+                if command.epoch != command_epoch.load(Ordering::Acquire) {
+                    continue;
+                }
                 let event = match execute_request(&command.request, |request| {
-                    rpc_patiently(request, &command_running)
+                    rpc_patiently(request, &command_running, || {
+                        command.epoch == command_epoch.load(Ordering::Acquire)
+                    })
                 }) {
                     Ok(response) => UiEvent::Reply {
                         response,
                         activate_created: command.activate_created,
                     },
-                    Err(error) => UiEvent::Error(format!("Mux command: {error:#}")),
+                    // Made for a daemon that was replaced meanwhile: void.
+                    Err(_) if command.epoch != command_epoch.load(Ordering::Acquire) => continue,
+                    Err(error) => {
+                        eprintln!(
+                            "crow-term: command {} failed: {error:#}",
+                            request_kind(&command.request)
+                        );
+                        UiEvent::CommandError {
+                            epoch: command.epoch,
+                            message: format!("Mux command: {error:#}"),
+                        }
+                    }
                 };
                 if command_proxy.send_event(event).is_err() {
                     break;
@@ -377,7 +425,9 @@ pub fn run(
                                             ),
                                             expires: false,
                                         });
-                                        break;
+                                        // Keep looking: when the user starts crow-term
+                                        // again, this window reattaches to it.
+                                        thread::sleep(Duration::from_secs(2));
                                     }
                                     None => {
                                         let _ = proxy.send_event(UiEvent::Link {
@@ -438,6 +488,7 @@ pub fn run(
         mailbox,
         crow_shared.clone(),
     );
+    app.epoch = epoch;
     let result = event_loop.run_app(&mut app);
     let fatal_error = app.fatal_error.take();
     running.store(false, Ordering::Relaxed);
@@ -1192,6 +1243,8 @@ struct App {
     window_title: String,
     /// Clear `status` at this instant (transient link notes).
     status_expires: Option<Instant>,
+    /// Daemon generation: commands made before a reattach are void.
+    epoch: Arc<AtomicU64>,
     clipboard: Option<arboard::Clipboard>,
     crow: Option<Arc<crow::Shared>>,
     crow_view: CrowView,
@@ -1253,6 +1306,7 @@ impl App {
             bell_flash: None,
             window_title: String::new(),
             status_expires: None,
+            epoch: Arc::default(),
             clipboard: None,
             crow,
             crow_view: CrowView::default(),
@@ -1316,6 +1370,7 @@ impl App {
         let _ = self.commands.send(Command {
             request,
             activate_created,
+            epoch: self.epoch.load(Ordering::Acquire),
         });
     }
     fn input(&mut self, bytes: Vec<u8>) {
@@ -2625,16 +2680,35 @@ impl ApplicationHandler<UiEvent> for App {
                 self.status_expires = None;
                 self.redraw();
             }
+            UiEvent::CommandError { epoch, message } => {
+                // Pane ids of a replaced daemon mean nothing to the new one.
+                if epoch == self.epoch.load(Ordering::Acquire) {
+                    self.status = message;
+                    self.status_expires = None;
+                    self.redraw();
+                }
+            }
             UiEvent::Link { status, expires } => {
                 self.status = status.unwrap_or_default();
                 self.status_expires = expires.then(|| Instant::now() + Duration::from_secs(3));
                 self.redraw();
             }
             UiEvent::Reattached { window, pane } => {
+                eprintln!(
+                    "crow-term: reattached to window {window}, pane {pane} (was window {}, pane {})",
+                    self.window_id, self.pane_id
+                );
+                self.epoch.fetch_add(1, Ordering::AcqRel);
+                // Switch ids directly: the old ones belong to the replaced
+                // daemon and must not be resized or focused in the new one.
                 self.view = None;
                 self.sent_sizes.clear();
-                self.activate_window(window);
-                self.focus_pane(pane);
+                self.window_id = window;
+                self.shared_window.store(window, Ordering::Relaxed);
+                self.pane_id = pane;
+                self.pending_focus_in = None;
+                self.selection = None;
+                self.renderer.rows.clear();
                 self.status =
                     "Daemon restarted — a new session replaced the one that ended with it".into();
                 self.status_expires = Some(Instant::now() + Duration::from_secs(10));
