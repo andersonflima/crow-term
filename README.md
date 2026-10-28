@@ -11,6 +11,23 @@ terminal for command-line tools and Vim/Neovim/LazyVim.
 builds are checked in CI; a build is not the same as manual validation of every
 platform, keyboard layout, graphics driver or editor setup.
 
+## Install
+
+Prebuilt alpha archives for macOS (arm64, x86_64), Linux (arm64, x86_64) and
+Windows (x86_64) are attached to each
+[GitHub Release](https://github.com/andersonflima/crow-term/releases), with
+`SHA256SUMS` and build provenance (`gh attestation verify <file> --repo andersonflima/crow-term`).
+
+With Homebrew (pick one; both provide `crow-term`):
+
+```sh
+brew install andersonflima/tap/crow-term          # command-line install, macOS and Linux
+brew install --cask andersonflima/tap/crow-term   # Crow Term.app in /Applications, macOS
+```
+
+The macOS app is signed and notarized only when the release says so; Windows
+builds are not code-signed yet. See [docs/release.md](docs/release.md).
+
 ## Run from source
 
 Install a current stable Rust toolchain and your preferred shell, then:

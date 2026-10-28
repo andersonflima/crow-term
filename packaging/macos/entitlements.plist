@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for Crow Term. Intentionally empty.
+  Crow Term has no JIT, loads no third-party or unsigned dylibs/plugins, and
+  never sets DYLD_* for itself. Shells and tools are separate executables run
+  through a PTY (fork/exec), each governed by its own code signature, so no
+  com.apple.security.cs.* exception is needed. Add a key only with evidence
+  (a reproduced failure), never preemptively. See docs/release.md.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

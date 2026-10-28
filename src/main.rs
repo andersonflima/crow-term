@@ -102,6 +102,30 @@ enum Action {
     },
 }
 
+/// Bundled locations only: next to the invoked path (portable archive, which may be
+/// a symlink), next to the resolved executable (Homebrew `bin` links), and the
+/// macOS app bundle's `Contents/Resources` (signed bundles keep data out of `MacOS`).
+fn bundled_shell_setup_candidates() -> Result<Vec<PathBuf>> {
+    let invoked = std::env::current_exe()?;
+    let mut bases = vec![
+        invoked
+            .parent()
+            .context("Executable directory missing")?
+            .to_path_buf(),
+    ];
+    if let Some(resolved) = std::fs::canonicalize(&invoked)
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+    {
+        bases.push(resolved.join("../Resources"));
+        bases.push(resolved);
+    }
+    Ok(bases
+        .into_iter()
+        .map(|base| base.join("shell/setup.py"))
+        .collect())
+}
+
 fn ensure_daemon(config: Option<&PathBuf>) -> Result<()> {
     let initial_error = match ipc::rpc(&Request::List) {
         Ok(_) => return Ok(()),
@@ -230,16 +254,15 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Action::ShellSetup { source, args }) => {
-            let base = std::env::current_exe()?
-                .parent()
-                .context("Executable directory missing")?
-                .to_path_buf();
-            let script = source.as_ref().unwrap_or(&base).join("shell/setup.py");
-            if !script.is_file() {
+            let candidates = match source {
+                Some(source) => vec![source.join("shell/setup.py")],
+                None => bundled_shell_setup_candidates()?,
+            };
+            let Some(script) = candidates.into_iter().find(|path| path.is_file()) else {
                 bail!(
                     "Bundled shell/setup.py missing; use the full archive, run python3 shell/setup.py explicitly, or pass --source /trusted/checkout"
                 );
-            }
+            };
             let python = which::which("python3")
                 .or_else(|_| which::which("python"))
                 .context("Python3 required only for shell setup")?;
