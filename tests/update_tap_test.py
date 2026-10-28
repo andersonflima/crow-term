@@ -39,7 +39,9 @@ class UpdateTapTest(unittest.TestCase):
         self.assertEqual(changed, ["Formula/crow-term.rb", "Casks/crow-term.rb"])
         formula = (self.tap / "Formula/crow-term.rb").read_text()
         cask = (self.tap / "Casks/crow-term.rb").read_text()
-        self.assertIn(f'version "{VERSION}"', formula)
+        # Formula version comes from the URL (brew audit: an explicit version is redundant).
+        self.assertNotIn('version "', formula)
+        self.assertIn(f"/download/v{VERSION}/crow-term-{VERSION}-macos-arm64.tar.gz", formula)
         for token in ("SHA256_MACOS_ARM64", "SHA256_MACOS_X86_64", "SHA256_LINUX_ARM64", "SHA256_LINUX_X86_64"):
             self.assertIn(self.digests[token], formula)
         self.assertIn(self.digests["SHA256_MACOS_ARM64_APP"], cask)

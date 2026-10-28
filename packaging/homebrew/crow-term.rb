@@ -3,27 +3,26 @@
 class CrowTerm < Formula
   desc "Native terminal with persistent sessions, built in Rust"
   homepage "https://github.com/andersonflima/crow-term"
-  version "@VERSION@"
   license "MIT"
 
   on_macos do
     on_arm do
-      url "https://github.com/andersonflima/crow-term/releases/download/v#{version}/crow-term-#{version}-macos-arm64.tar.gz"
+      url "https://github.com/andersonflima/crow-term/releases/download/v@VERSION@/crow-term-@VERSION@-macos-arm64.tar.gz"
       sha256 "@SHA256_MACOS_ARM64@"
     end
     on_intel do
-      url "https://github.com/andersonflima/crow-term/releases/download/v#{version}/crow-term-#{version}-macos-x86_64.tar.gz"
+      url "https://github.com/andersonflima/crow-term/releases/download/v@VERSION@/crow-term-@VERSION@-macos-x86_64.tar.gz"
       sha256 "@SHA256_MACOS_X86_64@"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/andersonflima/crow-term/releases/download/v#{version}/crow-term-#{version}-linux-arm64.tar.gz"
+      url "https://github.com/andersonflima/crow-term/releases/download/v@VERSION@/crow-term-@VERSION@-linux-arm64.tar.gz"
       sha256 "@SHA256_LINUX_ARM64@"
     end
     on_intel do
-      url "https://github.com/andersonflima/crow-term/releases/download/v#{version}/crow-term-#{version}-linux-x86_64.tar.gz"
+      url "https://github.com/andersonflima/crow-term/releases/download/v@VERSION@/crow-term-@VERSION@-linux-x86_64.tar.gz"
       sha256 "@SHA256_LINUX_X86_64@"
     end
   end
