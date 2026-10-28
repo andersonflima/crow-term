@@ -388,7 +388,7 @@ pub fn run(config: Config) -> Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     while !server.stopped.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 if server.stopped.load(Ordering::Acquire) {
                     break;
                 }
@@ -412,6 +412,7 @@ pub fn run(config: Config) -> Result<()> {
                         stream
                             .set_nonblocking(true)
                             .context("set server IPC nonblocking mode")?;
+                        let mut stream = ipc::FramedStream::new(stream);
                         let request = ipc::read_frame(&mut stream).context("read IPC request")?;
                         let response = server
                             .handle(request)

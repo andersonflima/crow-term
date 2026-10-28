@@ -16,6 +16,56 @@ use std::{
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
 
+/// The Windows PIPE_NOWAIT transport can report a successful zero-byte read
+/// while still connected. Keep this quirk out of the generic framing reader,
+/// where zero bytes must continue to mean EOF (files, cursors and Unix sockets).
+pub struct FramedStream(Stream);
+impl FramedStream {
+    pub fn new(stream: Stream) -> Self {
+        Self(stream)
+    }
+}
+impl Read for FramedStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.0.read(buffer)?;
+        #[cfg(windows)]
+        if count == 0 && !buffer.is_empty() {
+            use std::os::windows::io::{AsHandle, AsRawHandle};
+            use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+            let Stream::NamedPipe(pipe) = &self.0;
+            let mut available = 0;
+            // SAFETY: borrowed live pipe handle; no input/output buffer is used,
+            // and the available-byte output points to initialized writable storage.
+            let connected = unsafe {
+                PeekNamedPipe(
+                    pipe.as_handle().as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if connected != 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let error = std::io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(109 | 232 | 233)) {
+                return Err(error);
+            }
+        }
+        Ok(count)
+    }
+}
+impl Write for FramedStream {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
 pub fn runtime_dir() -> Result<PathBuf> {
     let path = match std::env::var_os("CROW_TERM_RUNTIME_DIR") {
         Some(p) => PathBuf::from(p),
@@ -273,11 +323,12 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 }
 
 pub fn rpc(request: &Request) -> Result<Response> {
-    let mut stream = Stream::connect(socket_name()?).context("Crow daemon is not running")?;
+    let stream = Stream::connect(socket_name()?).context("Crow daemon is not running")?;
     check_peer(&stream).context("authenticate IPC server")?;
     stream
         .set_nonblocking(true)
         .context("set client IPC nonblocking mode")?;
+    let mut stream = FramedStream::new(stream);
     write_frame(&mut stream, request).context("write IPC request")?;
     let response = read_frame(&mut stream).context("read IPC response")?;
     if let Response::Error(message) = &response {
