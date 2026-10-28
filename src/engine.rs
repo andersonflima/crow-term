@@ -1,6 +1,6 @@
 //! PTY ownership and VT emulation. The daemon owns this object, not a GUI view.
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -645,6 +645,9 @@ pub struct Engine {
     write_error: Arc<Mutex<Option<String>>>,
     process: Arc<Process>,
     notify: Notify,
+    /// Snapshot readers waiting for `state`: the PTY reader steps aside for
+    /// them (std mutexes are not fair; a flooding reader re-locks at once).
+    snapshot_waiters: Arc<AtomicUsize>,
 }
 // Unix cleanup must run before any wait/try_wait reaps the session leader.
 #[cfg(unix)]
@@ -844,6 +847,7 @@ impl Engine {
             write_error: write_error.clone(),
             process: process.clone(),
             notify: notify.clone(),
+            snapshot_waiters: Arc::default(),
         };
 
         // Set defaults before the reader/parser can answer an application's first OSC query.
@@ -873,6 +877,7 @@ impl Engine {
             })
             .context("start PTY writer")?;
         let reader_state = state.clone();
+        let waiters = engine.snapshot_waiters.clone();
         thread::Builder::new()
             .name("crow-pty-read".into())
             .spawn(move || {
@@ -881,6 +886,13 @@ impl Engine {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
                         Ok(count) => {
+                            // Let a waiting snapshot in first (bounded: ~1 ms).
+                            for _ in 0..1000 {
+                                if waiters.load(Ordering::Acquire) == 0 {
+                                    break;
+                                }
+                                thread::yield_now();
+                            }
                             let Ok(mut state) = reader_state.lock() else {
                                 break;
                             };
@@ -1092,9 +1104,11 @@ impl Engine {
         Ok(())
     }
     pub fn snapshot(&self) -> Result<Screen> {
-        Ok(self
-            .state
-            .lock()
+        // Announce the wait so a flooding PTY reader steps aside (see reader).
+        self.snapshot_waiters.fetch_add(1, Ordering::AcqRel);
+        let state = self.state.lock();
+        self.snapshot_waiters.fetch_sub(1, Ordering::AcqRel);
+        Ok(state
             .map_err(|_| anyhow!("terminal state poisoned"))?
             .snapshot(self.alive()))
     }
