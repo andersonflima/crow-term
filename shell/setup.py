@@ -49,21 +49,21 @@ set -gx Z_DATA {q(prefix / 'data/z/data')}
 if test -f {q(prefix / 'plugins/z/conf.d/z.fish')}
     source {q(prefix / 'plugins/z/conf.d/z.fish')}
 end
-set -g fish_color_command FFFFFF --bold
-set -g fish_color_keyword FFFFFF --bold
-set -g fish_color_quote 8C8C8C
+set -g fish_color_command normal --bold
+set -g fish_color_keyword normal --bold
+set -g fish_color_quote 606060
 set -g fish_color_comment 6A6A6A --italics
-set -g fish_color_param A8A8A8
-set -g fish_color_operator FFFFFF
-set -g fish_color_redirection C6C6C6
-set -g fish_color_end FFFFFF
-set -g fish_color_error FFFFFF --bold
-set -g fish_color_autosuggestion 4A4A4A
-set -g fish_color_selection --background=2A2A2A
-set -g fish_color_search_match --background=2A2A2A
+set -g fish_color_param normal
+set -g fish_color_operator normal
+set -g fish_color_redirection normal
+set -g fish_color_end normal
+set -g fish_color_error normal --bold
+set -g fish_color_autosuggestion 808080
+set -g fish_color_selection --reverse
+set -g fish_color_search_match --reverse
 function fish_prompt
     set -l last_status $status
-    set_color white
+    set_color normal
     printf '%s' (prompt_pwd)
     if test $last_status -ne 0
         printf ' [%s]' $last_status
@@ -81,18 +81,18 @@ HISTFILE={q(prefix / 'data/zsh-history')}
 HISTSIZE=10000
 SAVEHIST=10000
 setopt HIST_IGNORE_SPACE
-PROMPT='%F{{white}}%~%f > '
-ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=#4A4A4A'
+PROMPT='%f%~ > '
+ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=#808080'
 if [[ -f {q(prefix / 'plugins/zsh-autosuggestions/zsh-autosuggestions.zsh')} ]]; then
     source {q(prefix / 'plugins/zsh-autosuggestions/zsh-autosuggestions.zsh')}
 fi
 typeset -gA ZSH_HIGHLIGHT_STYLES
-ZSH_HIGHLIGHT_STYLES[command]='fg=#FFFFFF,bold'
-ZSH_HIGHLIGHT_STYLES[builtin]='fg=#FFFFFF,bold'
-ZSH_HIGHLIGHT_STYLES[reserved-word]='fg=#FFFFFF,bold'
+ZSH_HIGHLIGHT_STYLES[command]='bold'
+ZSH_HIGHLIGHT_STYLES[builtin]='bold'
+ZSH_HIGHLIGHT_STYLES[reserved-word]='bold'
 ZSH_HIGHLIGHT_STYLES[comment]='fg=#6A6A6A,italic'
-ZSH_HIGHLIGHT_STYLES[single-quoted-argument]='fg=#8C8C8C'
-ZSH_HIGHLIGHT_STYLES[double-quoted-argument]='fg=#8C8C8C'
+ZSH_HIGHLIGHT_STYLES[single-quoted-argument]='fg=#606060'
+ZSH_HIGHLIGHT_STYLES[double-quoted-argument]='fg=#606060'
 # Must remain the final sourced plugin (upstream requirement).
 if [[ -f {q(prefix / 'plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh')} ]]; then
     source {q(prefix / 'plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh')}

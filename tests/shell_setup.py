@@ -22,6 +22,15 @@ spec.loader.exec_module(setup)
 
 
 class ShellSetupTests(unittest.TestCase):
+    def test_profiles_inherit_foreground_instead_of_white_on_light(self):
+        base=Path("/dedicated/crow-profile")
+        fish=setup.fish_profile(base)
+        zsh=setup.zsh_profile(base)
+        self.assertIn("fish_color_command normal --bold",fish)
+        self.assertNotIn("set_color white",fish)
+        self.assertNotIn("FFFFFF",fish)
+        self.assertIn("ZSH_HIGHLIGHT_STYLES[command]='bold'",zsh)
+        self.assertNotIn("%F{white}",zsh)
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="crow-shell-test-")
         self.addCleanup(self.temp.cleanup)
