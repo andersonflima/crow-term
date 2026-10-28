@@ -304,6 +304,10 @@ impl Interceptor {
                     self.pass(sink);
                     return;
                 }
+                // C0 controls inside an OSC string are ignored by the parser.
+                if matches!(byte, 0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1c..=0x1f) {
+                    return;
+                }
                 self.payload.push(byte);
                 if self.payload == b"52;" {
                     self.state = State::Osc52;
@@ -439,6 +443,18 @@ impl Interceptor {
             self.drop_sequence();
             return;
         }
+        // The parser answers DA2 for `CSI > c` with up to one extra
+        // intermediate (the marker counts as one of its two).
+        if !self.ignored
+            && self.marker == Some(b'>')
+            && final_byte == b'c'
+            && self.intermediates <= 1
+            && self.separators < MAX_PARAMS
+        {
+            self.drop_sequence();
+            sink(Out::Query(Query::SecondaryAttributes));
+            return;
+        }
         if self.ignored || self.intermediates > 0 || self.separators >= MAX_PARAMS {
             self.pass(sink);
             return;
@@ -474,12 +490,6 @@ impl Interceptor {
             (Some(b'>'), b'q') if first == 0 && params.len() <= 1 => {
                 self.pass(sink);
                 sink(Out::Query(Query::Version));
-                return;
-            }
-            // Every `CSI > … c` reaches the parser's DA2 (its crate version).
-            (Some(b'>'), b'c') => {
-                self.drop_sequence();
-                sink(Out::Query(Query::SecondaryAttributes));
                 return;
             }
             (None, b't') if first == 16 && params.len() == 1 => {
@@ -622,6 +632,23 @@ mod tests {
         let osc = b"\x1b]2;title\x07\x1b]8;;https://x\x1b\\\x1b]11;?\x18done";
         let (fed, _) = run(&mut interceptor, &[osc]);
         assert_eq!(fed, osc);
+    }
+
+    #[test]
+    fn re_review_osc52_c0_in_number_and_da2_intermediate() {
+        let mut interceptor = Interceptor::default();
+        let mut big = b"\x1b]5\x012;c;".to_vec();
+        big.extend(std::iter::repeat_n(b'A', MAX_OSC52_BYTES));
+        big.extend_from_slice(b"\x07after");
+        let (fed, _) = run(&mut interceptor, &[&big]);
+        assert_eq!(fed, b"after");
+        let (fed, queries) = run(&mut interceptor, &[b"\x1b[> c\x1b[>0;1 c\x1b[> !c"]);
+        assert_eq!(
+            queries,
+            vec![Query::SecondaryAttributes, Query::SecondaryAttributes]
+        );
+        // Two extra intermediates: the parser ignores it, so it passes through.
+        assert_eq!(fed, b"\x1b[> !c");
     }
 
     #[test]

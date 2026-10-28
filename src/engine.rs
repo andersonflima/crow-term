@@ -155,6 +155,9 @@ impl State {
                 // their effects and follows the parser's own replies in order.
                 if parser.sync_timeout().sync_timeout().is_some() {
                     parser.stop_sync(term);
+                    // Reopen the block: the rest of the frame stays atomic
+                    // until the application's own end marker (or timeout).
+                    parser.advance(term, b"\x1b[?2026h");
                 }
                 if let Some(text) = answer(query, term, cell, osc52_copy) {
                     let _ = replies.send(Event::PtyWrite(text));
@@ -1361,6 +1364,18 @@ mod tests {
         assert_eq!(got[0], "\x1bP1$r0;1m\x1b\\");
         assert_eq!(got[1], "\x1b[?6c");
         assert!(got[2].starts_with("\x1bP>|crow-term("), "{got:?}");
+        // ...and the synchronized update stays open until the application's ESU.
+        let mut sync = State::new(Size { rows: 2, cols: 20 }, 0);
+        sync.advance(b"OLD");
+        sync.advance(b"\x1b[?2026h\x1b[2J\x1b[HA\x1b[>q");
+        sync.advance(b"B");
+        assert!(
+            sync.parser.sync_timeout().sync_timeout().is_some(),
+            "sync block ended before ESU"
+        );
+        assert_eq!(sync.snapshot(true).cells[0][1].text, " ");
+        sync.advance(b"\x1b[?2026l");
+        assert_eq!(sync.snapshot(true).cells[0][1].text, "B");
         // DA2 with extra parameters is still Crow Term's.
         state.advance(b"\x1b[>0;0c\x1b[>1c");
         let number = version_number();
