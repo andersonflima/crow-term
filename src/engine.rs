@@ -752,11 +752,32 @@ fn kill_unix_session(raw_shell: u32, foreground: Option<rustix::process::Pid>) -
         }
         if let Err(error) = kill_process_group(group, Signal::KILL)
             && error != rustix::io::Errno::SRCH
+            // macOS answers EPERM for a group whose members already exited and
+            // await reaping (seen on close-pane right after the members above
+            // were killed): nothing is left to signal, so that is success.
+            && !(error == rustix::io::Errno::PERM && !session_has_live_member(&mut system, raw_shell))
         {
             return Err(error).context("terminate terminal process group");
         }
     }
     Ok(())
+}
+
+/// Whether any process of the PTY session, its leader included, is still
+/// alive (not a zombie awaiting its parent or an exiting process).
+#[cfg(unix)]
+fn session_has_live_member(system: &mut sysinfo::System, raw_shell: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    let sid = sysinfo::Pid::from_u32(raw_shell);
+    system.processes().values().any(|process| {
+        (process.pid() == sid || process.session_id() == Some(sid))
+            && process.status() != sysinfo::ProcessStatus::Zombie
+    })
 }
 
 impl Engine {
