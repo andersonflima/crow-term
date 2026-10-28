@@ -128,16 +128,21 @@ fn execute_request(
 }
 
 /// One request, retried while the link is only slow: a command never fails
-/// because the daemon was busy for a moment. Input is retried only when it
-/// certainly did not reach the daemon, so a keystroke is never doubled.
-fn rpc_patiently(request: &Request, input: bool, running: &AtomicBool) -> Result<Response> {
+/// because the daemon was busy for a moment. Requests with effects (input,
+/// split, new window, close…) are retried only when they certainly did not
+/// reach the daemon, so nothing is doubled; idempotent ones on any slowness.
+fn rpc_patiently(request: &Request, running: &AtomicBool) -> Result<Response> {
+    let idempotent = matches!(
+        request,
+        Request::Resize { .. } | Request::List | Request::PaneCwd { .. }
+    );
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut attempt = 0u32;
     loop {
         match rpc(request) {
             Err(error)
                 if !crate::link::refused(&error)
-                    && (!input || crate::link::not_sent(&error))
+                    && (idempotent || crate::link::not_sent(&error))
                     && Instant::now() < deadline
                     && running.load(Ordering::Relaxed) =>
             {
@@ -199,9 +204,8 @@ pub fn run(
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => break,
                 };
-                let input = matches!(command.request, Request::Input { .. });
                 let event = match execute_request(&command.request, |request| {
-                    rpc_patiently(request, input, &command_running)
+                    rpc_patiently(request, &command_running)
                 }) {
                     Ok(response) => UiEvent::Reply {
                         response,
