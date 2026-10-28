@@ -24,7 +24,9 @@ for package in sorted(metadata["packages"],key=lambda p:(p["name"],p["version"])
     if not package["source"]:
         continue
     directory=Path(package["manifest_path"]).parent
-    files={p for p in directory.iterdir() if p.is_file() and p.name.lower().startswith(("license","licence","copying","copyright","notice"))}
+    # Crates can vendor separate Unicode/protocol/data licenses below src/ or
+    # protocol directories. A root-only scan silently drops those notices.
+    files={p for p in directory.rglob("*") if p.is_file() and p.name.lower().startswith(("license","licence","copying","copyright","notice"))}
     if package.get("license_file"):
         path=directory/package["license_file"]
         if path.is_file():files.add(path)
@@ -46,7 +48,8 @@ for package in sorted(metadata["packages"],key=lambda p:(p["name"],p["version"])
         if override.get("note"):
             sections.append(override["note"]+"\n")
     for path in sorted(files):
-        sections.append("\n--- "+path.name+" ---\n"+path.read_text(encoding="utf-8")+"\n")
+        label=path.relative_to(directory) if path.is_relative_to(directory) else path.relative_to(root)
+        sections.append("\n--- "+str(label)+" ---\n"+path.read_text(encoding="utf-8")+"\n")
     count+=1
 if missing:
     raise SystemExit("Missing original license files: "+", ".join(missing))
