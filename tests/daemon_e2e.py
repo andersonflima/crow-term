@@ -169,8 +169,15 @@ class DaemonTests(DaemonHarness):
         pane = self.rpc("new-session", "nvim")["Created"]["pane"]
         self.send(pane, shlex.quote(nvim) + " --clean -n -i NONE")
         self.eventually(lambda: self.rpc("capture-pane", pane, "--json")["modes"]["bracketed_paste"])
-        self.command("send-keys", pane, "iCrow terminal é 界 -> != 🚀\x1b")
+        self.command("send-keys", pane, "iCrow terminal é 界 -> != 🚀")
         self.eventually(lambda: "Crow terminal" in self.capture(pane))
+        # Escape as the GUI encodes it for the keyboard mode Neovim enabled: a
+        # raw ESC followed by ":" is ambiguous (Alt+:) under the kitty protocol.
+        flags = self.rpc("capture-pane", pane, "--json")["modes"].get("keyboard", 0)
+        escape = subprocess.run([str(BIN), "debug-encode-key", "Escape", "--flags", str(flags)],
+                                capture_output=True, check=True, timeout=10).stdout.decode()
+        self.command("send-keys", pane, escape)
+        self.eventually(lambda: self.rpc("capture-pane", pane, "--json")["cursor"]["shape"] == "block")
         self.command("send-keys", pane, ":qa!\r")
         self.eventually(lambda: not self.rpc("capture-pane", pane, "--json")["modes"]["bracketed_paste"])
         self.send(pane, "echo CROW_NVIM_EXIT_OK")
