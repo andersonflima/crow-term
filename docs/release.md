@@ -41,6 +41,11 @@ Each has `<asset>.sha256`. The macOS `.tar.gz` holds the portable tree with
 `Crow Term.app` and a `crow-term` link into it; the `.app.zip` holds only the
 app (used by the cask). The bundle is self-contained: the shell setup lives in
 `Contents/Resources/shell`. Linux binaries follow the glibc of Ubuntu 24.04.
+At run time the Linux GUI loads libxkbcommon dynamically, plus
+libxkbcommon-x11 on X11 and libwayland-client on Wayland (Debian/Ubuntu:
+`libxkbcommon0 libxkbcommon-x11-0 libwayland-client0`). Without
+libxkbcommon-x11 the X11 GUI aborts at startup with "Library
+libxkbcommon-x11.so could not be loaded" (seen in the GUI journeys CI).
 
 ## Secrets and variables
 
