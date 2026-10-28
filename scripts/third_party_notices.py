@@ -49,7 +49,7 @@ for package in sorted(metadata["packages"],key=lambda p:(p["name"],p["version"])
             sections.append(override["note"]+"\n")
     for path in sorted(files):
         label=path.relative_to(directory) if path.is_relative_to(directory) else path.relative_to(root)
-        sections.append("\n--- "+str(label)+" ---\n"+path.read_text(encoding="utf-8")+"\n")
+        sections.append("\n--- "+str(label)+" ---\n"+path.read_bytes().decode("utf-8")+"\n")
     count+=1
 if missing:
     raise SystemExit("Missing original license files: "+", ".join(missing))
@@ -58,8 +58,8 @@ if str(Path.home()) in output:
     raise SystemExit("Refusing a notice bundle containing a local home path")
 destination=root/"THIRD_PARTY_LICENSES.txt"
 if args.check:
-    if not destination.is_file() or destination.read_text(encoding="utf-8")!=output:
+    if not destination.is_file() or destination.read_bytes().decode("utf-8")!=output:
         raise SystemExit("THIRD_PARTY_LICENSES.txt is stale; run scripts/third_party_notices.py")
 else:
-    destination.write_text(output,encoding="utf-8")
+    destination.write_bytes(output.encode("utf-8"))
 print(f"Collected original notices for {count} packages")
