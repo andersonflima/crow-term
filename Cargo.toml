@@ -20,7 +20,7 @@ interprocess = "2.4"
 winit = "0.30"
 softbuffer = "0.4"
 cosmic-text = "0.19"
-arboard = "3.7"
+arboard = { version = "3.7", features = ["wayland-data-control"] }
 clap = { version = "4", features = ["derive"] }
 which = "8"
 unicode-width = "0.2"
