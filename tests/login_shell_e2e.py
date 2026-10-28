@@ -99,6 +99,18 @@ class LoginShells(unittest.TestCase):
             time.sleep(0.1)
         return cli, runtime
 
+    def wait_until_ready(self, cli, pane, prompt=None, quiet=0.8, timeout=40):
+        deadline = time.monotonic() + timeout
+        last, since = None, time.monotonic()
+        while time.monotonic() < deadline:
+            screen = cli("capture-pane", pane)
+            if screen != last:
+                last, since = screen, time.monotonic()
+            elif screen.strip() and (prompt is None or prompt in screen) and time.monotonic() - since >= quiet:
+                return screen
+            time.sleep(0.1)
+        raise AssertionError(f"shell never became ready (prompt {prompt!r}):\n{last}")
+
     def wait_for(self, cli, pane, needle, timeout=30):
         deadline = time.monotonic() + timeout
         screen = ""
@@ -126,7 +138,10 @@ class LoginShells(unittest.TestCase):
                 doctor = cli("doctor")
                 self.assertIn("; login shell)", doctor)
                 pane = json.loads(cli("new-session", name))["Created"]["pane"]
-                time.sleep(1.5)  # let the profile and prompt finish before typing
+                # Type only once the shell is ready: its prompt is drawn and the
+                # screen has stopped changing (pwsh's PSReadLine on Linux
+                # re-displays early typeahead without running it).
+                self.wait_until_ready(cli, pane, prompt="PS " if name == "pwsh" else None)
                 cli("send-keys", pane, probe, "--enter")
                 screen = self.wait_for(cli, pane, "M=login-profile")
                 # The PATH line wraps at 80 columns: compare the unwrapped text.
