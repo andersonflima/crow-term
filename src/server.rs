@@ -408,13 +408,15 @@ pub fn run(config: Config) -> Result<()> {
                     }
                     let _guard = Guard(active);
                     let result = (|| -> Result<()> {
-                        ipc::check_peer(&stream)?;
-                        stream.set_nonblocking(true)?;
-                        let request = ipc::read_frame(&mut stream)?;
+                        ipc::check_peer(&stream).context("authenticate IPC client")?;
+                        stream
+                            .set_nonblocking(true)
+                            .context("set server IPC nonblocking mode")?;
+                        let request = ipc::read_frame(&mut stream).context("read IPC request")?;
                         let response = server
                             .handle(request)
                             .unwrap_or_else(|e| Response::Error(format!("{e:#}")));
-                        ipc::write_frame(&mut stream, &response)
+                        ipc::write_frame(&mut stream, &response).context("write IPC response")
                     })();
                     if let Err(error) = result {
                         eprintln!("crow-term IPC: {error:#}");

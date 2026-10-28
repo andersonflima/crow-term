@@ -274,10 +274,12 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 
 pub fn rpc(request: &Request) -> Result<Response> {
     let mut stream = Stream::connect(socket_name()?).context("Crow daemon is not running")?;
-    check_peer(&stream)?;
-    stream.set_nonblocking(true)?;
-    write_frame(&mut stream, request)?;
-    let response = read_frame(&mut stream)?;
+    check_peer(&stream).context("authenticate IPC server")?;
+    stream
+        .set_nonblocking(true)
+        .context("set client IPC nonblocking mode")?;
+    write_frame(&mut stream, request).context("write IPC request")?;
+    let response = read_frame(&mut stream).context("read IPC response")?;
     if let Response::Error(message) = &response {
         bail!("{message}");
     }

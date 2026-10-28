@@ -103,9 +103,10 @@ enum Action {
 }
 
 fn ensure_daemon(config: Option<&PathBuf>) -> Result<()> {
-    if ipc::rpc(&Request::List).is_ok() {
-        return Ok(());
-    }
+    let initial_error = match ipc::rpc(&Request::List) {
+        Ok(_) => return Ok(()),
+        Err(error) => error,
+    };
     let runtime = ipc::runtime_dir()?;
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -142,7 +143,7 @@ fn ensure_daemon(config: Option<&PathBuf>) -> Result<()> {
         }
         if let Some(status) = child.try_wait()? {
             bail!(
-                "Daemon exited {status}; inspect {} (a stale socket after crash must be removed manually, only when no daemon is running)",
+                "Daemon exited {status}; first connection failed: {initial_error:#}; inspect {} (a stale socket after crash must be removed manually, only when no daemon is running)",
                 runtime.join("daemon.log").display()
             );
         }

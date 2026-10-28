@@ -67,6 +67,10 @@ class DaemonTests(unittest.TestCase):
     def capture(self, pane):
         return self.command("capture-pane", pane).stdout
 
+    def output_line(self,pane,expected):
+        # A command's terminal echo is not evidence that the shell executed it.
+        return any(line.strip()==expected for line in self.capture(pane).splitlines())
+
     def send(self, pane, text):
         self.command("send-keys", pane, text, "--enter")
 
@@ -75,11 +79,11 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(self.rpc("new-session", "alpha")["Created"], first)
         pane, window = first["pane"], first["window"]
         self.send(pane, "echo CROW_REAL_PTY")
-        self.eventually(lambda: "CROW_REAL_PTY" in self.capture(pane))
+        self.eventually(lambda: self.output_line(pane,"CROW_REAL_PTY"))
         # Reattaching with another CLI default must not change a session's shell profile.
         second = self.rpc("--session", "alpha", "--shell", "crow-nonexistent-shell-fixture", "new-window")["Created"]
         self.send(second["pane"],"echo CROW_ORIGINAL_PROFILE")
-        self.eventually(lambda: "CROW_ORIGINAL_PROFILE" in self.capture(second["pane"]))
+        self.eventually(lambda: self.output_line(second["pane"],"CROW_ORIGINAL_PROFILE"))
         split = self.rpc("--session", "alpha", "split-pane", pane, "--window", window, "--horizontal")["Created"]
         sessions = self.rpc("list-sessions")["View"]["sessions"]
         self.assertEqual(len(sessions), 1)
@@ -153,7 +157,7 @@ class DaemonTests(unittest.TestCase):
         self.command("send-keys", pane, ":qa!\r")
         self.eventually(lambda: not self.rpc("capture-pane", pane, "--json")["modes"]["bracketed_paste"])
         self.send(pane, "echo CROW_NVIM_EXIT_OK")
-        self.eventually(lambda: "CROW_NVIM_EXIT_OK" in self.capture(pane))
+        self.eventually(lambda: self.output_line(pane,"CROW_NVIM_EXIT_OK"))
 
     @unittest.skipIf(os.name == "nt", "tmux supported here on Unix; WSL must be tested separately")
     def test_real_tmux_reads_unmodified_config(self):
@@ -175,7 +179,7 @@ class DaemonTests(unittest.TestCase):
         self.assertEqual(conf.read_text(), "set -g prefix C-t\nset -g @crow-marker exact-config\nset -g status off\n")
         self.command("send-keys", pane, "\x14d")
         self.send(pane, "echo CROW_TMUX_DETACHED")
-        self.eventually(lambda: "CROW_TMUX_DETACHED" in self.capture(pane))
+        self.eventually(lambda: self.output_line(pane,"CROW_TMUX_DETACHED"))
 
 
 if __name__ == "__main__":
