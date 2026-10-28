@@ -3707,9 +3707,11 @@ mod tests {
         renderer.symbols = Some(SYMBOL_FAMILIES[0]);
         assert!(!renderer.symbol_cell(&config, &cell("a")));
         assert!(!renderer.symbol_cell(&config, &cell("")));
-        // The answer for a code point follows the configured face's own charmap.
-        let first = renderer.symbol_cell(&config, &cell("\u{E702}"));
-        assert_eq!(renderer.primary_covers.get(&'\u{E702}'), Some(&!first));
+        // The configured face's own charmap decides: the bundled Crowquill Mono
+        // maps the powerline separators (U+E0A0-E0B3) but not nf-dev-git (U+E702).
+        assert!(renderer.symbol_cell(&config, &cell("\u{E702}")));
+        assert!(!renderer.symbol_cell(&config, &cell("\u{E0B0}")));
+        assert_eq!(renderer.primary_covers.get(&'\u{E0B0}'), Some(&true));
         // A configured family that does not exist covers nothing: always the symbols family.
         let missing = Config {
             font_family: "No Such Family For Crow Tests".into(),
