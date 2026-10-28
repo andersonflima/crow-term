@@ -21,6 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Minimum spacing of snapshots while agents are working (files change constantly).
 const BUSY_GAP: Duration = Duration::from_secs(5);
+/// Retry spacing for the pane cwd request after repeated failures.
+const CWD_RETRY: Duration = Duration::from_secs(60);
 const MAX_STDOUT: u64 = 2 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SESSIONS: usize = 64;
@@ -662,6 +664,28 @@ pub fn panel_lines(source: &Source) -> Vec<Line> {
     lines
 }
 
+/// Fit panel lines into `capacity` rows. When they do not fit, the final count
+/// line stays pinned at the bottom and a `+N more` row replaces the overflow.
+pub fn fit_lines(lines: &[Line], capacity: usize) -> Vec<Line> {
+    if lines.len() <= capacity {
+        return lines.to_vec();
+    }
+    if capacity < 3 {
+        return lines.iter().rev().take(capacity).rev().cloned().collect();
+    }
+    let shown = capacity - 2;
+    let mut out = lines[..shown].to_vec();
+    out.push(vec![seg(
+        format!(
+            "… +{} more rows (panel_position = \"right\" shows more)",
+            lines.len() - shown - 1
+        ),
+        Tone::Muted,
+    )]);
+    out.push(lines[lines.len() - 1].clone());
+    out
+}
+
 /// Age fields are snapshot-relative; advance them by the time since the fetch.
 pub fn aged(state: &CrowState, elapsed: Duration) -> CrowState {
     let mut state = state.clone();
@@ -972,6 +996,7 @@ pub fn spawn(
             let mut cwd_cache: Option<(u64, Option<String>, Option<String>)> = None;
             let mut first = true;
             let mut cwd_failures = 0u32;
+            let mut cwd_failed_at: Option<Instant> = None;
             while shared.running.load(Ordering::Relaxed) {
                 if !first {
                     let focused = shared.focused.load(Ordering::Relaxed);
@@ -990,14 +1015,21 @@ pub fn spawn(
                 // Pane cwd + branch: one IPC + one targeted process query per tick.
                 let pane = shared.pane.load(Ordering::Relaxed);
                 let (cwd, branch) = if config.status_bar {
-                    let cwd = if cwd_failures < 3 {
+                    // After 3 failures in a row (closed pane, daemon restart, or an older
+                    // daemon that rejects the request and logs it) retry once a minute.
+                    let retry = cwd_failed_at.is_none_or(|t| now.duration_since(t) >= CWD_RETRY);
+                    let cwd = if cwd_failures < 3 || retry {
                         match cwd_of(pane) {
                             Ok(cwd) => {
                                 cwd_failures = 0;
+                                cwd_failed_at = None;
                                 cwd
                             }
                             Err(()) => {
                                 cwd_failures += 1;
+                                if cwd_failures >= 3 {
+                                    cwd_failed_at = Some(now);
+                                }
                                 None
                             }
                         }
@@ -1297,6 +1329,24 @@ mod tests {
     }
 
     #[test]
+    fn overflowing_panel_keeps_the_count_line() {
+        let lines = panel_lines(&Source::Ready(state()));
+        assert_eq!(fit_lines(&lines, 100), lines);
+        let fitted = fit_lines(&lines, 11);
+        assert_eq!(fitted.len(), 11);
+        assert_eq!(fitted.last(), lines.last());
+        assert_eq!(
+            fitted[9][0].text,
+            format!(
+                "… +{} more rows (panel_position = \"right\" shows more)",
+                lines.len() - 10
+            )
+        );
+        assert_eq!(fit_lines(&lines, 1), vec![lines.last().unwrap().clone()]);
+        assert!(fit_lines(&lines, 0).is_empty());
+    }
+
+    #[test]
     fn ages_and_aging() {
         assert_eq!(
             [0, 59, 60, 3599, 3600, 86_399, 86_400].map(age),
@@ -1504,7 +1554,7 @@ mod tests {
         running.store(false, Ordering::Relaxed);
         shared.wake();
         handle.join().unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "then once per CWD_RETRY");
         // Missing crow-skills: nothing but an empty status line is published.
         assert!(published.try_iter().all(|view| view.status.is_empty()));
     }

@@ -220,8 +220,7 @@ pub fn run(
             initial_pane,
             |pane| match rpc(&Request::PaneCwd { pane }) {
                 Ok(Response::Cwd(cwd)) => Ok(cwd),
-                // e.g. the pane just closed: not a protocol failure.
-                Ok(Response::Error(_)) => Ok(None),
+                // rpc() already maps Response::Error (e.g. a closed pane) to Err.
                 _ => Err(()),
             },
             move |view| crow_proxy.send_event(UiEvent::Crow(Box::new(view))).is_ok(),
@@ -801,10 +800,8 @@ fn render_panel(
     let size = (12.0 * scale) as f32;
     let gap = (8.0 * scale) as i32;
     let mut y = pad;
-    for segments in lines {
-        if y + line > h as i32 - pad / 2 {
-            break;
-        }
+    let capacity = ((h as i32 - pad - pad / 2) / line.max(1)).max(0) as usize;
+    for segments in &crow::fit_lines(lines, capacity) {
         let mut x = pad;
         for segment in segments {
             let width = renderer.text(
