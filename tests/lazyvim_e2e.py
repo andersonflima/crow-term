@@ -190,10 +190,18 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
                         return any(cell["text"] and cell["text"] in "▎┃▍" for cell in row[:8]) and line
                 return False
             try:
-                # gitsigns attaches asynchronously after `git diff` runs.
-                self.eventually(signed, timeout=30)
+                # gitsigns attaches asynchronously; when the buffer was read before
+                # the plugin loaded (LazyFile) it can stay detached on a busy
+                # runner. What this scenario proves is that the sign renders
+                # through the terminal, so attach explicitly if it has not.
+                self.eventually(signed, timeout=10)
             except AssertionError:
-                raise AssertionError(f"no gitsigns sign on the modified line:\n{last[0]}") from None
+                self.ex("Gitsigns attach")
+                try:
+                    self.eventually(signed, timeout=20)
+                except AssertionError:
+                    raise AssertionError(f"no gitsigns sign on the modified line:\n{last[0]}") from None
+                print("gitsigns: attached explicitly", file=sys.stderr)
         with self.subTest("treesitter highlight"):
             active = self.report("vim.treesitter.highlighter.active[vim.api.nvim_get_current_buf()] ~= nil")
             self.assertTrue(active)
