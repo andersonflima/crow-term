@@ -79,7 +79,11 @@ class Run:
         )
         self.guis = []
         try:
-            eventually(lambda: self.cli("list-sessions").returncode == 0, 10, what="daemon start")
+            # `doctor` never starts a daemon; other commands would autostart one
+            # if they reached the socket before this daemon bound it.
+            eventually(lambda: "daemon: running" in self.cli("doctor").stdout, 15, what="daemon start")
+            if self.daemon.poll() is not None:
+                raise AssertionError(f"test daemon exited with {self.daemon.returncode}")
         except BaseException:
             self.close()
             raise
