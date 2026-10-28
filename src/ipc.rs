@@ -20,7 +20,8 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// v3: kitty keyboard flags and modifyOtherKeys level in `Modes`.
 /// v4: underline style and underline color in `Cell`.
 /// v5: cell pixel metrics on resize, bell count, hyperlinks, alternate scroll.
-pub const WIRE_VERSION: u32 = 5;
+/// v6: daemon instance in `View`, `Request::Guarded`.
+pub const WIRE_VERSION: u32 = 6;
 const DEADLINE: Duration = Duration::from_secs(5);
 /// Unix sockets block in the kernel for at most this long per call, so the
 /// frame deadline is still checked while no byte flows.
@@ -323,10 +324,36 @@ fn check_windows_peer(pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn transfer<T>(deadline: Instant, operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
+/// When a frame transfer gives up. A patient deadline (GUI commands) is
+/// extended for as long as a daemon process is alive: a frozen or loaded
+/// daemon is waited for, never reported as a timeout; only its death ends it.
+pub struct Deadline {
+    at: std::cell::Cell<Instant>,
+    patient: bool,
+}
+impl Deadline {
+    pub fn new(patient: bool) -> Self {
+        Self {
+            at: std::cell::Cell::new(Instant::now() + DEADLINE),
+            patient,
+        }
+    }
+    fn expired(&self) -> bool {
+        if Instant::now() < self.at.get() {
+            return false;
+        }
+        if self.patient && daemon_alive() {
+            self.at.set(Instant::now() + DEADLINE);
+            return false;
+        }
+        true
+    }
+}
+
+fn transfer<T>(deadline: &Deadline, operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
     let mut operation = operation;
     loop {
-        if Instant::now() >= deadline {
+        if deadline.expired() {
             return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
         }
         match operation() {
@@ -348,7 +375,7 @@ fn transfer<T>(deadline: Instant, operation: impl FnMut() -> std::io::Result<T>)
     }
 }
 
-fn read_exact(reader: &mut impl Read, buffer: &mut [u8], deadline: Instant) -> Result<()> {
+fn read_exact(reader: &mut impl Read, buffer: &mut [u8], deadline: &Deadline) -> Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
         let count = transfer(deadline, || {
@@ -376,7 +403,13 @@ fn read_exact(reader: &mut impl Read, buffer: &mut [u8], deadline: Instant) -> R
 }
 
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
-    let deadline = Instant::now() + DEADLINE;
+    read_frame_by(reader, &Deadline::new(false))
+}
+
+pub fn read_frame_by<T: DeserializeOwned>(
+    reader: &mut impl Read,
+    deadline: &Deadline,
+) -> Result<T> {
     let mut length = [0; 4];
     read_exact(reader, &mut length, deadline)?;
     let length = u32::from_le_bytes(length) as usize;
@@ -389,12 +422,19 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
 }
 
 pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()> {
+    write_frame_by(writer, value, &Deadline::new(false))
+}
+
+pub fn write_frame_by(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    deadline: &Deadline,
+) -> Result<()> {
     let data = postcard::to_allocvec(value)?;
     if data.len() > MAX_FRAME {
         bail!("IPC frame exceeds limit");
     }
     let framed = [(data.len() as u32).to_le_bytes().as_slice(), &data].concat();
-    let deadline = Instant::now() + DEADLINE;
     let mut offset = 0;
     while offset < framed.len() {
         // Bounded Windows writes amortize system calls within our 64-KiB hints;
@@ -476,16 +516,32 @@ pub fn daemon_alive() -> bool {
 }
 
 pub fn rpc(request: &Request) -> Result<Response> {
-    let stream = Stream::connect(socket_name()?).map_err(|error| {
-        if matches!(
-            error.kind(),
-            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-        ) {
-            anyhow::Error::new(crate::link::Unreachable(error))
-        } else {
-            anyhow::Error::new(crate::link::NotSent(error.into()))
-        }
-    })?;
+    rpc_by(request, false)
+}
+
+/// A command that waits for a live daemon however long it takes (input,
+/// paste, splits): never a timeout while the daemon process exists.
+pub fn rpc_patient(request: &Request) -> Result<Response> {
+    rpc_by(request, true)
+}
+
+fn rpc_by(request: &Request, patient: bool) -> Result<Response> {
+    use interprocess::{ConnectWaitMode, local_socket::ConnectOptions};
+    // Bounded connect: a full accept backlog makes Linux block in connect().
+    let stream = ConnectOptions::new()
+        .name(socket_name()?)
+        .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(1)))
+        .connect_sync()
+        .map_err(|error| {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) {
+                anyhow::Error::new(crate::link::Unreachable(error))
+            } else {
+                anyhow::Error::new(crate::link::NotSent(error.into()))
+            }
+        })?;
     let not_sent = |error: anyhow::Error| anyhow::Error::new(crate::link::NotSent(error));
     check_peer(&stream)
         .context("authenticate IPC server")
@@ -494,10 +550,11 @@ pub fn rpc(request: &Request) -> Result<Response> {
         .context("configure client IPC stream")
         .map_err(not_sent)?;
     let mut stream = FramedStream::new(stream);
-    write_frame(&mut stream, request)
+    let deadline = Deadline::new(patient);
+    write_frame_by(&mut stream, request, &deadline)
         .context("write IPC request")
         .map_err(not_sent)?;
-    let response = read_frame(&mut stream).context("read IPC response")?;
+    let response = read_frame_by(&mut stream, &deadline).context("read IPC response")?;
     if let Response::Error(message) = response {
         return Err(anyhow::Error::new(crate::link::Refused(message)));
     }
@@ -649,9 +706,13 @@ mod tests {
     #[test]
     fn expired_deadline_stops_even_interrupted_operations() {
         assert!(
-            transfer::<()>(Instant::now(), || Err(
-                std::io::ErrorKind::Interrupted.into()
-            ))
+            transfer::<()>(
+                &Deadline {
+                    at: std::cell::Cell::new(Instant::now()),
+                    patient: false
+                },
+                || Err(std::io::ErrorKind::Interrupted.into())
+            )
             .is_err()
         );
     }

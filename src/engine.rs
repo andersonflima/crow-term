@@ -1044,16 +1044,18 @@ impl Engine {
             return Err(anyhow!("PTY write failed: {error}"));
         }
         let mut message = WriteMessage::Bytes(bytes.to_vec());
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Back-pressure from a program that is not reading its input (a paste
+        // into `sleep`) is waited out for as long as the program lives: no
+        // timeout that would race the client and drop the rest of a paste.
+        let mut pause = Duration::from_millis(1);
         loop {
             match self.writer.try_send(message) {
                 Ok(()) => return Ok(()),
-                Err(mpsc::TrySendError::Full(pending)) if std::time::Instant::now() < deadline => {
+                Err(mpsc::TrySendError::Full(pending)) => {
+                    ensure!(self.alive(), "terminal process has exited");
                     message = pending;
-                    thread::sleep(Duration::from_millis(1));
-                }
-                Err(mpsc::TrySendError::Full(_)) => {
-                    return Err(anyhow!("PTY input queue remained full for 5 seconds"));
+                    thread::sleep(pause);
+                    pause = (pause * 2).min(Duration::from_millis(20));
                 }
                 Err(mpsc::TrySendError::Disconnected(_)) => {
                     return Err(anyhow!("PTY writer stopped"));

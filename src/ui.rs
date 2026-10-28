@@ -104,6 +104,8 @@ impl ViewMailbox {
 struct Command {
     request: Request,
     activate_created: bool,
+    /// Daemon instance the request was made for (0 before the first view).
+    instance: u64,
     /// Daemon generation the request was made for (bumped on reattach).
     epoch: u64,
 }
@@ -148,37 +150,55 @@ fn request_kind(request: &Request) -> String {
     }
 }
 
-/// One request, retried while the link is only slow: a command never fails
-/// because the daemon was busy for a moment. Requests with effects (input,
-/// split, new window, close…) are retried only when they certainly did not
-/// reach the daemon, so nothing is doubled; idempotent ones on any slowness.
+/// One command, waited for while the daemon lives (no fixed deadline: a
+/// frozen, loaded or back-pressured daemon is never reported as a timeout).
+/// It is resent only when it certainly did not reach the daemon (connecting
+/// or writing failed), never across a daemon replacement, so nothing runs
+/// twice or in another daemon's panes.
 fn rpc_patiently(
     request: &Request,
     running: &AtomicBool,
     current: impl Fn() -> bool,
 ) -> Result<Response> {
-    let idempotent = matches!(
-        request,
-        Request::Resize { .. } | Request::List | Request::PaneCwd { .. }
-    );
-    let deadline = Instant::now() + Duration::from_secs(30);
     let mut attempt = 0u32;
     loop {
-        match rpc(request) {
-            // Never across a daemon replacement: pane ids are reused there.
+        match crate::ipc::rpc_patient(request) {
             Err(error)
-                if !crate::link::refused(&error)
-                    && crate::link::classify(&error) == crate::link::Failure::Transient
-                    && (idempotent || crate::link::not_sent(&error))
-                    && Instant::now() < deadline
+                if crate::link::not_sent(&error)
                     && running.load(Ordering::Relaxed)
-                    && current() =>
+                    && current()
+                    && crate::ipc::daemon_alive() =>
             {
                 attempt += 1;
                 thread::sleep(Duration::from_millis((50 * u64::from(attempt)).min(500)));
             }
             other => return other,
         }
+    }
+}
+
+/// Requests addressing panes/windows by id are sent guarded by the daemon
+/// instance they were made for (see `View::instance`).
+fn guard(request: Request, instance: u64) -> Request {
+    let addressed = matches!(
+        request,
+        Request::Input { .. }
+            | Request::Resize { .. }
+            | Request::Scroll { .. }
+            | Request::Split { .. }
+            | Request::NewWindow { .. }
+            | Request::ClosePane { .. }
+            | Request::RenameWindow { .. }
+            | Request::PaneCwd { .. }
+            | Request::Clipboard { .. }
+    );
+    if addressed && instance != 0 {
+        Request::Guarded {
+            instance,
+            request: Box::new(request),
+        }
+    } else {
+        request
     }
 }
 
@@ -219,7 +239,9 @@ pub fn run(
     let proxy = event_loop.create_proxy();
     let running = Arc::new(AtomicBool::new(true));
     let active_window = Arc::new(AtomicU64::new(initial_window));
-    let (tx, rx) = mpsc::channel::<Command>();
+    // Bounded: a daemon that stops reading cannot make the GUI's memory grow;
+    // a full queue is reported (see App::send).
+    let (tx, rx) = mpsc::sync_channel::<Command>(4096);
     let command_proxy = proxy.clone();
     let crow_proxy = proxy.clone();
     let command_running = running.clone();
@@ -240,7 +262,8 @@ pub fn run(
                     continue;
                 }
                 let event = match execute_request(&command.request, |request| {
-                    rpc_patiently(request, &command_running, || {
+                    let request = guard(request.clone(), command.instance);
+                    rpc_patiently(&request, &command_running, || {
                         command.epoch == command_epoch.load(Ordering::Acquire)
                     })
                 }) {
@@ -1210,7 +1233,7 @@ struct App {
     pane_id: u64,
     shared_window: Arc<AtomicU64>,
     running: Arc<AtomicBool>,
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::SyncSender<Command>,
     mailbox: Arc<ViewMailbox>,
     fatal_error: Option<String>,
     window: Option<Arc<Window>>,
@@ -1243,6 +1266,10 @@ struct App {
     window_title: String,
     /// Clear `status` at this instant (transient link notes).
     status_expires: Option<Instant>,
+    /// Daemon instance of the latest view; commands are guarded with it.
+    instance: u64,
+    /// Commands dropped because the command queue was full.
+    dropped: std::cell::Cell<u64>,
     /// Daemon generation: commands made before a reattach are void.
     epoch: Arc<AtomicU64>,
     clipboard: Option<arboard::Clipboard>,
@@ -1263,7 +1290,7 @@ impl App {
         window_id: u64,
         pane_id: u64,
         shell: ShellSpec,
-        commands: mpsc::Sender<Command>,
+        commands: mpsc::SyncSender<Command>,
         shared_window: Arc<AtomicU64>,
         running: Arc<AtomicBool>,
         mailbox: Arc<ViewMailbox>,
@@ -1306,6 +1333,8 @@ impl App {
             bell_flash: None,
             window_title: String::new(),
             status_expires: None,
+            instance: 0,
+            dropped: std::cell::Cell::new(0),
             epoch: Arc::default(),
             clipboard: None,
             crow,
@@ -1367,11 +1396,17 @@ impl App {
         self.redraw();
     }
     fn send(&self, request: Request, activate_created: bool) {
-        let _ = self.commands.send(Command {
+        let command = Command {
             request,
             activate_created,
+            instance: self.instance,
             epoch: self.epoch.load(Ordering::Acquire),
-        });
+        };
+        if let Err(mpsc::TrySendError::Full(_)) = self.commands.try_send(command) {
+            // The daemon has not taken a command for 4096 key presses: say so
+            // rather than grow without bound or block the window.
+            self.dropped.set(self.dropped.get() + 1);
+        }
     }
     fn input(&mut self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
@@ -2091,6 +2126,12 @@ impl App {
             .collect()
     }
     fn draw(&mut self) -> Result<()> {
+        if self.dropped.get() > 0 && self.status.is_empty() {
+            self.status = format!(
+                "{} key/command event(s) dropped: the daemon has not taken input for a while",
+                self.dropped.replace(0)
+            );
+        }
         let Some(window) = &self.window else {
             return Ok(());
         };
@@ -2626,6 +2667,9 @@ impl ApplicationHandler<UiEvent> for App {
                 if window != self.window_id {
                     return;
                 }
+                if view.instance != self.instance {
+                    self.instance = view.instance;
+                }
                 let revision_changed = self
                     .view
                     .as_ref()
@@ -2699,6 +2743,7 @@ impl ApplicationHandler<UiEvent> for App {
                     self.window_id, self.pane_id
                 );
                 self.epoch.fetch_add(1, Ordering::AcqRel);
+                self.instance = 0;
                 // Switch ids directly: the old ones belong to the replaced
                 // daemon and must not be resized or focused in the new one.
                 self.view = None;
@@ -3927,6 +3972,7 @@ mod tests {
         assert!(mailbox.push(
             1,
             View {
+                instance: 1,
                 revision: 2,
                 sessions: vec![],
                 screens: vec![(1, screen)]
@@ -3935,6 +3981,7 @@ mod tests {
         assert!(!mailbox.push(
             1,
             View {
+                instance: 1,
                 revision: 2,
                 sessions: vec![],
                 screens: vec![]
@@ -3945,6 +3992,7 @@ mod tests {
         assert!(mailbox.push(
             2,
             View {
+                instance: 1,
                 revision: 3,
                 sessions: vec![],
                 screens: vec![]

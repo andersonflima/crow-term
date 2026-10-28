@@ -589,6 +589,39 @@ def j11_stall(ctx):
     return f"5 x 6 s stalls absorbed; status sequence {shown}; new content drawn after them", [ctx.save_frame("j11-after-stall", frame)]
 
 
+@journey("J14", "keys typed while the daemon is frozen for 7 s arrive once, with no timeout shown")
+def j14_frozen_daemon(ctx):
+    ctx.need("keys")
+    if os.name == "nt":
+        raise Skip("the daemon cannot be frozen with SIGSTOP on Windows")
+    import signal
+    gui, session, pane = link_gui(ctx)
+    if ctx.nvim_gui is not gui:
+        raise Skip("needs the Neovim GUI from the earlier journeys")
+    normal_mode(ctx, gui)
+    statuses = []
+    os.kill(ctx.run.daemon.pid, signal.SIGSTOP)
+    try:
+        ctx.driver.type(gui, "ofrozen daemon typed")
+        ctx.driver.key(gui, "Escape")
+        until = time.monotonic() + 7
+        while time.monotonic() < until:
+            current = gui.frame()
+            if current and (not statuses or statuses[-1] != current[1]["status"]):
+                statuses.append(current[1]["status"])
+            time.sleep(0.1)
+    finally:
+        os.kill(ctx.run.daemon.pid, signal.SIGCONT)
+    eventually(lambda: "frozen daemon typed" in ctx.run.capture(pane), 20, what="text typed during the freeze")
+    count = ctx.run.capture(pane).count("frozen daemon typed")
+    frame = gui.wait_frame(lambda m, i: "frozen daemon typed" not in m["status"], what="frame after the freeze")
+    statuses.append(frame[1]["status"])
+    bad = [s for s in statuses if any(word in s.lower() for word in ("timed out", "mux command", "disconnect", "stopped"))]
+    if bad or count != 1:
+        raise AssertionError(f"statuses {statuses}; text appears {count} time(s)")
+    return f"7 s freeze: text arrived once; statuses {[s for s in statuses if s] or ['(none)']}", [ctx.save_frame("j14-after-freeze", frame)]
+
+
 @journey("J12", "a daemon that dies is restarted and the GUI reattaches by itself")
 def j12_restart(ctx):
     gui, _, pane = link_gui(ctx)
@@ -617,7 +650,7 @@ def j13_stop(ctx):
 
 
 JOURNEYS = [j1_launch, j2_text, j3_split, j4_resize, j5_nvim_edit, j6_paste, j7_mouse, j8_focus, j10_chords, j9_reattach,
-            j11_stall, j12_restart, j13_stop]
+            j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
 
 
 def summary_markdown(ctx):

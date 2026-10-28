@@ -127,6 +127,8 @@ impl Registry {
 }
 
 pub struct Server {
+    /// Random per process; see `View::instance`.
+    instance: u64,
     registry: Mutex<Registry>,
     signals: Arc<Signals>,
     stopped: AtomicBool,
@@ -134,7 +136,17 @@ pub struct Server {
 }
 impl Server {
     pub fn new(config: &Config) -> Self {
+        use std::hash::{BuildHasher, Hasher};
+        // RandomState is seeded randomly per process; mix in time and pid.
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_nanos()),
+        );
+        hasher.write_u32(std::process::id());
         Self {
+            instance: hasher.finish().max(1),
             registry: Mutex::new(Registry::default()),
             signals: Arc::default(),
             stopped: AtomicBool::new(false),
@@ -213,6 +225,7 @@ impl Server {
                 .collect::<Result<_>>()?
         };
         Ok(View {
+            instance: self.instance,
             revision,
             sessions,
             screens,
@@ -220,6 +233,17 @@ impl Server {
     }
     pub fn handle(&self, request: Request) -> Result<Response> {
         match request {
+            Request::Guarded { instance, request } => {
+                ensure!(
+                    instance == self.instance,
+                    "Daemon instance changed: command for a previous daemon ignored"
+                );
+                ensure!(
+                    !matches!(*request, Request::Guarded { .. } | Request::Watch { .. }),
+                    "Invalid guarded request"
+                );
+                return self.handle(*request);
+            }
             Request::List => return Ok(Response::View(self.view(None, 0, None)?)),
             Request::Watch {
                 session,
@@ -564,6 +588,48 @@ pub fn run(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn guarded_commands_run_only_on_the_daemon_instance_they_were_made_for() {
+        // Two daemons in a row reuse pane ids from 1: a command made for the
+        // first must never reach a pane of the second (another GUI's session).
+        let first = Server::new(&Config::default());
+        let second = Server::new(&Config::default());
+        assert_ne!(first.instance, second.instance);
+        let View { instance, .. } = first.view(None, 0, None).unwrap();
+        assert_eq!(instance, first.instance);
+        let stale = Request::Guarded {
+            instance: first.instance,
+            request: Box::new(Request::Input {
+                pane: 1,
+                bytes: b"rm -rf ~".to_vec(),
+            }),
+        };
+        let error = second.handle(stale).unwrap_err().to_string();
+        assert!(error.contains("instance changed"), "{error}");
+        // The right instance reaches the request itself (here: no such pane).
+        let current = Request::Guarded {
+            instance: second.instance,
+            request: Box::new(Request::Input {
+                pane: 1,
+                bytes: b"x".to_vec(),
+            }),
+        };
+        assert!(
+            second
+                .handle(current)
+                .unwrap_err()
+                .to_string()
+                .contains("Pane not found")
+        );
+        let nested = Request::Guarded {
+            instance: second.instance,
+            request: Box::new(Request::Guarded {
+                instance: 0,
+                request: Box::new(Request::List),
+            }),
+        };
+        assert!(second.handle(nested).is_err());
+    }
     #[test]
     fn validates_sizes_and_names() {
         assert!(validate_size(Size { rows: 0, cols: 80 }).is_err());

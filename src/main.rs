@@ -353,7 +353,8 @@ fn main() -> Result<()> {
             if *enter {
                 bytes.push(b'\r');
             }
-            print_response(ipc::rpc(&Request::Input { pane: *pane, bytes })?)
+            // Like the GUI: waited for while the daemon lives, never a timeout.
+            print_response(ipc::rpc_patient(&Request::Input { pane: *pane, bytes })?)
         }
         Some(Action::CapturePane { pane, json }) => {
             let Response::View(view) = ipc::rpc(&Request::List)? else {

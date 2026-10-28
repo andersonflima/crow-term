@@ -227,6 +227,22 @@ class DaemonTests(DaemonHarness):
 
 
 class UnresponsiveDaemonTests(DaemonHarness):
+    @unittest.skipIf(os.name == "nt", "POSIX stty/head/wc")
+    def test_a_large_paste_into_a_program_that_is_not_reading_is_delivered_whole(self):
+        """Repro: ~800 KB pasted while the program sleeps. The daemon used to
+        give up after 5 s of PTY back-pressure and drop the rest; now every
+        byte arrives, in order, once the program reads."""
+        pane = self.rpc("new-session", "paste")["Created"]["pane"]
+        total = 40 * 20000
+        self.send(pane, f"stty raw -echo; sleep 8; head -c {total} | wc -c; stty sane")
+        time.sleep(0.5)
+        for index in range(40):
+            result = subprocess.run([str(BIN), "send-keys", str(pane), "x" * 20000], env=self.env,
+                                    capture_output=True, text=True, timeout=90)
+            self.assertEqual(result.returncode, 0, f"chunk {index}: {result.stderr}")
+        self.eventually(lambda: any(l.strip() == str(total) for l in self.capture(pane).splitlines()), timeout=60)
+
+
     @unittest.skipIf(os.name == "nt", "SIGSTOP")
     def test_a_frozen_daemon_is_never_replaced(self):
         """A live daemon that neither answers nor accepts (SIGSTOP + full accept
