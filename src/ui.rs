@@ -1008,6 +1008,8 @@ struct App {
     crow_panel: bool,
     crow_pane: u64,
     panel_layer: Option<PanelLayer>,
+    #[cfg(feature = "frame-dump")]
+    frame_dump: Option<crate::frame_dump::FrameDump>,
 }
 impl App {
     // Construction joins independent model/worker handles exactly once, not a hot-path API.
@@ -1066,6 +1068,8 @@ impl App {
             crow_panel,
             crow_pane: pane_id,
             panel_layer: None,
+            #[cfg(feature = "frame-dump")]
+            frame_dump: crate::frame_dump::FrameDump::from_env(),
         }
     }
     /// Crow panel area, or `None` when hidden or the window is too small for it.
@@ -1851,6 +1855,22 @@ impl App {
             return Ok(());
         };
         let rects = self.rects();
+        #[cfg(feature = "frame-dump")]
+        let dump_panes: Vec<crate::frame_dump::PaneMeta> = rects
+            .iter()
+            .map(|&(id, rect)| {
+                let grid = self.rect_size(rect);
+                crate::frame_dump::PaneMeta {
+                    id,
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.w,
+                    h: rect.h,
+                    rows: grid.rows,
+                    cols: grid.cols,
+                }
+            })
+            .collect();
         let flash_rects = rects.clone();
         let panel_rect = self.panel_rect();
         let tabs = self.tab_rects();
@@ -2260,6 +2280,45 @@ impl App {
         // Row raster cache is bounded by visible panes; bound glyph growth during long sessions.
         if self.renderer.swash.image_cache.len() > 16384 {
             self.renderer.swash.image_cache.clear();
+        }
+        #[cfg(feature = "frame-dump")]
+        if let Some(dump) = &mut self.frame_dump {
+            let cursor = self
+                .view
+                .as_ref()
+                .and_then(|view| view.screens.iter().find(|(id, _)| *id == self.pane_id))
+                .map(|(_, screen)| crate::frame_dump::CursorMeta {
+                    row: screen.cursor.row,
+                    col: screen.cursor.col,
+                    visible: screen.cursor.visible,
+                    shape: screen.cursor.shape.clone(),
+                });
+            let meta = crate::frame_dump::FrameMeta {
+                schema: "crow-frame/1",
+                seq: dump.next_seq(),
+                renderer: "software",
+                width: size.width,
+                height: size.height,
+                scale: self.scale,
+                cell_width: self.renderer.cell_width,
+                cell_height: self.renderer.cell_height,
+                revision: self.view.as_ref().map_or(0, |view| view.revision),
+                session: self.session.clone(),
+                window: self.window_id,
+                pane: self.pane_id,
+                panes: dump_panes,
+                cursor,
+                focused: self.focused,
+                prefix: self.prefix,
+                status: self.status.clone(),
+                ime: self.ime.clone(),
+            };
+            if let Err(error) = dump.write(&frame, size.width, size.height, &meta) {
+                eprintln!(
+                    "crow-term: frame dump to {} failed: {error}",
+                    dump.dir().display()
+                );
+            }
         }
         frame
             .present()

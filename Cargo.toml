@@ -25,6 +25,11 @@ clap = { version = "4", features = ["derive"] }
 which = "8"
 unicode-width = "0.2"
 
+[features]
+# Test-only: write each presented GUI frame to $CROW_TERM_FRAME_DUMP/frame.ppm
+# (tests/gui). Never enabled in release builds.
+frame-dump = []
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
