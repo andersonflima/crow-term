@@ -17,6 +17,9 @@ Crow Term is an original application, not a fork of another terminal.
 - Crowquill Ink theme: `assets/theme-license.txt`.
 - Vendored shell plugins: `shell/plugins.lock.json`; notices shipped alongside
   each source package under `shell/vendor/`.
+- Test fixture only (not shipped): `tests/lazyvim/` contains files from
+  LazyVim/starter (Apache-2.0, `tests/lazyvim/LICENSE.starter`); provenance in
+  `tests/lazyvim/README.md`.
 
 Bundled assets retain their original names. Crow Term does not claim authorship
 of those upstream libraries, fonts, themes or plugins.

@@ -19,7 +19,7 @@ import unittest
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import daemon_e2e  # noqa: E402
-from nvim_e2e import encode  # noqa: E402
+from nvim_e2e import BEFORE, encode, leaked_replies  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "lazyvim"
@@ -40,6 +40,11 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
     def setUp(self):
         self.nvim = daemon_e2e.neovim_binary(self)
         self.home = lazyvim_home(self)
+        # Every locked plugin must be present at its commit (local git only).
+        lazy = self.home / "data" / "nvim" / "lazy"
+        for name, entry in json.loads((FIXTURE / "nvim" / "lazy-lock.json").read_text()).items():
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=lazy / name, capture_output=True, text=True)
+            self.assertEqual(head.stdout.strip(), entry["commit"], f"{name} is not at its locked commit")
         super().setUp()
         self.project = self.runtime / "project"
         self.project.mkdir()
@@ -68,12 +73,19 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
             "HTTP_PROXY": DEAD_PROXY,
             "HTTPS_PROXY": DEAD_PROXY,
             "ALL_PROXY": DEAD_PROXY,
+            "no_proxy": "",
+            "NO_PROXY": "",
+            # Ignore user/system git config (e.g. url.insteadOf rewriting to
+            # SSH) and allow only local repositories.
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ALLOW_PROTOCOL": "file",
         }
         pane = self.rpc("new-session", "lazyvim")["Created"]["pane"]
         self.command("resize-pane", pane, "--rows", 40, "--cols", 140)
         command = " ".join(f"{key}={shlex.quote(str(value))}" for key, value in env.items())
         command += " " + " ".join(map(shlex.quote, [self.nvim, *files]))
-        self.send(pane, f"cd {shlex.quote(str(self.project))} && {command}")
+        self.send(pane, f"cd {shlex.quote(str(self.project))} && echo {BEFORE} && {command}")
         self.pane = pane
         self.flags = self.eventually(lambda: self.modes()["keyboard"], timeout=30)
         return pane
@@ -191,9 +203,8 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
             self.eventually(lambda: self.modes()["keyboard"] == 0, timeout=15)
             self.send(self.pane, "echo CROW_AFTER_LAZYVIM")
             self.eventually(lambda: self.output_line(self.pane, "CROW_AFTER_LAZYVIM"), timeout=10)
-            text = self.capture(self.pane).replace("echo CROW_AFTER_LAZYVIM", "")
-            for leaked in ("rgb:", "+r", "$r", "[?", ">|", "0u", "1u", "3u"):
-                self.assertNotIn(leaked, text)
+            self.assertEqual(leaked_replies(self, self.pane, "CROW_AFTER_LAZYVIM"), [],
+                             self.capture(self.pane))
 
     def test_checkhealth_errors_are_allowlisted(self):
         self.start("alpha.lua")
@@ -204,6 +215,10 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
         self.eventually(lambda: "ERROR" in self.capture(self.pane) or "OK" in self.capture(self.pane), timeout=60)
         self.ex(f"silent write! {out}")
         self.eventually(lambda: out.exists() and out.stat().st_size > 0, timeout=30)
+        report = out.read_text()
+        # A real report, not an empty or partial buffer.
+        for section in ("lazy", "snacks", "noice", "which-key", "vim.health"):
+            self.assertIn(section, report.lower(), report[:2000])
         errors = sorted({line.strip() for line in out.read_text().splitlines() if "ERROR" in line})
         allow = [re.compile(line) for line in (FIXTURE / "checkhealth-allowlist.txt").read_text().splitlines()
                  if line.strip() and not line.startswith("#")]

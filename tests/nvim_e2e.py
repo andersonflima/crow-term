@@ -7,6 +7,7 @@ real editor must decode it as the intended key.
 """
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -33,6 +34,24 @@ CHORDS = {
     "C_BS": ("Backspace", ["ctrl"], "<C-BS>"),
     "A_J": ("j", ["alt"], "<M-j>"),
 }
+
+
+BEFORE = "CROW_BEFORE_NVIM"
+# Query answers that would show up as text if they reached the shell.
+LEAK_PATTERNS = [re.compile(pattern) for pattern in (
+    r"\[\?[\d;]*[cuy]", r"\[>[\d;]*[cmq]", r"\[[\d;:]+u", r"rgb:[0-9a-f]",
+    r"P[01][+$]r", r">\|", r"\[\d+;\d+R", r"\[[468];\d+;\d+t", r"\]1[01];",
+)]
+
+
+def leaked_replies(test, pane, after):
+    """Answer-like text between the editor start marker and the shell's
+    `after` marker (the region a leaked reply would be typed or printed in)."""
+    lines = test.capture(pane).splitlines()
+    start = max(index for index, line in enumerate(lines) if line.strip() == BEFORE)
+    end = max(index for index, line in enumerate(lines) if line.strip() == after)
+    region = "\n".join(lines[start + 1:end]).replace("echo " + after, "")
+    return [pattern.pattern for pattern in LEAK_PATTERNS if pattern.search(region)]
 
 
 def encode(key, mods, flags, release=False):
@@ -66,7 +85,7 @@ class NeovimKeyboardTests(daemon_e2e.DaemonHarness):
         script.write_text(init)
         keymap = {name: lhs for name, (_, _, lhs) in CHORDS.items()}
         pane = self.rpc("new-session", "nvim")["Created"]["pane"]
-        command = "CROW_KEYMAP=" + shlex.quote(json.dumps(keymap)) + " " + " ".join(
+        command = f"echo {BEFORE}; CROW_KEYMAP=" + shlex.quote(json.dumps(keymap)) + " " + " ".join(
             map(shlex.quote, [self.nvim, "--clean", "-n", "-i", "NONE", "-u", str(script)]))
         self.send(pane, command)
         return pane
@@ -119,8 +138,9 @@ end, {{}})
             return report.exists() and json.loads(report.read_text())
         state = self.eventually(lambda: (r := reported()) and r["background"] == "light" and r, timeout=10)
         self.assertTrue(state["termguicolors"], state)
-        # SpellBad: undercurl with a special (underline) color, rendered by
-        # Neovim through Smulx/Setulc learned from XTGETTCAP.
+        # SpellBad: undercurl with a special (underline) color. Neovim detects
+        # undercurl from the DECRQSS SGR answer (`4:3`); protocol_probe.py
+        # covers the XTGETTCAP Smulx/Setulc answers separately.
         def curly():
             cells = [c for c in self.rpc("capture-pane", pane, "--json")["cells"][0]]
             marked = cells[:8]
@@ -133,14 +153,15 @@ end, {{}})
         self.eventually(lambda: cursor() == "block", timeout=5)
         self.command("send-keys", pane, "i")
         self.eventually(lambda: cursor() == "beam", timeout=5)
-        self.command("send-keys", pane, "\x1b:qa!\r")
+        flags = self.modes(pane)["keyboard"]
+        self.command("send-keys", pane, encode("Escape", [], flags))
+        self.eventually(lambda: cursor() == "block", timeout=5)
+        self.command("send-keys", pane, ":qa!\r")
         self.eventually(lambda: self.modes(pane)["keyboard"] == 0, timeout=10)
         self.send(pane, "echo CROW_AFTER_NVIM")
         self.eventually(lambda: self.output_line(pane, "CROW_AFTER_NVIM"), timeout=10)
         # No query answer may surface as text in the shell afterwards.
-        text = self.capture(pane)
-        for leaked in ("rgb:", "+r", "$r", "[?", ">|", "0u", "1u", "3u"):
-            self.assertNotIn(leaked, text.replace("echo CROW_AFTER_NVIM", ""), text)
+        self.assertEqual(leaked_replies(self, pane, "CROW_AFTER_NVIM"), [], self.capture(pane))
 
 
 def json_quote(text):
