@@ -31,7 +31,13 @@ SECONDS = float(os.environ.get("CROW_STRESS_SECONDS", "12"))
 # daemon's own log is checked for slow snapshots.
 SNAPSHOT_P95 = float(os.environ.get("CROW_STRESS_SNAPSHOT_P95", "0.5"))
 SNAPSHOT_MAX = 2.0
-DAEMON_SLOW_MS = 250
+# Daemon-side bounds sized for the smallest CI runner (3 vCPUs shared by the
+# daemon's 8 parser threads and 8 producers): measured there p50 ~42 ms, max
+# ~294 ms; on 12 saturated cores max ~124 ms. The old behaviour this guards
+# against was >= 500 ms per Watch in the daemon and seconds on the client,
+# against a 5 s deadline that the GUI no longer treats as a disconnect.
+DAEMON_P50_MS = 100
+DAEMON_SLOW_MS = 500
 ECHO_P99 = 0.2
 # The producers run at the lowest CPU priority: they model background output,
 # and on a 3-core runner eight unthrottled producers would otherwise starve
@@ -136,6 +142,7 @@ class LinkUnderLoad(daemon_e2e.DaemonHarness):
         daemon_report = (f"daemon-side snapshots of 8 panes: {len(daemon)}, p50 {percentile(daemon, 0.5)} ms, "
                          f"p99 {percentile(daemon, 0.99)} ms, max {max(daemon)} ms")
         print(daemon_report, file=sys.stderr)
+        self.assertLess(percentile(daemon, 0.5), DAEMON_P50_MS, f"{daemon_report}; {report}")
         self.assertLess(max(daemon), DAEMON_SLOW_MS, f"{daemon_report}; {report}")
         self.assertLess(p99(echoes), ECHO_P99, report)
 
