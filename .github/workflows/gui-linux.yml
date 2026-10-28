@@ -1,0 +1,88 @@
+name: GUI journeys (Linux)
+# Real GUI + daemon + PTYs on X11 (Xvfb/openbox) and Wayland (headless sway).
+# Evidence (frame dumps, screenshots, diffs, results.json) is uploaded as an
+# artifact. Golden candidates are produced with the update_goldens input and are
+# never committed automatically.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      update_goldens:
+        description: Upload candidate goldens for review
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: gui-linux-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  journeys:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [x11, wayland]
+    name: linux ${{ matrix.backend }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CROW_TERM_REQUIRE_NVIM: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Native, display and font packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-x11-0 \
+            fonts-noto-color-emoji fonts-noto-cjk \
+            xvfb openbox xdotool wmctrl xclip x11-utils imagemagick \
+            sway wayvnc grim wl-clipboard
+          dpkg-query -W fonts-noto-color-emoji fonts-noto-cjk sway wayvnc xvfb | tee "$RUNNER_TEMP/packages.txt"
+      - name: Pinned Symbols Nerd Font
+        run: python tests/gui/fetch_fonts.py && fc-cache -f
+      - name: Pinned Neovim
+        run: |
+          nvim="$(python scripts/fetch_neovim.py 0.11.7 --dest "$RUNNER_TEMP/neovim")"
+          echo "CROW_TERM_NVIM=$nvim" >> "$GITHUB_ENV"
+      - run: cargo build --locked --features frame-dump
+      - name: Journeys on X11
+        if: matrix.backend == 'x11'
+        run: |
+          Xvfb :99 -screen 0 1600x1000x24 -nolisten tcp > "$RUNNER_TEMP/xvfb.log" 2>&1 &
+          export DISPLAY=:99
+          for _ in $(seq 50); do xdpyinfo > /dev/null 2>&1 && break; sleep 0.2; done
+          openbox > "$RUNNER_TEMP/openbox.log" 2>&1 &
+          sleep 1
+          python tests/gui/journeys.py --driver x11 --goldens linux-x11 --artifacts gui-artifacts --require-goldens \
+            ${{ inputs.update_goldens && '--update-goldens' || '' }} \
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9
+      - name: Journeys on Wayland
+        if: matrix.backend == 'wayland'
+        run: |
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          unset DISPLAY
+          WLR_BACKENDS=headless WLR_RENDERER=pixman WLR_LIBINPUT_NO_DEVICES=1 \
+            sway -c tests/gui/sway.conf > "$RUNNER_TEMP/sway.log" 2>&1 &
+          for _ in $(seq 50); do ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock > /dev/null 2>&1 && break; sleep 0.2; done
+          export SWAYSOCK="$(ls "$XDG_RUNTIME_DIR"/sway-ipc.*.sock)"
+          export CROW_WAYVNC_LOG="$RUNNER_TEMP/wayvnc.log"
+          export WAYLAND_DISPLAY="$(cd "$XDG_RUNTIME_DIR" && ls wayland-* | grep -v lock | head -n1)"
+          swaymsg -t get_outputs | head -20
+          python tests/gui/journeys.py --driver wayland --goldens linux-wayland --artifacts gui-artifacts --require-goldens \
+            ${{ inputs.update_goldens && '--update-goldens' || '' }} \
+            --expect-pass J1,J2,J3,J4,J5,J6,J7,J8,J10,J9
+      - name: Display server logs
+        if: always()
+        run: cp "$RUNNER_TEMP"/*.log "$RUNNER_TEMP/packages.txt" gui-artifacts/ 2>/dev/null || true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: gui-linux-${{ matrix.backend }}
+          path: gui-artifacts
+          retention-days: 14
