@@ -80,6 +80,8 @@ pub const MAX_CLIPBOARD: usize = 1024 * 1024;
 /// Longest OSC 8 target kept in a snapshot, and most distinct targets per screen.
 const MAX_LINK_URI: usize = 2048;
 const MAX_LINKS: usize = 1024;
+/// Total OSC 8 target bytes per snapshot (bounds the IPC frame).
+const MAX_LINK_BYTES: usize = 64 * 1024;
 
 struct State {
     term: Term<Events>,
@@ -148,7 +150,15 @@ impl State {
         intercept.scan(bytes, &mut |out| match out {
             Out::Bytes(bytes) => parser.advance(term, bytes),
             Out::Query(query) => {
-                let _ = replies.send(Event::PtyWrite(answer(query, term, cell, osc52_copy)));
+                // Inside a synchronized-output block the parser still holds the
+                // bytes before this query: commit them first, so the answer sees
+                // their effects and follows the parser's own replies in order.
+                if parser.sync_timeout().sync_timeout().is_some() {
+                    parser.stop_sync(term);
+                }
+                if let Some(text) = answer(query, term, cell, osc52_copy) {
+                    let _ = replies.send(Event::PtyWrite(text));
+                }
             }
         });
     }
@@ -207,6 +217,10 @@ impl State {
                     None
                 }
                 Event::PtyWrite(text) => Some(text),
+                // No GUI has reported cell metrics yet: no pixel answer at all.
+                Event::TextAreaSizeRequest(_) if self.cell.width == 0 || self.cell.height == 0 => {
+                    None
+                }
                 Event::TextAreaSizeRequest(format) => Some(format(WindowSize {
                     num_lines: self.size.rows,
                     num_cols: self.size.cols,
@@ -240,6 +254,7 @@ impl State {
         let mut cells = Vec::with_capacity(self.size.rows as usize);
         let mut links: Vec<String> = Vec::new();
         let mut link_index: std::collections::HashMap<String, u16> = Default::default();
+        let mut link_bytes = 0usize;
         let mut row = Vec::with_capacity(self.size.cols as usize);
         for indexed in content.display_iter {
             let cell = indexed.cell;
@@ -281,10 +296,14 @@ impl State {
                     if let Some(&index) = link_index.get(uri) {
                         return Some(index);
                     }
-                    if uri.len() > MAX_LINK_URI || links.len() >= MAX_LINKS {
+                    if uri.len() > MAX_LINK_URI
+                        || links.len() >= MAX_LINKS
+                        || link_bytes + uri.len() > MAX_LINK_BYTES
+                    {
                         return None;
                     }
                     let index = links.len() as u16;
+                    link_bytes += uri.len();
                     links.push(uri.to_owned());
                     link_index.insert(uri.to_owned(), index);
                     Some(index)
@@ -469,11 +488,17 @@ fn current_sgr(term: &Term<Events>) -> String {
     out.join(";")
 }
 
-fn answer(query: Query, term: &Term<Events>, cell: CellPixels, osc52_copy: bool) -> String {
-    match query {
+/// OSC 52 copies are accepted unless the daemon config turns them off.
+fn osc52_copy_enabled(config: Option<&crate::config::Config>) -> bool {
+    config.is_some_and(|config| config.terminal.osc52 == crate::config::Osc52Mode::Copy)
+}
+
+fn answer(query: Query, term: &Term<Events>, cell: CellPixels, osc52_copy: bool) -> Option<String> {
+    Some(match query {
         Query::ModifyOtherKeys(level) => format!("\x1b[>4;{level}m"),
         Query::Version => format!("\x1bP>|crow-term({})\x1b\\", env!("CARGO_PKG_VERSION")),
         Query::SecondaryAttributes => format!("\x1b[>0;{};1c", version_number()),
+        Query::CellSize if cell.width == 0 || cell.height == 0 => return None,
         Query::CellSize => format!("\x1b[6;{};{}t", cell.height, cell.width),
         Query::Termcap(names) => names
             .iter()
@@ -508,7 +533,7 @@ fn answer(query: Query, term: &Term<Events>, cell: CellPixels, osc52_copy: bool)
             }
             _ => "\x1bP0$r\x1b\\".to_owned(),
         },
-    }
+    })
 }
 
 fn convert_color(
@@ -767,8 +792,7 @@ impl Engine {
             .context("spawn terminal shell")?;
         drop(pair.slave);
         let (writer, writes) = mpsc::sync_channel(32);
-        let osc52_copy =
-            theme.is_some_and(|config| config.terminal.osc52 == crate::config::Osc52Mode::Copy);
+        let osc52_copy = osc52_copy_enabled(theme);
         let state = Arc::new(Mutex::new(State::with_osc52(size, scrollback, osc52_copy)));
         let write_error = Arc::new(Mutex::new(None));
         let process = Arc::new(Process {
@@ -1326,6 +1350,49 @@ mod tests {
             (off.clipboard.clone(), off.snapshot(true).clipboard_seq),
             (None, 0)
         );
+    }
+    #[test]
+    fn review_regressions_sync_order_da2_params_metrics_and_osc52_wiring() {
+        // Answers inside synchronized output see the earlier bytes and keep
+        // the parser's own reply order.
+        let mut state = State::new(Size { rows: 2, cols: 20 }, 0);
+        state.advance(b"\x1b[?2026h\x1b[1m\x1bP$qm\x1b\\\x1b[c\x1b[>q\x1b[?2026l");
+        let got = replies(&mut state);
+        assert_eq!(got[0], "\x1bP1$r0;1m\x1b\\");
+        assert_eq!(got[1], "\x1b[?6c");
+        assert!(got[2].starts_with("\x1bP>|crow-term("), "{got:?}");
+        // DA2 with extra parameters is still Crow Term's.
+        state.advance(b"\x1b[>0;0c\x1b[>1c");
+        let number = version_number();
+        assert_eq!(
+            replies(&mut state),
+            [
+                format!("\x1b[>0;{number};1c"),
+                format!("\x1b[>0;{number};1c")
+            ]
+        );
+        // No pixel answers before a GUI reported cell metrics.
+        state.advance(b"\x1b[14t\x1b[16t\x1b[5n");
+        assert_eq!(replies(&mut state), ["\x1b[0n"]);
+        // The daemon config decides OSC 52: default copy, "off" disables.
+        let mut config = crate::config::Config::default();
+        assert!(osc52_copy_enabled(Some(&config)));
+        config.terminal.osc52 = crate::config::Osc52Mode::Off;
+        assert!(!osc52_copy_enabled(Some(&config)));
+        assert!(!osc52_copy_enabled(None));
+    }
+    #[test]
+    fn hyperlink_targets_are_bounded_per_snapshot() {
+        let mut state = State::new(Size { rows: 4, cols: 100 }, 0);
+        let uri = "u".repeat(2000);
+        let mut bytes = Vec::new();
+        for index in 0..60 {
+            bytes.extend_from_slice(format!("\x1b]8;;{uri}{index}\x07x\x1b]8;;\x07").as_bytes());
+        }
+        state.advance(&bytes);
+        let screen = state.snapshot(true);
+        assert!(screen.links.iter().map(String::len).sum::<usize>() <= MAX_LINK_BYTES);
+        assert!(screen.links.len() < 60);
     }
     #[test]
     fn bell_hyperlinks_and_alternate_scroll_reach_the_snapshot() {

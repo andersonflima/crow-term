@@ -34,6 +34,9 @@ pub enum Query {
 
 /// Longest DCS query payload examined; longer strings are forwarded as-is.
 const MAX_DCS_QUERY: usize = 4096;
+/// Largest OSC 52 string forwarded: base64 of a 1 MiB copy plus its header.
+/// Larger copies are discarded before the parser decodes them.
+pub const MAX_OSC52_BYTES: usize = 4 * (1024 * 1024usize).div_ceil(3) + 64;
 
 /// Scanner output, in stream order.
 #[derive(Debug)]
@@ -51,8 +54,16 @@ enum State {
     Csi,
     /// DCS whose payload may still be an XTGETTCAP/DECRQSS query.
     Dcs,
-    /// Any other DCS string: forwarded until ESC, CAN or SUB.
+    /// Any other DCS string: forwarded until ESC, CAN, SUB or 8-bit ST.
     DcsPass,
+    /// OSC whose number is not known yet.
+    Osc,
+    /// OSC 52 (clipboard) held whole until its terminator, within the cap.
+    Osc52,
+    /// Any other OSC string: forwarded until BEL, ESC, CAN or SUB.
+    OscPass,
+    /// Oversized OSC 52: discarded until its terminator.
+    OscDrop,
 }
 
 #[derive(Debug)]
@@ -131,14 +142,19 @@ impl Interceptor {
                 }
                 continue;
             }
-            if self.state == State::DcsPass {
-                // Bulk-forward long strings (sixel, tmux passthrough).
+            if matches!(self.state, State::DcsPass | State::OscPass | State::OscDrop) {
+                // Bulk-forward (or discard) long strings: sixel, tmux passthrough, OSC.
                 let end = bytes[index..]
                     .iter()
-                    .position(|&byte| matches!(byte, ESC | 0x18 | 0x1a))
+                    .position(|&byte| match self.state {
+                        State::DcsPass => matches!(byte, ESC | 0x18 | 0x1a | 0x9c),
+                        _ => matches!(byte, ESC | 0x18 | 0x1a | 0x07),
+                    })
                     .map_or(bytes.len(), |offset| index + offset);
                 if end > index {
-                    sink(Out::Bytes(&bytes[index..end]));
+                    if self.state != State::OscDrop {
+                        sink(Out::Bytes(&bytes[index..end]));
+                    }
                     index = end;
                     continue;
                 }
@@ -219,6 +235,9 @@ impl Interceptor {
                 let query = (self.state == State::Dcs)
                     .then(|| self.dcs_query())
                     .flatten();
+                if self.state == State::OscDrop {
+                    self.drop_sequence();
+                }
                 self.pass(sink);
                 if let Some(query) = query {
                     sink(Out::Query(query));
@@ -227,8 +246,72 @@ impl Interceptor {
                 return;
             }
             0x18 | 0x1a => {
+                if self.state == State::OscDrop {
+                    // The parser executes CAN/SUB after ending the string.
+                    self.drop_sequence();
+                    sink(Out::Bytes(&[byte]));
+                    return;
+                }
                 self.hold(byte);
                 self.pass(sink);
+                return;
+            }
+            // 8-bit ST ends a DCS string in the parser (UTF-8 mode keeps it).
+            0x9c if matches!(self.state, State::Dcs | State::DcsPass) => {
+                let query = (self.state == State::Dcs)
+                    .then(|| self.dcs_query())
+                    .flatten();
+                if self.state == State::DcsPass {
+                    sink(Out::Bytes(&[byte]));
+                } else {
+                    self.hold(byte);
+                }
+                self.pass(sink);
+                if let Some(query) = query {
+                    sink(Out::Query(query));
+                }
+                return;
+            }
+            _ if self.state == State::OscPass => {
+                sink(Out::Bytes(&[byte]));
+                if byte == 0x07 {
+                    self.reset_sequence();
+                    self.state = State::Ground;
+                }
+                return;
+            }
+            _ if self.state == State::OscDrop => {
+                if byte == 0x07 {
+                    self.drop_sequence();
+                }
+                return;
+            }
+            _ if self.state == State::Osc52 => {
+                if byte == 0x07 {
+                    self.held.push(byte);
+                    self.pass(sink);
+                } else if self.held.len() >= MAX_OSC52_BYTES {
+                    self.held = Vec::new();
+                    self.state = State::OscDrop;
+                } else {
+                    self.held.push(byte);
+                }
+                return;
+            }
+            _ if self.state == State::Osc => {
+                self.hold(byte);
+                if byte == 0x07 {
+                    self.pass(sink);
+                    return;
+                }
+                self.payload.push(byte);
+                if self.payload == b"52;" {
+                    self.state = State::Osc52;
+                } else if !b"52;".starts_with(&self.payload) {
+                    sink(Out::Bytes(&self.held));
+                    self.reset_sequence();
+                    self.state = State::OscPass;
+                }
                 return;
             }
             // Inside a DCS string the parser does not execute C0 controls.
@@ -258,7 +341,13 @@ impl Interceptor {
             _ => {}
         }
         match self.state {
-            State::Ground | State::Dcs | State::DcsPass => {
+            State::Ground
+            | State::Dcs
+            | State::DcsPass
+            | State::Osc
+            | State::Osc52
+            | State::OscPass
+            | State::OscDrop => {
                 unreachable!("ground and DCS bytes are handled above")
             }
             State::Escape => match byte {
@@ -268,6 +357,10 @@ impl Interceptor {
                 b'[' => {
                     self.hold(byte);
                     self.state = State::Csi;
+                }
+                b']' => {
+                    self.hold(byte);
+                    self.state = State::Osc;
                 }
                 b'P' => {
                     self.hold(byte);
@@ -383,7 +476,8 @@ impl Interceptor {
                 sink(Out::Query(Query::Version));
                 return;
             }
-            (Some(b'>'), b'c') if first == 0 && params.len() <= 1 => {
+            // Every `CSI > … c` reaches the parser's DA2 (its crate version).
+            (Some(b'>'), b'c') => {
                 self.drop_sequence();
                 sink(Out::Query(Query::SecondaryAttributes));
                 return;
@@ -505,6 +599,39 @@ mod tests {
         let (fed, queries) = run(&mut interceptor, &[b"\x1bP+q5463\x18x"]);
         assert_eq!(fed, b"\x1bP+q5463\x18x");
         assert!(queries.is_empty());
+    }
+
+    #[test]
+    fn oversized_osc52_is_discarded_before_the_parser_decodes_it() {
+        let mut interceptor = Interceptor::default();
+        let small = b"\x1b]52;c;aGk=\x07after";
+        for split in 0..small.len() {
+            let mut interceptor = Interceptor::default();
+            let (fed, _) = run(&mut interceptor, &[&small[..split], &small[split..]]);
+            assert_eq!(fed, small, "split at {split}");
+        }
+        let mut big = b"\x1b]52;c;".to_vec();
+        big.extend(std::iter::repeat_n(b'A', MAX_OSC52_BYTES));
+        big.extend_from_slice(b"\x1b\\after\x1b]52;c;");
+        big.extend(std::iter::repeat_n(b'A', MAX_OSC52_BYTES));
+        big.extend_from_slice(b"\x18x");
+        let (fed, _) = run(&mut interceptor, &[&big[..1000], &big[1000..]]);
+        assert_eq!(fed, b"\x1b\\after\x18x");
+        assert!(interceptor.held.capacity() < MAX_OSC52_BYTES * 2);
+        // Other OSC strings pass through in bulk, also across terminators.
+        let osc = b"\x1b]2;title\x07\x1b]8;;https://x\x1b\\\x1b]11;?\x18done";
+        let (fed, _) = run(&mut interceptor, &[osc]);
+        assert_eq!(fed, osc);
+    }
+
+    #[test]
+    fn eight_bit_st_ends_dcs_like_the_parser() {
+        let mut interceptor = Interceptor::default();
+        let (fed, queries) = run(&mut interceptor, &[b"\x1bP$qm\x9chello\n"]);
+        assert_eq!(fed, b"\x1bP$qm\x9chello\n");
+        assert_eq!(queries, vec![Query::StatusString(b"m".to_vec())]);
+        let (fed, _) = run(&mut interceptor, &[b"\x1bPq#0\x9cplain"]);
+        assert_eq!(fed, b"\x1bPq#0\x9cplain");
     }
 
     #[test]

@@ -1671,25 +1671,32 @@ impl App {
         let Some(view) = &self.view else {
             return;
         };
+        if view.screens.is_empty() {
+            return;
+        }
         let mut rang = HashSet::new();
         let mut copies = Vec::new();
+        // Counters are kept only for panes in this view: a pane seen again
+        // after a window switch (or a new pane) only records its counters, so
+        // bells and copies from while it was hidden are never replayed.
+        let mut bells = HashMap::new();
+        let mut clipboard_seqs = HashMap::new();
         for (pane, screen) in &view.screens {
-            // A first sighting only records the counters: never replay history.
-            if self
-                .bells
-                .insert(*pane, screen.bell)
-                .is_some_and(|old| old != screen.bell)
-            {
+            if self.bells.get(pane).is_some_and(|old| *old != screen.bell) {
                 rang.insert(*pane);
             }
             if self
                 .clipboard_seqs
-                .insert(*pane, screen.clipboard_seq)
-                .is_some_and(|old| old != screen.clipboard_seq)
+                .get(pane)
+                .is_some_and(|old| *old != screen.clipboard_seq)
             {
                 copies.push(*pane);
             }
+            bells.insert(*pane, screen.bell);
+            clipboard_seqs.insert(*pane, screen.clipboard_seq);
         }
+        self.bells = bells;
+        self.clipboard_seqs = clipboard_seqs;
         if !rang.is_empty() {
             self.bell_flash = Some((Instant::now() + Duration::from_millis(150), rang));
         }
