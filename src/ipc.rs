@@ -188,16 +188,16 @@ fn check_windows_peer(pid: u32) -> Result<()> {
     Ok(())
 }
 
-fn transfer<T>(operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
+fn transfer<T>(deadline: Instant, operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
     let mut operation = operation;
-    let start = Instant::now();
     loop {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+        }
         match operation() {
             Ok(value) => return Ok(value),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock && start.elapsed() < DEADLINE =>
-            {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(1))
             }
             Err(error) => return Err(error.into()),
@@ -205,10 +205,10 @@ fn transfer<T>(operation: impl FnMut() -> std::io::Result<T>) -> Result<T> {
     }
 }
 
-fn read_exact(reader: &mut impl Read, buffer: &mut [u8]) -> Result<()> {
+fn read_exact(reader: &mut impl Read, buffer: &mut [u8], deadline: Instant) -> Result<()> {
     let mut offset = 0;
     while offset < buffer.len() {
-        let count = transfer(|| {
+        let count = transfer(deadline, || {
             let result = reader.read(&mut buffer[offset..]);
             #[cfg(windows)]
             let result = result.map_err(|error| {
@@ -233,14 +233,15 @@ fn read_exact(reader: &mut impl Read, buffer: &mut [u8]) -> Result<()> {
 }
 
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<T> {
+    let deadline = Instant::now() + DEADLINE;
     let mut length = [0; 4];
-    read_exact(reader, &mut length)?;
+    read_exact(reader, &mut length, deadline)?;
     let length = u32::from_le_bytes(length) as usize;
     if length == 0 || length > MAX_FRAME {
         bail!("Invalid IPC frame length: {length}");
     }
     let mut data = vec![0; length];
-    read_exact(reader, &mut data)?;
+    read_exact(reader, &mut data, deadline)?;
     Ok(postcard::from_bytes(&data)?)
 }
 
@@ -250,9 +251,19 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
         bail!("IPC frame exceeds limit");
     }
     let framed = [(data.len() as u32).to_le_bytes().as_slice(), &data].concat();
+    let deadline = Instant::now() + DEADLINE;
     let mut offset = 0;
     while offset < framed.len() {
-        let count = transfer(|| writer.write(&framed[offset..]))?;
+        let count = transfer(deadline, || {
+            let count = writer.write(&framed[offset..])?;
+            // PIPE_NOWAIT writes can succeed with no progress when its byte
+            // buffer is full. Preserve the offset and retry only on Windows.
+            #[cfg(windows)]
+            if count == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            Ok(count)
+        })?;
         if count == 0 {
             bail!("IPC peer stopped accepting data");
         }
@@ -282,6 +293,76 @@ pub fn wake_listener() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expired_deadline_stops_even_interrupted_operations() {
+        assert!(
+            transfer::<()>(Instant::now(), || Err(
+                std::io::ErrorKind::Interrupted.into()
+            ))
+            .is_err()
+        );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_empty_nowait_read_retries_but_eof_stays_terminal() {
+        struct Delayed {
+            empty: bool,
+            data: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for Delayed {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                if self.empty {
+                    self.empty = false;
+                    Err(std::io::Error::from_raw_os_error(232))
+                } else {
+                    self.data.read(b)
+                }
+            }
+        }
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &Request::List).unwrap();
+        let mut reader = Delayed {
+            empty: true,
+            data: std::io::Cursor::new(bytes),
+        };
+        assert!(matches!(
+            read_frame::<Request>(&mut reader).unwrap(),
+            Request::List
+        ));
+        assert!(read_frame::<Request>(&mut reader).is_err());
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_no_progress_write_retries_without_duplicate_bytes() {
+        struct Delayed {
+            empty: bool,
+            data: Vec<u8>,
+        }
+        impl Write for Delayed {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                if self.empty {
+                    self.empty = false;
+                    Ok(0)
+                } else {
+                    let n = b.len().min(2);
+                    self.data.extend_from_slice(&b[..n]);
+                    Ok(n)
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Delayed {
+            empty: true,
+            data: Vec::new(),
+        };
+        write_frame(&mut writer, &Request::List).unwrap();
+        assert!(matches!(
+            read_frame::<Request>(&mut writer.data.as_slice()).unwrap(),
+            Request::List
+        ));
+    }
     #[test]
     fn roundtrip() {
         let mut bytes = Vec::new();
