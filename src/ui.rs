@@ -3,13 +3,14 @@
 use crate::config::Config;
 use crate::crow::{self, CrowView, Segment, Tone};
 use crate::ipc::rpc;
+use crate::keyboard::{self, KeyAction, KeyInput};
 use crate::model::*;
 use anyhow::{Context as _, Result};
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style,
     SwashCache, Weight, Wrap,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::{
     Arc, Mutex,
@@ -20,11 +21,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey};
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Theme, Window, WindowId};
 
 const REGULAR: &[u8] = include_bytes!("../assets/fonts/CrowquillMono-Regular.ttf");
@@ -849,6 +851,8 @@ struct App {
     wheel_remainder: f64,
     ime: String,
     sent_sizes: HashMap<u64, Size>,
+    /// Keys whose press reached the PTY, so only their release is reported.
+    pressed_keys: HashSet<PhysicalKey>,
     clipboard: Option<arboard::Clipboard>,
     crow: Option<Arc<crow::Shared>>,
     crow_view: CrowView,
@@ -900,6 +904,7 @@ impl App {
             wheel_remainder: 0.0,
             ime: String::new(),
             sent_sizes: HashMap::new(),
+            pressed_keys: HashSet::new(),
             clipboard: None,
             crow,
             crow_view: CrowView::default(),
@@ -1205,14 +1210,33 @@ impl App {
             }
         }
     }
-    fn key(
-        &mut self,
-        key: &Key,
-        text: Option<&str>,
-        physical: PhysicalKey,
-        location: KeyLocation,
-        event_loop: &ActiveEventLoop,
-    ) {
+    fn key_event(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
+        let base = event.key_without_modifiers();
+        let input = KeyInput {
+            key: &event.logical_key,
+            base: &base,
+            text: event.text.as_deref(),
+            physical: event.physical_key,
+            location: event.location,
+            mods: self.mods,
+            action: match (event.state, event.repeat) {
+                (ElementState::Released, _) => KeyAction::Release,
+                (_, true) => KeyAction::Repeat,
+                _ => KeyAction::Press,
+            },
+        };
+        if input.action == KeyAction::Release {
+            // Report a release only for a press the application received.
+            if self.pressed_keys.remove(&event.physical_key) {
+                let bytes = encode_input(&input, &self.modes());
+                self.input(bytes);
+            }
+            return;
+        }
+        self.key(&input, event_loop);
+    }
+    fn key(&mut self, input: &KeyInput, event_loop: &ActiveEventLoop) {
+        let key = input.key;
         let c = match key {
             Key::Character(s) => s.to_lowercase(),
             _ => String::new(),
@@ -1230,7 +1254,9 @@ impl App {
         if self.prefix {
             self.prefix = false;
             if is_prefix {
-                self.input(encode_key(key, text, self.mods, &self.modes()));
+                let bytes = encode_input(input, &self.modes());
+                self.pressed_keys.insert(input.physical);
+                self.input(bytes);
             } else {
                 self.prefix_action(key, event_loop);
             }
@@ -1259,7 +1285,8 @@ impl App {
             return;
         }
         if self.ime.is_empty() || !matches!(key, Key::Character(_)) {
-            let bytes = encode_key_event(key, text, physical, location, self.mods, &self.modes());
+            let bytes = encode_input(input, &self.modes());
+            self.pressed_keys.insert(input.physical);
             self.input(bytes);
         }
     }
@@ -2050,13 +2077,7 @@ impl ApplicationHandler<UiEvent> for App {
                 event,
                 is_synthetic: false,
                 ..
-            } if event.state == ElementState::Pressed => self.key(
-                &event.logical_key,
-                event.text.as_deref(),
-                event.physical_key,
-                event.location,
-                event_loop,
-            ),
+            } => self.key_event(&event, event_loop),
             WindowEvent::Ime(Ime::Commit(text)) => {
                 self.ime.clear();
                 self.input(text.into_bytes());
@@ -2088,6 +2109,7 @@ impl ApplicationHandler<UiEvent> for App {
                         self.release_mouse_capture(button);
                     }
                     self.mods = ModifiersState::empty();
+                    self.pressed_keys.clear();
                     self.prefix = false;
                     self.dragging = false;
                     self.mouse_button = None;
@@ -2242,6 +2264,31 @@ fn selected_text(screen: &Screen, selection: &Selection) -> String {
         lines.push(text.trim_end().to_string());
     }
     lines.join("\n")
+}
+/// Encode a key for the focused pane: kitty keyboard protocol when the
+/// application enabled it, xterm modifyOtherKeys when requested, else legacy.
+fn encode_input(input: &KeyInput, modes: &Modes) -> Vec<u8> {
+    if input.mods.super_key() {
+        // Super/Command chords are GUI shortcuts, never PTY input.
+        return Vec::new();
+    }
+    if modes.keyboard != 0 {
+        return keyboard::encode_kitty(input, modes.keyboard, modes.application_cursor);
+    }
+    if input.action == KeyAction::Release {
+        return Vec::new();
+    }
+    if let Some(bytes) = keyboard::encode_modify_other_keys(input, modes.modify_other_keys) {
+        return bytes;
+    }
+    encode_key_event(
+        input.key,
+        input.text,
+        input.physical,
+        input.location,
+        input.mods,
+        modes,
+    )
 }
 fn modifier_parameter(mods: ModifiersState) -> u8 {
     1 + u8::from(mods.shift_key()) + 2 * u8::from(mods.alt_key()) + 4 * u8::from(mods.control_key())
@@ -2414,16 +2461,12 @@ fn encode_key(key: &Key, text: Option<&str>, mods: ModifiersState, modes: &Modes
                     return Vec::new();
                 }
                 let c = c.to_ascii_lowercase();
-                match c {
-                    'a'..='z' => vec![c as u8 - b'a' + 1],
-                    '@' | ' ' | '2' => vec![0],
-                    '[' | '3' => vec![27],
-                    '\\' | '4' => vec![28],
-                    ']' | '5' => vec![29],
-                    '^' | '6' => vec![30],
-                    '_' | '-' | '7' => vec![31],
-                    '?' | '8' => vec![127],
-                    _ => return Vec::new(),
+                match keyboard::ctrl_byte(c) {
+                    Some(byte) => vec![byte],
+                    // xterm/kitty legacy: printable ASCII without a C0 form
+                    // (Ctrl+. , ; ' 0 1 9 ...) sends the character itself.
+                    None if c.is_ascii_graphic() => vec![c as u8],
+                    None => return Vec::new(),
                 }
             } else {
                 text.unwrap_or(character.as_str()).as_bytes().to_vec()
@@ -2575,6 +2618,56 @@ mod tests {
             ),
             b"\x1b[24;3~"
         );
+    }
+    #[test]
+    fn key_routing_follows_the_application_keyboard_mode() {
+        let slash = Key::Character("/".into());
+        let dot = Key::Character(".".into());
+        let a = Key::Character("a".into());
+        let input = |key: &'static Key, code, mods, action| KeyInput {
+            key,
+            base: key,
+            text: None,
+            physical: PhysicalKey::Code(code),
+            location: KeyLocation::Standard,
+            mods,
+            action,
+        };
+        let slash: &'static Key = Box::leak(Box::new(slash));
+        let dot: &'static Key = Box::leak(Box::new(dot));
+        let a: &'static Key = Box::leak(Box::new(a));
+        let mut modes = Modes::default();
+        let ctrl_slash = input(
+            slash,
+            KeyCode::Slash,
+            ModifiersState::CONTROL,
+            KeyAction::Press,
+        );
+        let ctrl_dot = input(
+            dot,
+            KeyCode::Period,
+            ModifiersState::CONTROL,
+            KeyAction::Press,
+        );
+        let release = input(
+            a,
+            KeyCode::KeyA,
+            ModifiersState::empty(),
+            KeyAction::Release,
+        );
+        // Legacy: xterm C0 for Ctrl+/ and the plain character for Ctrl+.
+        assert_eq!(encode_input(&ctrl_slash, &modes), vec![0x1f]);
+        assert_eq!(encode_input(&ctrl_dot, &modes), b".");
+        assert_eq!(encode_input(&release, &modes), b"");
+        modes.modify_other_keys = 1;
+        assert_eq!(encode_input(&ctrl_dot, &modes), b"\x1b[27;5;46~");
+        assert_eq!(encode_input(&ctrl_slash, &modes), vec![0x1f]);
+        // Kitty mode wins over modifyOtherKeys and reports releases on flag 2.
+        modes.keyboard = keyboard::DISAMBIGUATE | keyboard::EVENT_TYPES;
+        assert_eq!(encode_input(&ctrl_slash, &modes), b"\x1b[47;5u");
+        assert_eq!(encode_input(&release, &modes), b"\x1b[97;1:3u");
+        let command = input(a, KeyCode::KeyA, ModifiersState::SUPER, KeyAction::Press);
+        assert_eq!(encode_input(&command, &modes), b"");
     }
     #[test]
     fn vim_ctrl_chords_and_utf8_are_not_reinterpreted() {

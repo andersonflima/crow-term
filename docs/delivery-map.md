@@ -80,9 +80,14 @@ wire-size observations, not rendering/latency benchmarks.
 
 - Full manual Windows/WSL and Linux/Wayland/X11 journeys, including GPU/driver,
   international input, IME, complex emoji ZWJ clusters and accessibility.
-- Every Vim/LazyVim plugin, terminal protocol or keyboard extension. Kitty
-  keyboard, graphics protocols, sixel and tmux control-mode integration are not
-  advertised as implemented.
+- Every Vim/LazyVim plugin, terminal protocol or keyboard extension. Graphics
+  protocols, sixel and tmux control-mode integration are not advertised as
+  implemented. The kitty keyboard protocol (flags 1/2/4/8/16, push/pop/query/set)
+  and xterm modifyOtherKeys are implemented (`src/keyboard.rs`,
+  `src/intercept.rs`) with reference-table unit tests and real-Neovim decoding in
+  `tests/nvim_e2e.py`; caps/num-lock modifier bits are not reported (winit does
+  not expose lock state), Super/Command chords stay GUI shortcuts, and the GUI
+  encoder itself is verified by unit tests, not by synthetic native key events.
 - Semantic screen-reader grid accessibility, GUI session switcher, draggable
   split ratios, search UI, crash/reboot layout restore and process persistence
   beyond daemon lifetime.

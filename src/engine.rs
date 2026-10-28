@@ -13,6 +13,7 @@ use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, R
 use anyhow::{Context, Result, anyhow, ensure};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::intercept::{Interceptor, Out, Query};
 use crate::model::{Cell, ColorSpec, Cursor, Modes, Screen, ShellSpec, Size};
 
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
@@ -74,6 +75,9 @@ fn pty_size(size: Size) -> PtySize {
 struct State {
     term: Term<Events>,
     parser: VtParser,
+    intercept: Interceptor,
+    /// Same queue as the parser's own replies, so answers keep stream order.
+    replies: mpsc::Sender<Event>,
     pending_events: mpsc::Receiver<Event>,
     size: Size,
     title: String,
@@ -86,11 +90,16 @@ impl State {
             scrolling_history: scrollback.min(MAX_SCROLLBACK),
             // Never let terminal output read or overwrite the system clipboard.
             osc52: Osc52::Disabled,
+            // Progressive enhancement: push/pop/query/set (CSI > u, CSI < u,
+            // CSI ? u, CSI = u). The stack depth is bounded by `Interceptor`.
+            kitty_keyboard: true,
             ..Config::default()
         };
         Self {
-            term: Term::new(config, &size, Events(events)),
+            term: Term::new(config, &size, Events(events.clone())),
             parser: VtParser::new(),
+            intercept: Interceptor::default(),
+            replies: events,
             pending_events,
             size,
             title: String::new(),
@@ -99,7 +108,19 @@ impl State {
     }
 
     fn advance(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        let Self {
+            term,
+            parser,
+            intercept,
+            replies,
+            ..
+        } = self;
+        intercept.scan(bytes, &mut |out| match out {
+            Out::Bytes(bytes) => parser.advance(term, bytes),
+            Out::Query(query) => {
+                let _ = replies.send(Event::PtyWrite(answer(query)));
+            }
+        });
     }
 
     fn expire_sync(&mut self) -> bool {
@@ -117,6 +138,17 @@ impl State {
     }
 
     fn finish_sync(&mut self) {
+        let Self {
+            term,
+            parser,
+            intercept,
+            ..
+        } = self;
+        intercept.flush(&mut |out| {
+            if let Out::Bytes(bytes) = out {
+                parser.advance(term, bytes);
+            }
+        });
         self.parser.stop_sync(&mut self.term);
     }
 
@@ -238,11 +270,34 @@ impl State {
                 mouse_drag: mode.contains(TermMode::MOUSE_DRAG),
                 mouse_click: mode.intersects(TermMode::MOUSE_MODE),
                 focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
+                keyboard: keyboard_flags(mode),
+                modify_other_keys: self.intercept.modify_other_keys,
             },
             title: self.title.clone(),
             alive,
             display_offset: content.display_offset,
         }
+    }
+}
+
+/// Kitty progressive-enhancement flags (1 disambiguate, 2 event types,
+/// 4 alternate keys, 8 all keys as escapes, 16 associated text).
+fn keyboard_flags(mode: TermMode) -> u8 {
+    [
+        (TermMode::DISAMBIGUATE_ESC_CODES, 1),
+        (TermMode::REPORT_EVENT_TYPES, 2),
+        (TermMode::REPORT_ALTERNATE_KEYS, 4),
+        (TermMode::REPORT_ALL_KEYS_AS_ESC, 8),
+        (TermMode::REPORT_ASSOCIATED_TEXT, 16),
+    ]
+    .into_iter()
+    .filter(|(flag, _)| mode.contains(*flag))
+    .fold(0, |flags, (_, bit)| flags | bit)
+}
+
+fn answer(query: Query) -> String {
+    match query {
+        Query::ModifyOtherKeys(level) => format!("\x1b[>4;{level}m"),
     }
 }
 
@@ -918,6 +973,44 @@ mod tests {
                 .any(|text| text.contains("rgb:0000/0000/0000")),
             "{replies:?}"
         );
+    }
+    fn replies(state: &mut State) -> Vec<String> {
+        let (writer, writes) = mpsc::sync_channel(64);
+        state.events(&writer);
+        writes
+            .try_iter()
+            .filter_map(|message| match message {
+                WriteMessage::Bytes(bytes) => Some(String::from_utf8(bytes).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+    #[test]
+    fn kitty_keyboard_stack_and_modify_other_keys_reach_the_snapshot() {
+        let mut state = State::new(Size { rows: 3, cols: 20 }, 0);
+        state.advance(b"\x1b[?u\x1b[>1u\x1b[?u\x1b[c");
+        assert_eq!(state.snapshot(true).modes.keyboard, 1);
+        // Answers stay in stream order with the parser's own replies.
+        assert_eq!(replies(&mut state), ["\x1b[?0u", "\x1b[?1u", "\x1b[?6c"]);
+        state.advance(b"\x1b[>31u");
+        assert_eq!(state.snapshot(true).modes.keyboard, 31);
+        // The alternate screen has its own stack.
+        state.advance(b"\x1b[?1049h");
+        assert_eq!(state.snapshot(true).modes.keyboard, 0);
+        state.advance(b"\x1b[?1049l\x1b[<u");
+        assert_eq!(state.snapshot(true).modes.keyboard, 1);
+        state.advance(b"\x1b[<u");
+        assert_eq!(state.snapshot(true).modes.keyboard, 0);
+        state.advance(b"\x1b[>4;2m\x1b[?4m\x1b[5n");
+        assert_eq!(state.snapshot(true).modes.modify_other_keys, 2);
+        assert_eq!(replies(&mut state), ["\x1b[>4;2m", "\x1b[0n"]);
+        // A flood of pushes is bounded instead of reaching the parser's limit.
+        let flood = b"\x1b[>1u".repeat(10_000);
+        state.advance(&flood);
+        assert_eq!(state.snapshot(true).modes.keyboard, 1);
+        state.advance(b"\x1bc");
+        let modes = state.snapshot(true).modes;
+        assert_eq!((modes.keyboard, modes.modify_other_keys), (0, 0));
     }
     #[cfg(unix)]
     fn wait_for(engine: &Engine, predicate: impl Fn(&Screen) -> bool) -> Screen {

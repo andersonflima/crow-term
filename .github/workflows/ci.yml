@@ -90,4 +90,6 @@ jobs:
           echo "CROW_TERM_NVIM=$nvim" >> "$GITHUB_ENV"
       - run: cargo build --locked
       - name: Neovim through the daemon PTY
-        run: python tests/daemon_e2e.py DaemonTests.test_neovim_alternate_screen_input_and_clean_exit
+        run: |
+          python tests/daemon_e2e.py DaemonTests.test_neovim_alternate_screen_input_and_clean_exit
+          python tests/nvim_e2e.py

@@ -53,6 +53,12 @@ pub struct Modes {
     pub mouse_drag: bool,
     pub mouse_click: bool,
     pub focus_reporting: bool,
+    /// Active kitty keyboard enhancement flags; 0 means legacy encoding.
+    #[serde(default)]
+    pub keyboard: u8,
+    /// xterm modifyOtherKeys level requested by the application (0-2).
+    #[serde(default)]
+    pub modify_other_keys: u8,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Screen {

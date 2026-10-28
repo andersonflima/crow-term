@@ -30,7 +30,9 @@ def neovim_binary(test):
     return nvim
 
 
-class DaemonTests(unittest.TestCase):
+class DaemonHarness(unittest.TestCase):
+    """Isolated runtime + daemon per test. Holds no tests itself, so other
+    E2E modules can reuse it without re-running this module's tests."""
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="crow-e2e-")
         self.addCleanup(self.temp.cleanup)
@@ -89,6 +91,8 @@ class DaemonTests(unittest.TestCase):
     def send(self, pane, text):
         self.command("send-keys", pane, text, "--enter")
 
+
+class DaemonTests(DaemonHarness):
     def test_session_window_split_reattach_resize_and_isolation(self):
         first = self.rpc("new-session", "alpha")["Created"]
         self.assertEqual(self.rpc("new-session", "alpha")["Created"], first)

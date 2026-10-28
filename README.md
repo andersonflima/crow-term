@@ -184,6 +184,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo test --all-targets --locked
 python3 tests/shell_setup.py
 python3 tests/daemon_e2e.py
+python3 tests/nvim_e2e.py   # optional: CROW_TERM_NVIM=/path/to/nvim (>= 0.11)
 ```
 
 The E2E suite uses an isolated daemon/runtime and real PTYs. Available Neovim and
