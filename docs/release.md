@@ -61,7 +61,7 @@ Repository variable `MACOS_SIGN_IDENTITY` overrides the default identity
 
 What happens when they are absent:
 
-- No `CSC_LINK`: the log says `CSC_LINK not set: producing UNSIGNED build`; the
+- No `CSC_LINK`: the log says `CSC_LINK not set: producing UNSIGNED (ad-hoc signed) build`; the
   release still ships (unsigned, not notarized).
 - Signed but any of the four `APPLE_*` missing: `Notarization skipped: missing
   secrets …`; the app is signed but not notarized, so Gatekeeper still warns.

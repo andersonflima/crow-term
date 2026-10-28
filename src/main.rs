@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use crow_term::{config::Config, ipc, model::*, server, ui};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -106,18 +106,32 @@ enum Action {
 /// a symlink), next to the resolved executable (Homebrew `bin` links), and the
 /// macOS app bundle's `Contents/Resources` (signed bundles keep data out of `MacOS`).
 fn bundled_shell_setup_candidates() -> Result<Vec<PathBuf>> {
-    let invoked = std::env::current_exe()?;
+    shell_setup_candidates_for(&std::env::current_exe()?)
+}
+fn shell_setup_candidates_for(invoked: &Path) -> Result<Vec<PathBuf>> {
     let mut bases = vec![
         invoked
             .parent()
             .context("Executable directory missing")?
             .to_path_buf(),
     ];
-    if let Some(resolved) = std::fs::canonicalize(&invoked)
+    if let Some(resolved) = std::fs::canonicalize(invoked)
         .ok()
         .and_then(|path| path.parent().map(PathBuf::from))
     {
-        bases.push(resolved.join("../Resources"));
+        // Only a real macOS bundle layout (`X.app/Contents/MacOS`) may look in
+        // `../Resources`; elsewhere that path could belong to another user.
+        if cfg!(target_os = "macos")
+            && resolved.ends_with("Contents/MacOS")
+            && resolved
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::extension)
+                .is_some_and(|ext| ext == "app")
+            && let Some(contents) = resolved.parent()
+        {
+            bases.push(contents.join("Resources"));
+        }
         bases.push(resolved);
     }
     Ok(bases
@@ -417,5 +431,35 @@ fn main() -> Result<()> {
             ui::run(config, session, window, pane, spec)
         }
         _ => unreachable!("local commands handled above"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shell_setup_resources_only_inside_an_app_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let lone = root.join("sub/crow-term");
+        std::fs::create_dir_all(lone.parent().unwrap()).unwrap();
+        std::fs::write(&lone, b"").unwrap();
+        let candidates = shell_setup_candidates_for(&lone).unwrap();
+        assert!(
+            candidates
+                .iter()
+                .all(|c| !c.starts_with(root.join("Resources"))),
+            "{candidates:?}"
+        );
+        let app = root.join("Crow Term.app/Contents/MacOS/crow-term");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, b"").unwrap();
+        let candidates = shell_setup_candidates_for(&app).unwrap();
+        let resources = root.join("Crow Term.app/Contents/Resources/shell/setup.py");
+        assert_eq!(
+            candidates.contains(&resources),
+            cfg!(target_os = "macos"),
+            "{candidates:?}"
+        );
     }
 }

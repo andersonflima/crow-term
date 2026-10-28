@@ -23,7 +23,8 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES = ROOT / "packaging" / "homebrew"
-VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?")
+# Keep in sync with the tag check in .github/workflows/release.yml.
+VERSION_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?")
 SHA_RE = re.compile(r"[0-9a-f]{64}")
 # Placeholder token -> asset suffix after "crow-term-<version>-".
 ASSETS = {
@@ -38,9 +39,9 @@ OUTPUTS = {"crow-term.rb": "Formula/crow-term.rb", "cask/crow-term.rb": "Casks/c
 HEADER = "# Generated from crow-term packaging/homebrew by scripts/update_tap.py; do not edit by hand.\n"
 UNSIGNED_CAVEATS = '''
   caveats <<~EOS
-    This build of Crow Term is not notarized by Apple. If macOS blocks the
-    first launch, open System Settings > Privacy & Security and choose
-    "Open Anyway" for Crow Term.
+    This build of Crow Term is not notarized by Apple (it is only ad-hoc
+    signed). If macOS refuses to open it, remove the download quarantine:
+      xattr -dr com.apple.quarantine "#{appdir}/Crow Term.app"
   EOS
 '''
 

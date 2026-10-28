@@ -119,6 +119,11 @@ def build_app(dest, binary_path, version, build_number, root):
         shutil.copy2(icon, resources / icon.name)
     with (contents / "Info.plist").open("wb") as file:
         plistlib.dump(info_plist(version, build_number, icon.name if icon else None), file)
+    # Seal the bundle ad hoc: the linker-only signature of an arm64 binary leaves the
+    # bundle invalid ("code has no resources"), which macOS reports as damaged. The
+    # release workflow replaces this with a Developer ID signature when configured.
+    if shutil.which("codesign"):
+        subprocess.run(["codesign", "--force", "--sign", "-", str(dest / APP_NAME)], check=True)
     # Portable-archive entry point outside the bundle; a relative link into it is fine.
     (dest / "crow-term").symlink_to(f"{APP_NAME}/Contents/MacOS/crow-term")
     return dest / APP_NAME

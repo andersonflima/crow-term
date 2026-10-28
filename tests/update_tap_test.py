@@ -81,7 +81,9 @@ class UpdateTapTest(unittest.TestCase):
             self.run_tool("--assets-dir", str(self.assets))
 
     def test_rejects_bad_version_and_plain_http(self):
-        for bad in ("1.0", "latest", "1.0.0;rm"):
+        # Same grammar as the release workflow's tag check (hyphens allowed in pre-release).
+        self.assertTrue(update_tap.VERSION_RE.fullmatch("0.1.0-rc-1"))
+        for bad in ("1.0", "latest", "1.0.0;rm", "1.0.0-", "1.0.0-a b"):
             with self.assertRaises(update_tap.TapError):
                 update_tap.run(["--version", bad, "--tap", str(self.tap), "--assets-dir", str(self.assets)],
                                out=io.StringIO())

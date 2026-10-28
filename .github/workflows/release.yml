@@ -47,7 +47,8 @@ jobs:
             echo "::error::Cargo.toml version '${version}' is not semver"; exit 1
           fi
           publish=false
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          # Only a tag *push* publishes; a manual dispatch is always a dry run.
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/tags/* ]]; then
             if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
               echo "::error::Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v${version}"; exit 1
             fi
@@ -128,7 +129,8 @@ jobs:
           CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
         run: |
           if [[ -z "${CSC_LINK}" ]]; then
-            echo "CSC_LINK not set: producing UNSIGNED build"
+            # package.py already sealed the bundle with an ad-hoc signature.
+            echo "CSC_LINK not set: producing UNSIGNED (ad-hoc signed) build"
             echo "SIGNED=false" >> "${GITHUB_ENV}"
             exit 0
           fi
