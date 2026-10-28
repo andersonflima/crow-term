@@ -746,17 +746,46 @@ fn kill_unix_session(raw_shell: u32, foreground: Option<rustix::process::Pid>) -
     }
     // Fallback covers the foreground and shell groups even if platform
     // process enumeration missed a member. Groups cannot span sessions.
-    for group in [foreground, Some(shell)].into_iter().flatten() {
+    // The shell usually leads the foreground group: signal each group once.
+    // A second killpg would land while the group is exiting, which macOS
+    // answers with EPERM.
+    let groups = match foreground {
+        Some(group) if group == shell => [Some(shell), None],
+        _ => [foreground, Some(shell)],
+    };
+    for group in groups.into_iter().flatten() {
         if group == getpgrp() || group.is_init() || getsid(Some(group)).ok() != Some(shell) {
             continue;
         }
         if let Err(error) = kill_process_group(group, Signal::KILL)
             && error != rustix::io::Errno::SRCH
+            // Defensive: EPERM for a group in which nothing is left alive (all
+            // members exited, awaiting reaping) means there is nothing to
+            // signal. The reproduced macOS failure was the duplicate signal
+            // removed above; this path has not been observed since.
+            && !(error == rustix::io::Errno::PERM && !session_has_live_member(&mut system, raw_shell))
         {
             return Err(error).context("terminate terminal process group");
         }
     }
     Ok(())
+}
+
+/// Whether any process of the PTY session, its leader included, is still
+/// alive (not a zombie awaiting its parent or an exiting process).
+#[cfg(unix)]
+fn session_has_live_member(system: &mut sysinfo::System, raw_shell: u32) -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate};
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().without_tasks(),
+    );
+    let sid = sysinfo::Pid::from_u32(raw_shell);
+    system.processes().values().any(|process| {
+        (process.pid() == sid || process.session_id() == Some(sid))
+            && process.status() != sysinfo::ProcessStatus::Zombie
+    })
 }
 
 impl Engine {
@@ -1552,6 +1581,56 @@ mod tests {
         assert!(changes.load(Ordering::Relaxed) >= 3);
         assert!(engine.process.child.lock().unwrap().is_none());
         engine.kill().unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn kill_succeeds_while_the_session_is_exiting() {
+        // Regression: close-pane failed on macOS with "terminate terminal
+        // process group: Operation not permitted" when the group was already
+        // exiting. Probabilistic: under this load (4 concurrent closers, shells
+        // that exit on their own or keep running) the unfixed code failed about
+        // 1 kill in 2,400, i.e. in roughly one run of five on an M3 macOS.
+        // PTYs are opened one at a time: concurrent openpty calls fail
+        // intermittently (os error -6) and are not what this test is about.
+        static OPEN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let workers: Vec<_> = (0..4)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    let mut errors = Vec::new();
+                    for round in 0..120 {
+                        let body = if round % 2 == 0 { "exit 0" } else { "sleep 5" };
+                        let shell = ShellSpec {
+                            program: "/bin/sh".into(),
+                            args: vec!["-c".into(), body.into()],
+                            cwd: None,
+                        };
+                        let engine = {
+                            let _open = OPEN.lock().unwrap_or_else(|error| error.into_inner());
+                            Engine::new(&shell, Size::default(), 0, Arc::new(|| {})).unwrap()
+                        };
+                        if round % 3 == 0 {
+                            std::thread::sleep(Duration::from_millis((round % 7) as u64));
+                        }
+                        match engine.kill() {
+                            Ok(()) => assert!(!engine.alive()),
+                            Err(error) => {
+                                errors.push(format!("worker {worker} round {round}: {error:#}"))
+                            }
+                        }
+                    }
+                    errors
+                })
+            })
+            .collect();
+        let errors: Vec<String> = workers
+            .into_iter()
+            .flat_map(|worker| worker.join().unwrap())
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "{} failed kills: {errors:?}",
+            errors.len()
+        );
     }
     #[test]
     #[cfg(unix)]
