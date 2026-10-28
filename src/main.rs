@@ -383,6 +383,7 @@ fn main() -> Result<()> {
                     rows: *rows,
                     cols: *cols,
                 },
+                cell: None,
             })?)
         }
         Some(Action::ClosePane { pane, window }) => {

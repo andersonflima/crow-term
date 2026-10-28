@@ -268,11 +268,14 @@ impl Server {
                 ensure!(bytes.len() <= 1024 * 1024, "Input exceeds 1 MiB");
                 self.pane(pane)?.input(&bytes)?;
             }
-            Request::Resize { pane, size } => {
+            Request::Resize { pane, size, cell } => {
                 validate_size(size)?;
-                self.pane(pane)?.resize(size)?;
+                self.pane(pane)?.resize_with_cell(size, cell)?;
             }
             Request::PaneCwd { pane } => return Ok(Response::Cwd(self.pane(pane)?.cwd())),
+            Request::Clipboard { pane } => {
+                return Ok(Response::Clipboard(self.pane(pane)?.clipboard()?));
+            }
             Request::Scroll { pane, lines } => {
                 self.pane(pane)?.scroll(lines.clamp(-10000, 10000))?;
             }

@@ -14,7 +14,9 @@ use anyhow::{Context, Result, anyhow, ensure};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
 use crate::intercept::{Interceptor, Out, Query};
-use crate::model::{Cell, ColorSpec, Cursor, Modes, Screen, ShellSpec, Size, UnderlineStyle};
+use crate::model::{
+    Cell, CellPixels, ColorSpec, Cursor, Modes, Screen, ShellSpec, Size, UnderlineStyle,
+};
 
 pub type Notify = Arc<dyn Fn() + Send + Sync>;
 
@@ -31,6 +33,8 @@ impl EventListener for Events {
             event,
             Event::Title(_)
                 | Event::ResetTitle
+                | Event::Bell
+                | Event::ClipboardStore(_, _)
                 | Event::PtyWrite(_)
                 | Event::TextAreaSizeRequest(_)
                 | Event::ColorRequest(_, _)
@@ -63,14 +67,19 @@ fn checked_size(size: Size) -> Result<Size> {
     );
     Ok(size)
 }
-fn pty_size(size: Size) -> PtySize {
+fn pty_size(size: Size, cell: CellPixels) -> PtySize {
     PtySize {
         rows: size.rows,
         cols: size.cols,
-        pixel_width: 0,
-        pixel_height: 0,
+        pixel_width: size.cols.saturating_mul(cell.width),
+        pixel_height: size.rows.saturating_mul(cell.height),
     }
 }
+/// Largest OSC 52 copy accepted (decoded UTF-8 bytes); larger copies are ignored.
+pub const MAX_CLIPBOARD: usize = 1024 * 1024;
+/// Longest OSC 8 target kept in a snapshot, and most distinct targets per screen.
+const MAX_LINK_URI: usize = 2048;
+const MAX_LINKS: usize = 1024;
 
 struct State {
     term: Term<Events>,
@@ -80,16 +89,30 @@ struct State {
     replies: mpsc::Sender<Event>,
     pending_events: mpsc::Receiver<Event>,
     size: Size,
+    cell: CellPixels,
+    bell: u64,
+    osc52_copy: bool,
+    clipboard: Option<(u64, String)>,
+    clipboard_seq: u64,
     title: String,
     default_colors: [Rgb; alacritty_terminal::term::color::COUNT],
 }
 impl State {
+    #[cfg(test)]
     fn new(size: Size, scrollback: usize) -> Self {
+        Self::with_osc52(size, scrollback, false)
+    }
+    fn with_osc52(size: Size, scrollback: usize, osc52_copy: bool) -> Self {
         let (events, pending_events) = mpsc::channel();
         let config = Config {
             scrolling_history: scrollback.min(MAX_SCROLLBACK),
-            // Never let terminal output read or overwrite the system clipboard.
-            osc52: Osc52::Disabled,
+            // Terminal output never reads the clipboard; writing it is opt-in
+            // (`terminal.osc52 = "copy"`) and forwarded only to attached GUIs.
+            osc52: if osc52_copy {
+                Osc52::OnlyCopy
+            } else {
+                Osc52::Disabled
+            },
             // Progressive enhancement: push/pop/query/set (CSI > u, CSI < u,
             // CSI ? u, CSI = u). The stack depth is bounded by `Interceptor`.
             kitty_keyboard: true,
@@ -102,12 +125,19 @@ impl State {
             replies: events,
             pending_events,
             size,
+            cell: CellPixels::default(),
+            bell: 0,
+            osc52_copy,
+            clipboard: None,
+            clipboard_seq: 0,
             title: String::new(),
             default_colors: std::array::from_fn(default_rgb),
         }
     }
 
     fn advance(&mut self, bytes: &[u8]) {
+        let cell = self.cell;
+        let osc52_copy = self.osc52_copy;
         let Self {
             term,
             parser,
@@ -118,7 +148,7 @@ impl State {
         intercept.scan(bytes, &mut |out| match out {
             Out::Bytes(bytes) => parser.advance(term, bytes),
             Out::Query(query) => {
-                let _ = replies.send(Event::PtyWrite(answer(query)));
+                let _ = replies.send(Event::PtyWrite(answer(query, term, cell, osc52_copy)));
             }
         });
     }
@@ -163,12 +193,25 @@ impl State {
                     self.title.clear();
                     None
                 }
+                Event::Bell => {
+                    self.bell = self.bell.wrapping_add(1);
+                    None
+                }
+                // Both the clipboard and the primary selection target the one
+                // system clipboard the GUI can write.
+                Event::ClipboardStore(_, text)
+                    if self.osc52_copy && text.len() <= MAX_CLIPBOARD =>
+                {
+                    self.clipboard_seq = self.clipboard_seq.wrapping_add(1);
+                    self.clipboard = Some((self.clipboard_seq, text));
+                    None
+                }
                 Event::PtyWrite(text) => Some(text),
                 Event::TextAreaSizeRequest(format) => Some(format(WindowSize {
                     num_lines: self.size.rows,
                     num_cols: self.size.cols,
-                    cell_width: 0,
-                    cell_height: 0,
+                    cell_width: self.cell.width,
+                    cell_height: self.cell.height,
                 })),
                 Event::ColorRequest(index, format) => {
                     let color = (index < alacritty_terminal::term::color::COUNT)
@@ -195,6 +238,8 @@ impl State {
     fn snapshot(&self, alive: bool) -> Screen {
         let content = self.term.renderable_content();
         let mut cells = Vec::with_capacity(self.size.rows as usize);
+        let mut links: Vec<String> = Vec::new();
+        let mut link_index: std::collections::HashMap<String, u16> = Default::default();
         let mut row = Vec::with_capacity(self.size.cols as usize);
         for indexed in content.display_iter {
             let cell = indexed.cell;
@@ -231,6 +276,19 @@ impl State {
                 wide_spacer: cell
                     .flags
                     .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                link: cell.hyperlink().and_then(|link| {
+                    let uri = link.uri();
+                    if let Some(&index) = link_index.get(uri) {
+                        return Some(index);
+                    }
+                    if uri.len() > MAX_LINK_URI || links.len() >= MAX_LINKS {
+                        return None;
+                    }
+                    let index = links.len() as u16;
+                    links.push(uri.to_owned());
+                    link_index.insert(uri.to_owned(), index);
+                    Some(index)
+                }),
                 // Concealed text (SGR 8) shows neither glyph nor decoration.
                 underline_style: if hidden {
                     UnderlineStyle::None
@@ -282,10 +340,15 @@ impl State {
                 focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
                 keyboard: keyboard_flags(mode),
                 modify_other_keys: self.intercept.modify_other_keys,
+                alternate_scroll: mode.contains(TermMode::ALT_SCREEN)
+                    && mode.contains(TermMode::ALTERNATE_SCROLL),
             },
             title: self.title.clone(),
             alive,
             display_offset: content.display_offset,
+            bell: self.bell,
+            links,
+            clipboard_seq: self.clipboard_seq,
         }
     }
 }
@@ -321,9 +384,130 @@ fn keyboard_flags(mode: TermMode) -> u8 {
     .fold(0, |flags, (_, bit)| flags | bit)
 }
 
-fn answer(query: Query) -> String {
+/// DA2 version field: major * 10000 + minor * 100 + patch.
+fn version_number() -> u32 {
+    let part = |value: &str| value.parse::<u32>().unwrap_or(0);
+    part(env!("CARGO_PKG_VERSION_MAJOR")) * 10_000
+        + part(env!("CARGO_PKG_VERSION_MINOR")) * 100
+        + part(env!("CARGO_PKG_VERSION_PATCH"))
+}
+
+/// terminfo capabilities answered by XTGETTCAP. `None` values are booleans.
+/// `Ms` (OSC 52 clipboard) is deliberately absent: terminal output may not
+/// access the clipboard.
+fn termcap(name: &str, osc52_copy: bool) -> Option<Option<&'static str>> {
+    Some(match name {
+        "Ms" if osc52_copy => Some("\x1b]52;%p1%s;%p2%s\x07"),
+        "Tc" | "RGB" => None,
+        "Smulx" => Some("\x1b[4:%p1%dm"),
+        "Setulc" => Some("\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m"),
+        "Ss" => Some("\x1b[%p1%d q"),
+        "Se" => Some("\x1b[2 q"),
+        _ => return None,
+    })
+}
+
+fn hex_decode(hex: &str) -> Option<String> {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(hex.get(index..index + 2)?, 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
+}
+
+fn hex_encode(text: &str) -> String {
+    text.bytes().map(|byte| format!("{byte:02X}")).collect()
+}
+
+fn sgr_color(color: Color, base: u8, bright: u8, extended: u8, out: &mut Vec<String>) {
+    match color {
+        Color::Named(named) if (named as usize) < 8 => out.push((base + named as u8).to_string()),
+        Color::Named(named) if (named as usize) < 16 => {
+            out.push((bright + named as u8 - 8).to_string())
+        }
+        Color::Named(_) => {}
+        Color::Indexed(index) => out.push(format!("{extended};5;{index}")),
+        Color::Spec(rgb) => out.push(format!("{extended};2;{};{};{}", rgb.r, rgb.g, rgb.b)),
+    }
+}
+
+/// SGR parameters that reproduce the cursor's current rendition (DECRQSS m).
+fn current_sgr(term: &Term<Events>) -> String {
+    let template = &term.grid().cursor.template;
+    let flags = template.flags;
+    let mut out = vec!["0".to_owned()];
+    for (flag, code) in [
+        (Flags::BOLD, "1"),
+        (Flags::DIM, "2"),
+        (Flags::ITALIC, "3"),
+        (Flags::UNDERLINE, "4"),
+        (Flags::DOUBLE_UNDERLINE, "4:2"),
+        (Flags::UNDERCURL, "4:3"),
+        (Flags::DOTTED_UNDERLINE, "4:4"),
+        (Flags::DASHED_UNDERLINE, "4:5"),
+        (Flags::INVERSE, "7"),
+        (Flags::HIDDEN, "8"),
+        (Flags::STRIKEOUT, "9"),
+    ] {
+        if flags.contains(flag) {
+            out.push(code.to_owned());
+        }
+    }
+    sgr_color(template.fg, 30, 90, 38, &mut out);
+    sgr_color(template.bg, 40, 100, 48, &mut out);
+    match template.underline_color() {
+        Some(Color::Spec(rgb)) => out.push(format!("58:2::{}:{}:{}", rgb.r, rgb.g, rgb.b)),
+        Some(Color::Indexed(index)) => out.push(format!("58:5:{index}")),
+        Some(Color::Named(named)) if (named as usize) < 16 => {
+            out.push(format!("58:5:{}", named as usize))
+        }
+        _ => {}
+    }
+    out.join(";")
+}
+
+fn answer(query: Query, term: &Term<Events>, cell: CellPixels, osc52_copy: bool) -> String {
     match query {
         Query::ModifyOtherKeys(level) => format!("\x1b[>4;{level}m"),
+        Query::Version => format!("\x1bP>|crow-term({})\x1b\\", env!("CARGO_PKG_VERSION")),
+        Query::SecondaryAttributes => format!("\x1b[>0;{};1c", version_number()),
+        Query::CellSize => format!("\x1b[6;{};{}t", cell.height, cell.width),
+        Query::Termcap(names) => names
+            .iter()
+            .map(|hex| {
+                match hex_decode(hex)
+                    .as_deref()
+                    .and_then(|name| termcap(name, osc52_copy))
+                {
+                    Some(None) => format!("\x1bP1+r{hex}\x1b\\"),
+                    Some(Some(value)) => format!("\x1bP1+r{hex}={}\x1b\\", hex_encode(value)),
+                    None => format!(
+                        "\x1bP0+r{}\x1b\\",
+                        if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            hex.as_str()
+                        } else {
+                            ""
+                        }
+                    ),
+                }
+            })
+            .collect(),
+        Query::StatusString(setting) => match setting.as_slice() {
+            b"m" => format!("\x1bP1$r{}m\x1b\\", current_sgr(term)),
+            b" q" => {
+                let style = term.cursor_style();
+                let base = match style.shape {
+                    CursorShape::Underline => 3,
+                    CursorShape::Beam => 5,
+                    _ => 1,
+                };
+                format!("\x1bP1$r{} q\x1b\\", base + u8::from(!style.blinking))
+            }
+            _ => "\x1bP0$r\x1b\\".to_owned(),
+        },
     }
 }
 
@@ -562,7 +746,7 @@ impl Engine {
         let size = checked_size(size)?;
         ensure!(!spec.program.is_empty(), "shell program is empty");
         let pair = portable_pty::native_pty_system()
-            .openpty(pty_size(size))
+            .openpty(pty_size(size, CellPixels::default()))
             .context("open terminal PTY")?;
         let mut reader = pair.master.try_clone_reader().context("clone PTY reader")?;
         let mut pty_writer = pair.master.take_writer().context("open PTY writer")?;
@@ -583,7 +767,9 @@ impl Engine {
             .context("spawn terminal shell")?;
         drop(pair.slave);
         let (writer, writes) = mpsc::sync_channel(32);
-        let state = Arc::new(Mutex::new(State::new(size, scrollback)));
+        let osc52_copy =
+            theme.is_some_and(|config| config.terminal.osc52 == crate::config::Osc52Mode::Copy);
+        let state = Arc::new(Mutex::new(State::with_osc52(size, scrollback, osc52_copy)));
         let write_error = Arc::new(Mutex::new(None));
         let process = Arc::new(Process {
             child: Mutex::new(Some(child)),
@@ -803,6 +989,11 @@ impl Engine {
         }
     }
     pub fn resize(&self, size: Size) -> Result<()> {
+        self.resize_with_cell(size, None)
+    }
+    /// Resize, optionally updating the cell pixel metrics used for pixel size
+    /// reports (CSI 14 t / 16 t, TIOCSWINSZ pixel fields).
+    pub fn resize_with_cell(&self, size: Size, cell: Option<CellPixels>) -> Result<()> {
         let size = checked_size(size)?;
         // One order for both locks. The reader only locks state, never master.
         let master = self
@@ -813,13 +1004,15 @@ impl Engine {
             .state
             .lock()
             .map_err(|_| anyhow!("terminal state poisoned"))?;
-        if state.size == size {
+        let cell = cell.unwrap_or(state.cell);
+        if state.size == size && state.cell == cell {
             return Ok(());
         }
         master
             .as_ref()
             .context("terminal PTY closed")?
-            .resize(pty_size(size))?;
+            .resize(pty_size(size, cell))?;
+        state.cell = cell;
         state.term.resize(size);
         state.size = size;
         drop(state);
@@ -843,6 +1036,15 @@ impl Engine {
             .lock()
             .map_err(|_| anyhow!("terminal state poisoned"))?
             .snapshot(self.alive()))
+    }
+    /// Latest accepted OSC 52 copy, if any.
+    pub fn clipboard(&self) -> Result<Option<(u64, String)>> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("terminal state poisoned"))?
+            .clipboard
+            .clone())
     }
     pub fn alive(&self) -> bool {
         self.process.alive.load(Ordering::Acquire)
@@ -1036,6 +1238,110 @@ mod tests {
             (cell.underline_style, cell.underline_color),
             (UnderlineStyle::None, None)
         );
+    }
+    fn base64(bytes: &[u8]) -> String {
+        const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                out.push(if i <= chunk.len() {
+                    TABLE[(n >> (18 - 6 * i) & 63) as usize] as char
+                } else {
+                    '='
+                });
+            }
+        }
+        out
+    }
+    #[test]
+    fn terminal_queries_are_answered_in_stream_order() {
+        let mut state = State::with_osc52(Size { rows: 4, cols: 30 }, 0, true);
+        state.cell = CellPixels {
+            width: 9,
+            height: 20,
+        };
+        state.advance(
+            b"\x1b[>q\x1b[>c\x1b[c\x1bP+q5463;524742;536d756c78;536574756c63;5373;5365;4d73;7a7a\x1b\\\x1b[14t\x1b[16t",
+        );
+        let version = env!("CARGO_PKG_VERSION");
+        let number = version_number();
+        let hex = |text: &str| hex_encode(text);
+        assert_eq!(
+            replies(&mut state),
+            [
+                format!("\x1bP>|crow-term({version})\x1b\\"),
+                format!("\x1b[>0;{number};1c"),
+                "\x1b[?6c".to_owned(),
+                format!(
+                    "\x1bP1+r5463\x1b\\\x1bP1+r524742\x1b\\\x1bP1+r536d756c78={}\x1b\\\x1bP1+r536574756c63={}\x1b\\\x1bP1+r5373={}\x1b\\\x1bP1+r5365={}\x1b\\\x1bP1+r4d73={}\x1b\\\x1bP0+r7a7a\x1b\\",
+                    hex("\x1b[4:%p1%dm"),
+                    hex("\x1b[58:2::%p1%{65536}%/%d:%p1%{256}%/%{255}%&%d:%p1%{255}%&%d%;m"),
+                    hex("\x1b[%p1%d q"),
+                    hex("\x1b[2 q"),
+                    hex("\x1b]52;%p1%s;%p2%s\x07"),
+                ),
+                "\x1b[4;80;270t".to_owned(),
+                "\x1b[6;20;9t".to_owned(),
+            ]
+        );
+        state.advance(
+            b"\x1b[1;3;4:3;7;38;2;1;2;3;48;5;200;58:5:9m\x1bP$qm\x1b\\\x1b[0;91m\x1bP$qm\x1b\\",
+        );
+        state.advance(b"\x1b[5 q\x1bP$q q\x1b\\\x1b[2 q\x1bP$q q\x1b\\\x1bP$qr\x1b\\");
+        assert_eq!(
+            replies(&mut state),
+            [
+                "\x1bP1$r0;1;3;4:3;7;38;2;1;2;3;48;5;200;58:5:9m\x1b\\",
+                "\x1bP1$r0;91m\x1b\\",
+                "\x1bP1$r5 q\x1b\\",
+                "\x1bP1$r2 q\x1b\\",
+                "\x1bP0$r\x1b\\",
+            ]
+        );
+    }
+    #[test]
+    fn osc52_copy_is_opt_out_bounded_and_never_readable() {
+        let mut state = State::with_osc52(Size { rows: 2, cols: 20 }, 0, true);
+        state.advance(format!("\x1b]52;c;{}\x07", base64(b"crow copy")).as_bytes());
+        state.events(&mpsc::sync_channel(8).0);
+        assert_eq!(state.clipboard, Some((1, "crow copy".to_owned())));
+        assert_eq!(state.snapshot(true).clipboard_seq, 1);
+        // Read queries are never answered, in any mode.
+        state.advance(b"\x1b]52;c;?\x07\x1b[5n");
+        assert_eq!(replies(&mut state), ["\x1b[0n"]);
+        // Oversized copies are rejected; the previous copy stays.
+        let big = vec![b'a'; MAX_CLIPBOARD + 1];
+        state.advance(format!("\x1b]52;c;{}\x07", base64(&big)).as_bytes());
+        state.events(&mpsc::sync_channel(8).0);
+        assert_eq!(state.clipboard_seq, 1);
+        // "off": no copy and no advertisement.
+        let mut off = State::with_osc52(Size { rows: 2, cols: 20 }, 0, false);
+        off.advance(format!("\x1b]52;c;{}\x07\x1bP+q4d73\x1b\\", base64(b"x")).as_bytes());
+        assert_eq!(replies(&mut off), ["\x1bP0+r4d73\x1b\\"]);
+        assert_eq!(
+            (off.clipboard.clone(), off.snapshot(true).clipboard_seq),
+            (None, 0)
+        );
+    }
+    #[test]
+    fn bell_hyperlinks_and_alternate_scroll_reach_the_snapshot() {
+        let mut state = State::new(Size { rows: 2, cols: 20 }, 0);
+        state.advance(b"\x07\x07\x1b]8;;https://example.com/a\x1b\\ab\x1b]8;;\x1b\\c\x1b]8;id=x;https://example.com/a\x07d");
+        state.events(&mpsc::sync_channel(8).0);
+        let screen = state.snapshot(true);
+        assert_eq!(screen.bell, 2);
+        assert_eq!(screen.links, ["https://example.com/a"]);
+        let links: Vec<_> = screen.cells[0][..4].iter().map(|c| c.link).collect();
+        assert_eq!(links, [Some(0), Some(0), None, Some(0)]);
+        assert!(!screen.modes.alternate_scroll);
+        state.advance(b"\x1b[?1049h");
+        assert!(state.snapshot(true).modes.alternate_scroll);
+        state.advance(b"\x1b[?1007l");
+        assert!(!state.snapshot(true).modes.alternate_scroll);
     }
     fn replies(state: &mut State) -> Vec<String> {
         let (writer, writes) = mpsc::sync_channel(64);

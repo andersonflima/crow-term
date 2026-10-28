@@ -19,7 +19,21 @@ const MAX_HELD: usize = 64 * 1024;
 pub enum Query {
     /// `CSI ? 4 m`: report xterm modifyOtherKeys (current level attached).
     ModifyOtherKeys(u8),
+    /// `CSI > q` / `CSI > 0 q`: XTVERSION.
+    Version,
+    /// `CSI > c` / `CSI > 0 c`: secondary device attributes (the sequence is
+    /// withheld from the parser, which would report its own crate version).
+    SecondaryAttributes,
+    /// `CSI 16 t`: character cell size in pixels.
+    CellSize,
+    /// `DCS + q Pt ST`: XTGETTCAP, hex-encoded capability names.
+    Termcap(Vec<String>),
+    /// `DCS $ q Pt ST`: DECRQSS for the setting named by `Pt`.
+    StatusString(Vec<u8>),
 }
+
+/// Longest DCS query payload examined; longer strings are forwarded as-is.
+const MAX_DCS_QUERY: usize = 4096;
 
 /// Scanner output, in stream order.
 #[derive(Debug)]
@@ -35,6 +49,10 @@ enum State {
     Ground,
     Escape,
     Csi,
+    /// DCS whose payload may still be an XTGETTCAP/DECRQSS query.
+    Dcs,
+    /// Any other DCS string: forwarded until ESC, CAN or SUB.
+    DcsPass,
 }
 
 #[derive(Debug)]
@@ -57,6 +75,8 @@ pub struct Interceptor {
     separators: usize,
     intermediates: usize,
     ignored: bool,
+    /// DCS payload after `ESC P` while it may still be a query.
+    payload: Vec<u8>,
     alt_screen: bool,
     kitty_depth: [u16; 2],
     /// xterm modifyOtherKeys level (0, 1 or 2), not tracked by the VT parser.
@@ -77,6 +97,7 @@ impl Default for Interceptor {
             separators: 0,
             intermediates: 0,
             ignored: false,
+            payload: Vec::new(),
             alt_screen: false,
             kitty_depth: [0; 2],
             modify_other_keys: 0,
@@ -110,6 +131,18 @@ impl Interceptor {
                 }
                 continue;
             }
+            if self.state == State::DcsPass {
+                // Bulk-forward long strings (sixel, tmux passthrough).
+                let end = bytes[index..]
+                    .iter()
+                    .position(|&byte| matches!(byte, ESC | 0x18 | 0x1a))
+                    .map_or(bytes.len(), |offset| index + offset);
+                if end > index {
+                    sink(Out::Bytes(&bytes[index..end]));
+                    index = end;
+                    continue;
+                }
+            }
             let byte = bytes[index];
             index += 1;
             self.byte(byte, sink);
@@ -138,6 +171,7 @@ impl Interceptor {
         self.separators = 0;
         self.intermediates = 0;
         self.ignored = false;
+        self.payload.clear();
     }
 
     fn hold(&mut self, byte: u8) {
@@ -181,13 +215,39 @@ impl Interceptor {
     fn byte(&mut self, byte: u8, sink: &mut impl FnMut(Out<'_>)) {
         match byte {
             ESC => {
+                // ESC terminates a DCS string; the parser then reads the ST.
+                let query = (self.state == State::Dcs)
+                    .then(|| self.dcs_query())
+                    .flatten();
                 self.pass(sink);
+                if let Some(query) = query {
+                    sink(Out::Query(query));
+                }
                 self.begin_escape();
                 return;
             }
             0x18 | 0x1a => {
                 self.hold(byte);
                 self.pass(sink);
+                return;
+            }
+            // Inside a DCS string the parser does not execute C0 controls.
+            _ if self.state == State::DcsPass => {
+                sink(Out::Bytes(&[byte]));
+                return;
+            }
+            _ if self.state == State::Dcs => {
+                self.hold(byte);
+                self.payload.push(byte);
+                let candidate = self.payload.len() > 2
+                    || matches!(self.payload.as_slice(), [b'+' | b'$'] | b"+q" | b"$q");
+                if !candidate || self.payload.len() > MAX_DCS_QUERY {
+                    if !self.overflow {
+                        sink(Out::Bytes(&self.held));
+                    }
+                    self.reset_sequence();
+                    self.state = State::DcsPass;
+                }
                 return;
             }
             // Executed by the parser in every escape/CSI state.
@@ -198,7 +258,9 @@ impl Interceptor {
             _ => {}
         }
         match self.state {
-            State::Ground => unreachable!("ground bytes are handled by scan"),
+            State::Ground | State::Dcs | State::DcsPass => {
+                unreachable!("ground and DCS bytes are handled above")
+            }
             State::Escape => match byte {
                 // The parser ignores DEL and bytes >= 0x80 after ESC and stays
                 // in its escape state: the next byte still starts the sequence.
@@ -206,6 +268,10 @@ impl Interceptor {
                 b'[' => {
                     self.hold(byte);
                     self.state = State::Csi;
+                }
+                b'P' => {
+                    self.hold(byte);
+                    self.state = State::Dcs;
                 }
                 b'c' => {
                     // RIS: the parser resets screens, keyboard stacks and modes.
@@ -262,6 +328,19 @@ impl Interceptor {
         }
     }
 
+    fn dcs_query(&self) -> Option<Query> {
+        let body = self.payload.get(2..)?;
+        match self.payload.get(..2)? {
+            b"+q" => Some(Query::Termcap(
+                body.split(|&byte| byte == b';')
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect(),
+            )),
+            b"$q" => Some(Query::StatusString(body.to_vec())),
+            _ => None,
+        }
+    }
+
     fn dispatch(&mut self, final_byte: u8, sink: &mut impl FnMut(Out<'_>)) {
         if self.overflow {
             self.drop_sequence();
@@ -299,6 +378,21 @@ impl Interceptor {
                 sink(Out::Query(Query::ModifyOtherKeys(self.modify_other_keys)));
                 return;
             }
+            (Some(b'>'), b'q') if first == 0 && params.len() <= 1 => {
+                self.pass(sink);
+                sink(Out::Query(Query::Version));
+                return;
+            }
+            (Some(b'>'), b'c') if first == 0 && params.len() <= 1 => {
+                self.drop_sequence();
+                sink(Out::Query(Query::SecondaryAttributes));
+                return;
+            }
+            (None, b't') if first == 16 && params.len() == 1 => {
+                self.pass(sink);
+                sink(Out::Query(Query::CellSize));
+                return;
+            }
             _ => {}
         }
         self.pass(sink);
@@ -323,7 +417,7 @@ mod tests {
 
     #[test]
     fn ordinary_output_is_forwarded_byte_for_byte_across_chunk_splits() {
-        let input = b"plain \x1b[1;31mred\x1b[0m \x1b]2;title\x07 \x1bP+q4d73\x1b\\ \xe7\x95\x8c\x1b(B\x1b[?1049h\x1b[?1049l";
+        let input = b"plain \x1b[1;31mred\x1b[0m \x1b]2;title\x07 \x1bPq#0;2\x1b\\ \xe7\x95\x8c\x1b(B\x1b[?1049h\x1b[?1049l";
         for split in 0..input.len() {
             let mut interceptor = Interceptor::default();
             let (fed, queries) = run(&mut interceptor, &[&input[..split], &input[split..]]);
@@ -368,6 +462,49 @@ mod tests {
         assert_eq!(interceptor.modify_other_keys, 1);
         run(&mut interceptor, &[b"\x1bc"]);
         assert_eq!(interceptor.modify_other_keys, 0);
+    }
+
+    #[test]
+    fn device_queries_are_recognised_in_order_across_splits() {
+        let input: &[u8] =
+            b"\x1b[>q\x1bP+q5463;536d756c78\x1b\\\x1b[>0c\x1bP$q m\x1b\\\x1b[16t\x1b[c";
+        let expected = vec![
+            Query::Version,
+            Query::Termcap(vec!["5463".into(), "536d756c78".into()]),
+            Query::SecondaryAttributes,
+            Query::StatusString(b" m".to_vec()),
+            Query::CellSize,
+        ];
+        let da2 = input.windows(5).position(|w| w == b"\x1b[>0c").unwrap();
+        let mut forwarded = input.to_vec();
+        forwarded.drain(da2..da2 + 5);
+        for split in 0..input.len() {
+            let mut interceptor = Interceptor::default();
+            let (fed, queries) = run(&mut interceptor, &[&input[..split], &input[split..]]);
+            assert_eq!(queries, expected, "split at {split}");
+            // Only DA2 is withheld from the parser.
+            assert_eq!(fed, forwarded, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn other_dcs_strings_pass_through_without_buffering_or_queries() {
+        let mut interceptor = Interceptor::default();
+        let mut sixel = b"\x1bPq#0;2;0;0;0\x07".to_vec();
+        sixel.extend(std::iter::repeat_n(b'~', 100_000));
+        sixel.extend_from_slice(b"\x1b\\done");
+        let (fed, queries) = run(&mut interceptor, &[&sixel[..50_000], &sixel[50_000..]]);
+        assert_eq!(fed, sixel);
+        assert!(queries.is_empty());
+        assert!(interceptor.held.is_empty());
+        // C0 inside a query string stays inside it (the parser does not ring).
+        let (fed, queries) = run(&mut interceptor, &[b"\x1bP+q\x0754\x1b\\"]);
+        assert_eq!(fed, b"\x1bP+q\x0754\x1b\\");
+        assert_eq!(queries, vec![Query::Termcap(vec!["\x0754".into()])]);
+        // CAN aborts a query string: no answer.
+        let (fed, queries) = run(&mut interceptor, &[b"\x1bP+q5463\x18x"]);
+        assert_eq!(fed, b"\x1bP+q5463\x18x");
+        assert!(queries.is_empty());
     }
 
     #[test]

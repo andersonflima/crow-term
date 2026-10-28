@@ -16,6 +16,7 @@ engineering alpha, not a certification of complete terminal compatibility.
 | Fish/Fisher and zsh | Existing shells plus opt-in offline isolated profiles | `shell/setup.py:1`, pinned licensed sources; real fish/zsh syntax and plugin load tested when installed |
 | Crowquill Ink and Mono | Owner-selected light default, dark example, four embedded OFL faces | `src/config.rs:1`, `assets/`; exact upstream attribution preserved |
 | Underline styles (Neovim diagnostics) | SGR 4:1-4:5 single/double/curly/dotted/dashed and SGR 58/59 underline color carried engine → model → IPC (wire v4) → software renderer (`draw_underline`) | `src/engine.rs` and `src/ui.rs` unit tests, daemon E2E JSON capture; raster geometry is unit-tested, not screenshot-verified on every platform |
+| Terminal queries and events | XTVERSION, XTGETTCAP (Tc/RGB/Smulx/Setulc/Ss/Se, Ms only with OSC 52 copy), DECRQSS (SGR, DECSCUSR), DA2 with the crow-term version, CSI 14t/16t from the GUI's real cell metrics (also TIOCSWINSZ pixels), DEC 1004 focus on pane switch, OSC 8 links kept in the snapshot (not clickable yet), visual bell, DEC 1007 alternate scroll, window title from OSC 0/2 | `src/intercept.rs`, `src/engine.rs` unit tests; GUI behaviours are covered by unit tests of their pure parts, not by native-event automation. Self-generated answers are not delayed by DEC 2026 synchronized output |
 | Ligatures, icons, emojis | Advanced shaping, cell anchoring, fallback, raster cache | UI unit tests verify substitutions and grid alignment; native Mac screenshot verified `->`, `!=`, `===`, accents, CJK, rocket emoji and Nerd Font icon |
 | Crow agent status (owner request) | Footer status line + toggleable agent panel from `crow-skills events snapshot --json`; focused-pane cwd via `PaneCwd` IPC, git branch from `.git/HEAD` | `src/crow.rs` parsing/format/throttle unit tests, `src/engine.rs` cwd test; versioned, tolerant parser; read-only, no prompt content |
 | Lightweight / fast | Native software renderer, no WebView; dirty row/glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented, **no claim of maximum performance or comparative superiority**; GPU rendering remains follow-up |
@@ -127,8 +128,11 @@ patterns before publication; this does not claim a formal full dependency audit.
 notices are cached from immutable official upstream revisions. Two upstream
 source trees omit original license files; their MIT declarations and a labelled
 standard template are explicitly distinguished from original copyright notices.
-OSC52 clipboard access from terminal output is disabled; explicit user clipboard
-shortcuts remain enabled. Nonexistent/unknown config fields fail explicitly.
+OSC 52 from terminal output is copy-only by owner decision (2026-10-28): writes
+are accepted by default (`[terminal] osc52 = "copy"`, opt out with `"off"`),
+capped at 1 MiB, delivered to attached GUIs on demand, and advertised (XTGETTCAP
+`Ms`) only when enabled; clipboard read queries are never answered. Explicit
+user clipboard shortcuts remain enabled. Nonexistent/unknown config fields fail explicitly.
 
 Network: official documentation/crate/upstream sources and the authorized GitHub
 repo/CI. External writes: coordination ledger and memory records; disposable

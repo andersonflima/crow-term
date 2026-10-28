@@ -19,7 +19,8 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// client starts its own daemon and older sessions keep their own.
 /// v3: kitty keyboard flags and modifyOtherKeys level in `Modes`.
 /// v4: underline style and underline color in `Cell`.
-pub const WIRE_VERSION: u32 = 4;
+/// v5: cell pixel metrics on resize, bell count, hyperlinks, alternate scroll.
+pub const WIRE_VERSION: u32 = 5;
 const DEADLINE: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]

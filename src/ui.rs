@@ -930,6 +930,16 @@ struct App {
     sent_sizes: HashMap<u64, Size>,
     /// Keys whose press reached the PTY, so only their release is reported.
     pressed_keys: HashSet<PhysicalKey>,
+    /// Window focus, for DEC 1004 focus reports on pane switches.
+    focused: bool,
+    /// Pane that becomes active before its screen arrives (window switch).
+    pending_focus_in: Option<u64>,
+    /// Last seen bell count / OSC 52 copy sequence per pane.
+    bells: HashMap<u64, u64>,
+    clipboard_seqs: HashMap<u64, u64>,
+    /// Visual bell: panes flashing until the deadline.
+    bell_flash: Option<(Instant, HashSet<u64>)>,
+    window_title: String,
     clipboard: Option<arboard::Clipboard>,
     crow: Option<Arc<crow::Shared>>,
     crow_view: CrowView,
@@ -982,6 +992,12 @@ impl App {
             ime: String::new(),
             sent_sizes: HashMap::new(),
             pressed_keys: HashSet::new(),
+            focused: true,
+            pending_focus_in: None,
+            bells: HashMap::new(),
+            clipboard_seqs: HashMap::new(),
+            bell_flash: None,
+            window_title: String::new(),
             clipboard: None,
             crow,
             crow_view: CrowView::default(),
@@ -1142,7 +1158,18 @@ impl App {
             let size = self.rect_size(rect);
             if self.sent_sizes.get(&pane) != Some(&size) {
                 self.sent_sizes.insert(pane, size);
-                self.send(Request::Resize { pane, size }, false);
+                let cell = CellPixels {
+                    width: self.renderer.cell_width.min(u32::from(u16::MAX)) as u16,
+                    height: self.renderer.cell_height.min(u32::from(u16::MAX)) as u16,
+                };
+                self.send(
+                    Request::Resize {
+                        pane,
+                        size,
+                        cell: Some(cell),
+                    },
+                    false,
+                );
             }
         }
         self.update_ime_position();
@@ -1161,16 +1188,50 @@ impl App {
             );
         }
     }
+    /// Make `pane` the input target, reporting DEC 1004 focus out/in to the
+    /// panes that requested focus events.
+    fn focus_pane(&mut self, pane: u64) {
+        if pane == self.pane_id {
+            return;
+        }
+        let old = self.pane_id;
+        self.pane_id = pane;
+        self.pending_focus_in = None;
+        if !self.focused {
+            return;
+        }
+        if self.screen(old).is_some_and(|s| s.modes.focus_reporting) {
+            self.send(
+                Request::Input {
+                    pane: old,
+                    bytes: b"\x1b[O".to_vec(),
+                },
+                false,
+            );
+        }
+        match self.screen(pane) {
+            Some(screen) if screen.modes.focus_reporting => self.send(
+                Request::Input {
+                    pane,
+                    bytes: b"\x1b[I".to_vec(),
+                },
+                false,
+            ),
+            Some(_) => {}
+            None => self.pending_focus_in = Some(pane),
+        }
+    }
     fn activate_window(&mut self, id: u64) {
         if id == self.window_id {
             return;
         }
         self.window_id = id;
         self.shared_window.store(id, Ordering::Relaxed);
-        if let Some(info) = self.current_window()
-            && let Some(id) = info.layout.panes().first()
+        if let Some(id) = self
+            .current_window()
+            .and_then(|info| info.layout.panes().first().copied())
         {
-            self.pane_id = *id;
+            self.focus_pane(id);
         }
         self.selection = None;
         self.renderer.rows.clear();
@@ -1200,7 +1261,7 @@ impl App {
                 .iter()
                 .position(|(id, _)| *id == self.pane_id)
                 .unwrap_or(0);
-            self.pane_id = rects[(index + 1) % rects.len()].0;
+            self.focus_pane(rects[(index + 1) % rects.len()].0);
         } else if let Some((_, current)) = rects.iter().find(|(id, _)| *id == self.pane_id) {
             let cx = current.x as f64 + current.w as f64 / 2.0;
             let cy = current.y as f64 + current.h as f64 / 2.0;
@@ -1223,8 +1284,8 @@ impl App {
                 })
                 .collect::<Vec<_>>();
             candidates.sort_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((id, _)) = candidates.first() {
-                self.pane_id = *id;
+            if let Some(&(id, _)) = candidates.first() {
+                self.focus_pane(id);
             }
         }
         self.selection = None;
@@ -1532,7 +1593,7 @@ impl App {
             return;
         };
         if state == ElementState::Pressed {
-            self.pane_id = pane;
+            self.focus_pane(pane);
             self.mouse_button = Some(button);
         }
         let modes = self.modes();
@@ -1576,7 +1637,7 @@ impl App {
             return;
         }
         if let Some((pane, point)) = self.point_at(self.cursor.x, self.cursor.y) {
-            self.pane_id = pane;
+            self.focus_pane(pane);
             let modes = self.modes();
             if (modes.mouse_click || modes.mouse_motion || modes.mouse_drag)
                 && !self.mods.shift_key()
@@ -1584,6 +1645,15 @@ impl App {
                 for _ in 0..count.unsigned_abs().min(100) {
                     self.mouse_report_to(pane, if count > 0 { 64 } else { 65 }, point, false);
                 }
+            } else if modes.alternate_scroll && !self.mods.shift_key() {
+                // DEC 1007: on the alternate screen the wheel sends cursor keys.
+                self.send(
+                    Request::Input {
+                        pane,
+                        bytes: alternate_scroll_bytes(count, modes.application_cursor),
+                    },
+                    false,
+                );
             } else {
                 self.selection = None;
                 self.send(
@@ -1594,6 +1664,75 @@ impl App {
                     false,
                 );
             }
+        }
+    }
+    /// Bell, OSC 52 copy and title changes carried by a new view.
+    fn apply_screen_events(&mut self) {
+        let Some(view) = &self.view else {
+            return;
+        };
+        let mut rang = HashSet::new();
+        let mut copies = Vec::new();
+        for (pane, screen) in &view.screens {
+            // A first sighting only records the counters: never replay history.
+            if self
+                .bells
+                .insert(*pane, screen.bell)
+                .is_some_and(|old| old != screen.bell)
+            {
+                rang.insert(*pane);
+            }
+            if self
+                .clipboard_seqs
+                .insert(*pane, screen.clipboard_seq)
+                .is_some_and(|old| old != screen.clipboard_seq)
+            {
+                copies.push(*pane);
+            }
+        }
+        if !rang.is_empty() {
+            self.bell_flash = Some((Instant::now() + Duration::from_millis(150), rang));
+        }
+        for pane in copies {
+            self.send(Request::Clipboard { pane }, false);
+        }
+        let title = match self.screen(self.pane_id).map(|s| s.title.trim()) {
+            Some(title) if !title.is_empty() => format!("{title} — crow-term"),
+            _ => format!("crow-term — {}", self.session),
+        };
+        if title != self.window_title {
+            if let Some(window) = &self.window {
+                window.set_title(&title);
+            }
+            self.window_title = title;
+        }
+        if let Some(pane) = self.pending_focus_in
+            && let Some(screen) = self.screen(pane)
+        {
+            let report = self.focused && pane == self.pane_id && screen.modes.focus_reporting;
+            self.pending_focus_in = None;
+            if report {
+                self.send(
+                    Request::Input {
+                        pane,
+                        bytes: b"\x1b[I".to_vec(),
+                    },
+                    false,
+                );
+            }
+        }
+    }
+    fn store_clipboard(&mut self, text: String) {
+        if self.clipboard.is_none() {
+            self.clipboard = arboard::Clipboard::new().ok();
+        }
+        if self
+            .clipboard
+            .as_mut()
+            .is_none_or(|clipboard| clipboard.set_text(text).is_err())
+        {
+            self.status = "OSC 52 copy could not reach the system clipboard".into();
+            self.redraw();
         }
     }
     fn tab_rects(&self) -> Vec<(u64, Rect)> {
@@ -1638,6 +1777,7 @@ impl App {
             return Ok(());
         };
         let rects = self.rects();
+        let flash_rects = rects.clone();
         let panel_rect = self.panel_rect();
         let tabs = self.tab_rects();
         let windows = self.windows();
@@ -1887,6 +2027,39 @@ impl App {
                 );
             }
         }
+        if let Some((until, panes)) = &self.bell_flash
+            && Instant::now() < *until
+        {
+            let thickness = (2.0 * self.scale).ceil().max(1.0) as u32;
+            for &(pane, rect) in &flash_rects {
+                if !panes.contains(&pane) {
+                    continue;
+                }
+                let rect = rect.intersection(bounds);
+                for edge in [
+                    Rect {
+                        h: thickness,
+                        ..rect
+                    },
+                    Rect {
+                        y: rect.y + rect.h.saturating_sub(thickness) as i32,
+                        h: thickness,
+                        ..rect
+                    },
+                    Rect {
+                        w: thickness,
+                        ..rect
+                    },
+                    Rect {
+                        x: rect.x + rect.w.saturating_sub(thickness) as i32,
+                        w: thickness,
+                        ..rect
+                    },
+                ] {
+                    fill(&mut frame, fw, edge.intersection(bounds), chrome.text);
+                }
+            }
+        }
         let footer_y = size
             .height
             .saturating_sub((FOOTER as f64 * self.scale) as u32) as i32;
@@ -2094,12 +2267,13 @@ impl ApplicationHandler<UiEvent> for App {
                 if let Some(info) = self.current_window() {
                     let panes = info.layout.panes();
                     if !panes.contains(&self.pane_id)
-                        && let Some(id) = panes.first()
+                        && let Some(&id) = panes.first()
                     {
-                        self.pane_id = *id;
+                        self.focus_pane(id);
                         self.selection = None;
                     }
                 }
+                self.apply_screen_events();
                 self.resize_panes();
                 if revision_changed {
                     self.redraw();
@@ -2109,9 +2283,10 @@ impl ApplicationHandler<UiEvent> for App {
                 response,
                 activate_created,
             } => match response {
+                Response::Clipboard(Some((_, text))) => self.store_clipboard(text),
                 Response::Created { window, pane } if activate_created => {
                     self.activate_window(window);
-                    self.pane_id = pane;
+                    self.focus_pane(pane);
                     self.resize_panes();
                     self.redraw();
                 }
@@ -2180,6 +2355,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::MouseInput { state, button, .. } => self.mouse_click(state, button),
             WindowEvent::MouseWheel { delta, .. } => self.wheel(delta),
             WindowEvent::Focused(focused) => {
+                self.focused = focused;
                 if let Some(shared) = &self.crow {
                     shared.focused.store(focused, Ordering::Relaxed);
                     if focused {
@@ -2214,11 +2390,33 @@ impl ApplicationHandler<UiEvent> for App {
             _ => {}
         }
     }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // The visual bell is the only timed redraw; otherwise stay event-driven.
+        match &self.bell_flash {
+            Some((until, _)) if Instant::now() >= *until => {
+                self.bell_flash = None;
+                self.redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            Some((until, _)) => event_loop.set_control_flow(ControlFlow::WaitUntil(*until)),
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.running.store(false, Ordering::Relaxed);
     }
 }
 
+/// Cursor keys for one wheel step on the alternate screen (3 lines per notch).
+fn alternate_scroll_bytes(count: i32, application_cursor: bool) -> Vec<u8> {
+    let key: &[u8] = match (count > 0, application_cursor) {
+        (true, true) => b"\x1bOA",
+        (true, false) => b"\x1b[A",
+        (false, true) => b"\x1bOB",
+        (false, false) => b"\x1b[B",
+    };
+    key.repeat((count.unsigned_abs() as usize).min(100) * 3)
+}
 fn prefix_matches(prefix: &str, key: &Key, mods: ModifiersState) -> bool {
     if prefix.eq_ignore_ascii_case("none")
         || !mods.control_key()
@@ -2620,6 +2818,7 @@ mod tests {
             wide_spacer: false,
             underline_style: UnderlineStyle::None,
             underline_color: None,
+            link: None,
         }
     }
     #[test]
@@ -2819,6 +3018,12 @@ mod tests {
             .collect();
         assert!(red.len() >= 2, "{red:?}");
         assert!(red.iter().all(|&y| y >= height * 2 / 3), "{red:?}");
+    }
+    #[test]
+    fn alternate_scroll_sends_three_cursor_keys_per_notch() {
+        assert_eq!(alternate_scroll_bytes(1, false), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(alternate_scroll_bytes(-1, true), b"\x1bOB\x1bOB\x1bOB");
+        assert_eq!(alternate_scroll_bytes(i32::MIN, false).len(), 100 * 3 * 3);
     }
     #[test]
     fn key_routing_follows_the_application_keyboard_mode() {
@@ -3248,6 +3453,9 @@ mod tests {
             title: String::new(),
             alive: true,
             display_offset: 0,
+            bell: 0,
+            links: Vec::new(),
+            clipboard_seq: 0,
         };
         assert!(mailbox.push(
             1,
