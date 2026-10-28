@@ -39,7 +39,8 @@ class DaemonTests(unittest.TestCase):
                 self.daemon.wait(timeout=5)
 
     def command(self, *args, check=True):
-        result = subprocess.run([str(BIN), "--shell", self.shell, *map(str, args)], env=self.env,
+        shell_options=[] if "--shell" in args else ["--shell",self.shell]
+        result = subprocess.run([str(BIN), *shell_options, *map(str, args)], env=self.env,
                                 capture_output=True, text=True, timeout=12)
         if check and result.returncode:
             raise AssertionError(f"{args}: {result.stderr}")

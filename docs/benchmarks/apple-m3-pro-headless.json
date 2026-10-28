@@ -1,0 +1,55 @@
+{
+  "scope": "indicative headless PTY/parser+CLI polling; NOT rendering/input latency; no comparative gain claim",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "architecture": "arm64",
+  "binary_bytes": 42783184,
+  "warmup_runs": 1,
+  "measured_runs": 5,
+  "lines": 10000,
+  "bytes_per_line": 71,
+  "controls": "fresh private daemon/runtime+empty config, sequential, same binary; shared host background load uncontrolled",
+  "summary": {
+    "daemon_ready_ms": {
+      "min": 7.198042003437877,
+      "median": 7.6476670074043795,
+      "max": 14.215707997209392
+    },
+    "pty_vt_workload_ms": {
+      "min": 40.54662499402184,
+      "median": 40.7732500025304,
+      "max": 42.41416699369438
+    },
+    "daemon_rss_kib": {
+      "min": 31088,
+      "median": 31120,
+      "max": 31136
+    }
+  },
+  "samples": [
+    {
+      "daemon_ready_ms": 7.198042003437877,
+      "pty_vt_workload_ms": 40.7732500025304,
+      "daemon_rss_kib": 31104
+    },
+    {
+      "daemon_ready_ms": 7.315124996239319,
+      "pty_vt_workload_ms": 42.41416699369438,
+      "daemon_rss_kib": 31088
+    },
+    {
+      "daemon_ready_ms": 14.215707997209392,
+      "pty_vt_workload_ms": 40.67212498921435,
+      "daemon_rss_kib": 31136
+    },
+    {
+      "daemon_ready_ms": 7.6476670074043795,
+      "pty_vt_workload_ms": 40.54662499402184,
+      "daemon_rss_kib": 31136
+    },
+    {
+      "daemon_ready_ms": 7.799792001605965,
+      "pty_vt_workload_ms": 42.195250003715046,
+      "daemon_rss_kib": 31120
+    }
+  ]
+}

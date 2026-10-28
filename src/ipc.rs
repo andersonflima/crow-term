@@ -1,9 +1,11 @@
 //! Local-only, length-framed IPC. No TCP listener and no shell interpolation.
 use crate::model::{Request, Response};
 use anyhow::{Context, Result, bail};
+#[cfg(unix)]
+use interprocess::local_socket::GenericFilePath;
 #[cfg(windows)]
 use interprocess::local_socket::GenericNamespaced;
-use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, prelude::*};
+use interprocess::local_socket::{ListenerOptions, Stream, prelude::*};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
     io::{Read, Write},

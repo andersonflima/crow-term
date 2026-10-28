@@ -12,7 +12,7 @@ arch = platform.machine().lower()
 name = f"crow-term-{system}-{arch}"
 dist = root / "dist"
 dest = dist / name
-dest.mkdir(parents=True, exist_ok=True)
+dest.mkdir(parents=True, exist_ok=False) # fail closed rather than merging with old packaging files
 binary = "crow-term.exe" if system == "windows" else "crow-term"
 shutil.copy2(root / "target/release" / binary, dest / binary)
 for directory in ["shell", "assets", "docs"]:
@@ -24,8 +24,10 @@ if system == "macos":
     contents = dest / "Crow Term.app/Contents"
     (contents / "MacOS").mkdir(parents=True, exist_ok=True)
     executable = contents / "MacOS/crow-term"
-    if not executable.exists():
-        executable.symlink_to("../../../crow-term")
+    # A real executable inside the bundle is required for native macOS app discovery.
+    shutil.move(str(dest / binary), executable)
+    (dest / binary).symlink_to("Crow Term.app/Contents/MacOS/crow-term")
+    (contents / "MacOS/shell").symlink_to("../../../shell", target_is_directory=True)
     with (contents / "Info.plist").open("wb") as file:
         plistlib.dump({"CFBundleName": "Crow Term", "CFBundleDisplayName": "Crow Term",
                       "CFBundleIdentifier": "dev.crow.crow-term", "CFBundleExecutable": "crow-term",
