@@ -226,6 +226,27 @@ class DaemonTests(DaemonHarness):
         self.eventually(lambda: self.output_line(pane,"CROW_TMUX_DETACHED"))
 
 
+class UnresponsiveDaemonTests(DaemonHarness):
+    @unittest.skipIf(os.name == "nt", "SIGSTOP")
+    def test_a_frozen_daemon_is_never_replaced(self):
+        """A live daemon that does not answer (here: SIGSTOP) keeps its socket and
+        sessions; a CLI call waits and fails instead of starting a second one."""
+        import signal
+        pane = self.rpc("new-session", "keep")["Created"]["pane"]
+        os.kill(self.daemon.pid, signal.SIGSTOP)
+        try:
+            result = subprocess.run([str(BIN), "list-sessions"], env=self.env, capture_output=True,
+                                    text=True, timeout=60)
+        finally:
+            os.kill(self.daemon.pid, signal.SIGCONT)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not answering", result.stderr)
+        sessions = self.rpc("list-sessions")["View"]["sessions"]
+        self.assertEqual([s["name"] for s in sessions], ["keep"], "the original daemon still serves")
+        self.assertIsNone(self.daemon.poll())
+        self.assertTrue(self.capture(pane) is not None)
+
+
 class DebugEncodeKeyTests(unittest.TestCase):
     def test_key_encoding_aid_never_starts_a_daemon(self):
         with tempfile.TemporaryDirectory(prefix="crow-e2e-") as temp:

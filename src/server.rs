@@ -15,18 +15,41 @@ use std::{
 /// `<runtime>/test-stall-watch-ms` exists, the next Watch removes it and sleeps
 /// that long, simulating a daemon that is alive but slow to answer.
 #[cfg(feature = "test-hooks")]
-fn stall_for_tests() {
-    let Ok(path) = ipc::runtime_dir().map(|dir| dir.join("test-stall-watch-ms")) else {
+fn stall_for_tests(session: &str) {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let Ok(path) = ipc::runtime_dir().map(|dir| dir.join("test-stall-watch")) else {
         return;
     };
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && std::fs::remove_file(&path).is_ok()
-        && let Ok(ms) = text.trim().parse::<u64>()
-    {
-        eprintln!("crow-term daemon: test hook stalls this Watch for {ms} ms");
-        std::thread::sleep(Duration::from_millis(ms.min(60_000)));
-    }
+    // "<ms> <count> <session>": the next <count> Watches of <session> stall.
+    let ms = {
+        let _guard = LOCK.lock();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let mut parts = text.split_whitespace();
+        let (Some(Ok(ms)), Some(Ok(count)), Some(target)) = (
+            parts.next().map(str::parse::<u64>),
+            parts.next().map(str::parse::<u32>),
+            parts.next(),
+        ) else {
+            return;
+        };
+        if target != session || count == 0 {
+            return;
+        }
+        if count == 1 {
+            let _ = std::fs::remove_file(&path);
+        } else {
+            let _ = std::fs::write(&path, format!("{ms} {} {target}", count - 1));
+        }
+        ms
+    };
+    eprintln!("crow-term daemon: test hook stalls a Watch of {session} for {ms} ms");
+    std::thread::sleep(Duration::from_millis(ms.min(60_000)));
 }
+
+/// Concurrent client connections served; further clients wait to be accepted.
+const MAX_CLIENTS: usize = 256;
 
 /// Requests slower than this are logged to daemon.log with their cause.
 const SLOW: Duration = Duration::from_millis(500);
@@ -173,7 +196,7 @@ impl Server {
             } => {
                 self.signals.wait(since);
                 #[cfg(feature = "test-hooks")]
-                stall_for_tests();
+                stall_for_tests(&session);
                 let started = std::time::Instant::now();
                 let view = self.view(Some(&session), window, Some(since))?;
                 let elapsed = started.elapsed();
@@ -387,6 +410,10 @@ impl Server {
                 registry.panes.clear();
                 registry.sessions.clear();
                 registry.profiles.clear();
+                // GUIs must not restart a daemon the user stopped on purpose.
+                if let Ok(dir) = ipc::runtime_dir() {
+                    let _ = std::fs::write(dir.join(ipc::STOPPED_MARKER), b"stopped\n");
+                }
                 self.stopped.store(true, Ordering::Release);
             }
         }
@@ -417,6 +444,10 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 pub fn run(config: Config) -> Result<()> {
+    // Held for the daemon's whole life: starters use it to tell a live but
+    // unresponsive daemon from a dead one (never replace a live daemon).
+    let _alive = ipc::hold_daemon_lock()?;
+    let _ = std::fs::remove_file(ipc::runtime_dir()?.join(ipc::STOPPED_MARKER));
     let listener = ipc::listen()?;
     let server = Arc::new(Server::new(&config));
     let active = Arc::new(AtomicUsize::new(0));
@@ -426,9 +457,12 @@ pub fn run(config: Config) -> Result<()> {
                 if server.stopped.load(Ordering::Acquire) {
                     break;
                 }
-                if active.load(Ordering::Acquire) >= 64 {
-                    drop(stream);
-                    continue;
+                // At capacity, wait for a slot instead of dropping the client
+                // (a dropped request looks like a broken link to the GUI).
+                while active.load(Ordering::Acquire) >= MAX_CLIENTS
+                    && !server.stopped.load(Ordering::Acquire)
+                {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 let server = server.clone();
                 let active = active.clone();
@@ -450,8 +484,22 @@ pub fn run(config: Config) -> Result<()> {
                             .handle(request)
                             .unwrap_or_else(|e| Response::Error(format!("{e:#}")));
                         let started = std::time::Instant::now();
-                        let written =
-                            ipc::write_frame(&mut stream, &response).context("write IPC response");
+                        let written = match ipc::write_frame(&mut stream, &response) {
+                            // Too large to send (e.g. a giant multi-pane window):
+                            // answer with an error the GUI can show, never a cut stream.
+                            Err(error) if error.to_string().contains("exceeds limit") => {
+                                eprintln!("crow-term daemon: reply too large: {error:#}");
+                                ipc::write_frame(
+                                    &mut stream,
+                                    &Response::Error(
+                                        "This window's screen is too large to send (16 MiB IPC limit)"
+                                            .into(),
+                                    ),
+                                )
+                            }
+                            other => other,
+                        }
+                        .context("write IPC response");
                         if started.elapsed() > SLOW {
                             eprintln!(
                                 "crow-term daemon: sending a reply took {} ms (slow or stalled client)",

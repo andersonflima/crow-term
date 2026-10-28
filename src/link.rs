@@ -22,6 +22,23 @@ impl std::error::Error for Unreachable {
     }
 }
 
+/// The request never reached the daemon (connect, authentication or writing
+/// failed): retrying cannot duplicate it.
+#[derive(Debug)]
+pub struct NotSent(pub anyhow::Error);
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.0)
+    }
+}
+impl std::error::Error for NotSent {}
+
+pub fn not_sent(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<NotSent>() || cause.is::<Unreachable>())
+}
+
 /// The daemon answered, with an error (e.g. the session no longer exists).
 #[derive(Debug)]
 pub struct Refused(pub String);

@@ -281,7 +281,9 @@ impl State {
                 cell.c.to_string()
             };
             if !hidden && let Some(zero) = cell.zerowidth() {
-                text.extend(zero);
+                // Bounded: unlimited combining marks on one cell would make a
+                // snapshot exceed the IPC frame limit (alacritty does not cap).
+                text.extend(zero.iter().take(MAX_ZEROWIDTH));
             }
             row.push(Cell {
                 text,
@@ -492,6 +494,9 @@ fn current_sgr(term: &Term<Events>) -> String {
 }
 
 /// OSC 52 copies are accepted unless the daemon config turns them off.
+/// Combining characters kept per cell in snapshots.
+const MAX_ZEROWIDTH: usize = 16;
+
 fn osc52_copy_enabled(config: Option<&crate::config::Config>) -> bool {
     config.is_some_and(|config| config.terminal.osc52 == crate::config::Osc52Mode::Copy)
 }

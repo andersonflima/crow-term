@@ -422,13 +422,64 @@ pub fn write_frame(writer: &mut impl Write, value: &impl Serialize) -> Result<()
     Ok(())
 }
 
+/// Written by the daemon when it is stopped on purpose (`crow-term stop`).
+pub const STOPPED_MARKER: &str = "daemon.stopped";
+const ALIVE_LOCK: &str = "daemon.alive";
+
+/// Take the daemon's lifetime lock (held until the process exits).
+pub fn hold_daemon_lock() -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(runtime_dir()?.join(ALIVE_LOCK))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            bail!("A Crow daemon is already running for this runtime directory")
+        }
+        Err(std::fs::TryLockError::Error(error)) => Err(error).context("lock daemon lifetime file"),
+    }
+}
+
+/// Whether a daemon process holds the lifetime lock (alive, even if it does not
+/// answer or accept right now).
+pub fn daemon_alive() -> bool {
+    let Ok(file) = runtime_dir().and_then(|dir| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(ALIVE_LOCK))
+            .map_err(Into::into)
+    }) else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 pub fn rpc(request: &Request) -> Result<Response> {
-    let stream = Stream::connect(socket_name()?)
-        .map_err(|error| anyhow::Error::new(crate::link::Unreachable(error)))?;
-    check_peer(&stream).context("authenticate IPC server")?;
-    prepare(&stream).context("configure client IPC stream")?;
+    let stream = Stream::connect(socket_name()?).map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+        ) {
+            anyhow::Error::new(crate::link::Unreachable(error))
+        } else {
+            anyhow::Error::new(crate::link::NotSent(error.into()))
+        }
+    })?;
+    let not_sent = |error: anyhow::Error| anyhow::Error::new(crate::link::NotSent(error));
+    check_peer(&stream)
+        .context("authenticate IPC server")
+        .map_err(not_sent)?;
+    prepare(&stream)
+        .context("configure client IPC stream")
+        .map_err(not_sent)?;
     let mut stream = FramedStream::new(stream);
-    write_frame(&mut stream, request).context("write IPC request")?;
+    write_frame(&mut stream, request)
+        .context("write IPC request")
+        .map_err(not_sent)?;
     let response = read_frame(&mut stream).context("read IPC response")?;
     if let Response::Error(message) = response {
         return Err(anyhow::Error::new(crate::link::Refused(message)));
@@ -440,6 +491,32 @@ pub fn rpc(request: &Request) -> Result<Response> {
 /// none accepts connections. A daemon that is merely slow to answer is never
 /// replaced (that would orphan its sessions): its replies are awaited.
 pub fn ensure_daemon(config: Option<&std::path::Path>) -> Result<()> {
+    start_daemon(config, true)
+}
+
+/// Like [`ensure_daemon`], for a GUI whose daemon disappeared: it never starts
+/// one while a daemon process is alive, nor after `crow-term stop`.
+pub fn restart_daemon(config: Option<&std::path::Path>) -> Result<()> {
+    start_daemon(config, false)
+}
+
+/// Why a GUI must not restart the daemon.
+#[derive(Debug)]
+pub enum NoRestart {
+    StoppedOnPurpose,
+    StillAlive,
+}
+impl std::fmt::Display for NoRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoRestart::StoppedOnPurpose => "the daemon was stopped with `crow-term stop`",
+            NoRestart::StillAlive => "the daemon process is alive but not accepting connections",
+        })
+    }
+}
+impl std::error::Error for NoRestart {}
+
+fn start_daemon(config: Option<&std::path::Path>, user_command: bool) -> Result<()> {
     use crate::link::{Failure, classify};
     use std::process::{Command, Stdio};
     let busy_until = Instant::now() + Duration::from_secs(20);
@@ -454,6 +531,9 @@ pub fn ensure_daemon(config: Option<&std::path::Path>) -> Result<()> {
         }
     }
     let runtime = runtime_dir()?;
+    if !user_command && runtime.join(STOPPED_MARKER).exists() {
+        return Err(NoRestart::StoppedOnPurpose.into());
+    }
     // One starter at a time per runtime directory (several GUIs or CLIs can
     // notice a stopped daemon together): removing a stale socket must never
     // race with another starter's fresh one.
@@ -466,10 +546,23 @@ pub fn ensure_daemon(config: Option<&std::path::Path>) -> Result<()> {
     if rpc(&Request::List).is_ok() {
         return Ok(());
     }
+    // A live daemon that refuses connections (full accept backlog, stopped by a
+    // debugger) keeps its socket and sessions: wait for it, never replace it.
+    let alive_until = Instant::now() + Duration::from_secs(20);
+    while daemon_alive() {
+        if !user_command || Instant::now() >= alive_until {
+            return Err(NoRestart::StillAlive.into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        if rpc(&Request::List).is_ok() {
+            return Ok(());
+        }
+    }
+    let _ = std::fs::remove_file(runtime.join(STOPPED_MARKER));
     #[cfg(unix)]
     {
-        // Nothing accepts connections here (checked under the lock): the socket
-        // file is left over from a daemon that did not exit cleanly.
+        // No daemon process holds the lifetime lock (checked under the start
+        // lock): the socket file is left over from one that did not exit cleanly.
         let socket = runtime.join(socket_file());
         if socket.exists() {
             match Stream::connect(socket_name()?) {

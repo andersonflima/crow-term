@@ -540,50 +540,58 @@ def j9_reattach(ctx):
 
 
 def link_gui(ctx):
-    """The GUI still attached after J9 (Neovim) or the fixture GUI, with its pane."""
-    for gui in (ctx.nvim_gui, ctx.fixture_gui):
+    """The GUI still attached after J9 (Neovim) or the fixture GUI, with its
+    session and pane."""
+    for gui, session in ((ctx.nvim_gui, "nvim"), (ctx.fixture_gui, "fixture")):
         if gui is not None and gui.alive():
             frame = gui.wait_frame(lambda m, i: m["revision"] > 0, what="frame before the link journey")
-            return gui, frame[1]["pane"]
+            return gui, session, frame[1]["pane"]
     raise Skip("no GUI left attached by the earlier journeys")
 
 
 LINK_FAILURE_WORDS = ("disconnect", "stopped", "could not")
 
 
-@journey("J11", "a daemon that stalls 7 s is waited for, never reported as disconnected")
+@journey("J11", "a daemon that keeps stalling is waited for, never reported as disconnected")
 def j11_stall(ctx):
-    gui, pane = link_gui(ctx)
+    gui, session, pane = link_gui(ctx)
     before = gui.frame()[1]["revision"]
-    stall = ctx.run.runtime / "test-stall-watch-ms"
-    stall.write_text("7000")
-    statuses = set()
-    until = time.monotonic() + 9
-    while time.monotonic() < until:
+    # Five consecutive Watches of this GUI's session stall 6 s each: every one
+    # exceeds the 5 s deadline, so the "busy" path is exercised, not skipped.
+    stall = ctx.run.runtime / "test-stall-watch"
+    stall.write_text(f"6000 5 {session}")
+    statuses = []
+    until = time.monotonic() + 45
+    while time.monotonic() < until and stall.exists():
         if not gui.alive():
             raise AssertionError(f"GUI exited during the stall: {gui.read_log()}")
         current = gui.frame()
-        if current:
-            statuses.add(current[1]["status"])
+        if current and (not statuses or statuses[-1] != current[1]["status"]):
+            statuses.append(current[1]["status"])
         time.sleep(0.1)
     if stall.exists():
-        raise AssertionError("the daemon never ran the stalled Watch (test hook missing?)")
+        raise AssertionError("the daemon did not stall this GUI's Watches (test hook missing?)")
     marker = "LINK_RECOVERED"
     ctx.run.send_keys(pane, f"\x1bo{marker}\x1b" if ctx.nvim_gui is gui else f"echo {marker}\r")
-    frame = gui.wait_frame(lambda m, i: m["revision"] > before and m["status"] == "", timeout=15,
-                           what="frame with new content after the stall")
+    frame = gui.wait_frame(lambda m, i: m["revision"] > before and m["status"] == "", timeout=30,
+                           what="frame with new content after the stalls")
+    for current in [frame[1]["status"]]:
+        if current and current not in statuses:
+            statuses.append(current)
     if marker not in ctx.run.capture(pane):
         raise AssertionError("pane content after the stall not on screen")
     bad = [s for s in statuses if any(word in s.lower() for word in LINK_FAILURE_WORDS)]
     if bad:
-        raise AssertionError(f"status line reported a link failure during a slow reply: {bad}")
-    shown = sorted(s for s in statuses if s)
-    return f"7 s stall absorbed; statuses seen {shown or ['(none)']}; new content drawn after it", [ctx.save_frame("j11-after-stall", frame)]
+        raise AssertionError(f"status line reported a link failure while the daemon was only slow: {bad}")
+    if not any("busy" in s.lower() for s in statuses):
+        raise AssertionError(f"30 s of stalls never showed the busy note: {statuses}")
+    shown = [s for s in statuses if s]
+    return f"5 x 6 s stalls absorbed; status sequence {shown}; new content drawn after them", [ctx.save_frame("j11-after-stall", frame)]
 
 
 @journey("J12", "a daemon that dies is restarted and the GUI reattaches by itself")
 def j12_restart(ctx):
-    gui, pane = link_gui(ctx)
+    gui, _, pane = link_gui(ctx)
     ctx.run.daemon.kill()
     ctx.run.daemon.wait(timeout=10)
     frame = gui.wait_frame(lambda m, i: "restarted" in m["status"] and m["revision"] > 0,
@@ -595,8 +603,21 @@ def j12_restart(ctx):
             f"(sessions {sessions}); status: {frame[1]['status']!r}"), [ctx.save_frame("j12-restarted", frame)]
 
 
+@journey("J13", "crow-term stop is respected: the GUI does not restart a stopped daemon")
+def j13_stop(ctx):
+    gui, _, _ = link_gui(ctx)
+    ctx.run.cli("stop", "--force", check=True)
+    frame = gui.wait_frame(lambda m, i: "crow-term stop" in m["status"], timeout=30,
+                           what="frame saying the daemon was stopped on purpose")
+    time.sleep(3)
+    doctor = ctx.run.cli("doctor").stdout
+    if "daemon: running" in doctor:
+        raise AssertionError("a GUI restarted the daemon after crow-term stop")
+    return f"status {frame[1]['status']!r}; no daemon restarted", [ctx.save_frame("j13-stopped", frame)]
+
+
 JOURNEYS = [j1_launch, j2_text, j3_split, j4_resize, j5_nvim_edit, j6_paste, j7_mouse, j8_focus, j10_chords, j9_reattach,
-            j11_stall, j12_restart]
+            j11_stall, j12_restart, j13_stop]
 
 
 def summary_markdown(ctx):

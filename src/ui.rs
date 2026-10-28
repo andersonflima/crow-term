@@ -127,6 +127,28 @@ fn execute_request(
     Ok(Response::Ok)
 }
 
+/// One request, retried while the link is only slow: a command never fails
+/// because the daemon was busy for a moment. Input is retried only when it
+/// certainly did not reach the daemon, so a keystroke is never doubled.
+fn rpc_patiently(request: &Request, input: bool, running: &AtomicBool) -> Result<Response> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut attempt = 0u32;
+    loop {
+        match rpc(request) {
+            Err(error)
+                if !crate::link::refused(&error)
+                    && (!input || crate::link::not_sent(&error))
+                    && Instant::now() < deadline
+                    && running.load(Ordering::Relaxed) =>
+            {
+                attempt += 1;
+                thread::sleep(Duration::from_millis((50 * u64::from(attempt)).min(500)));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Start a new daemon after the previous one stopped and recreate the session
 /// in it (the old daemon's programs ended with it).
 fn restart_daemon(
@@ -134,7 +156,12 @@ fn restart_daemon(
     session: &str,
     shell: &ShellSpec,
 ) -> Result<(u64, u64)> {
-    crate::ipc::ensure_daemon(config)?;
+    crate::ipc::restart_daemon(config)?;
+    recreate_session(session, shell)
+}
+
+/// Create (or find) the session in the running daemon.
+fn recreate_session(session: &str, shell: &ShellSpec) -> Result<(u64, u64)> {
     match rpc(&Request::Ensure {
         session: session.to_owned(),
         shell: shell.clone(),
@@ -172,7 +199,10 @@ pub fn run(
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => break,
                 };
-                let event = match execute_request(&command.request, rpc) {
+                let input = matches!(command.request, Request::Input { .. });
+                let event = match execute_request(&command.request, |request| {
+                    rpc_patiently(request, input, &command_running)
+                }) {
                     Ok(response) => UiEvent::Reply {
                         response,
                         activate_created: command.activate_created,
@@ -198,6 +228,10 @@ pub fn run(
             // A slow reply is never a disconnect; only a daemon that stopped
             // accepting connections is reported, restarted and reattached.
             let mut link = crate::link::Link::default();
+            // Set by any failed exchange: a session missing from the daemon's
+            // reply afterwards means the daemon was restarted (possibly by
+            // another GUI), not that the user closed it.
+            let mut recovering = false;
             while watch_running.load(Ordering::Relaxed) {
                 let cycle_started = Instant::now();
                 let window = watch_window.load(Ordering::Relaxed);
@@ -210,7 +244,37 @@ pub fn run(
                     window,
                     since,
                 }) {
+                    Ok(Response::View(view))
+                        if recovering && !view.sessions.iter().any(|s| s.name == watch_session) =>
+                    {
+                        match recreate_session(&watch_session, &watch_shell) {
+                            Ok((window, pane)) => {
+                                recovering = false;
+                                link = crate::link::Link::default();
+                                watch_window.store(window, Ordering::Relaxed);
+                                previous_window = window;
+                                since = 0;
+                                if proxy
+                                    .send_event(UiEvent::Reattached { window, pane })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                let _ = proxy.send_event(UiEvent::Link {
+                                    status: Some(format!(
+                                        "Session could not be recreated ({error:#}); retrying"
+                                    )),
+                                    expires: false,
+                                });
+                                thread::sleep(Duration::from_secs(1));
+                            }
+                        }
+                        continue;
+                    }
                     Ok(Response::View(view)) => {
+                        recovering = false;
                         if let Some(note) = link.ok()
                             && proxy
                                 .send_event(UiEvent::Link {
@@ -238,12 +302,15 @@ pub fn run(
                         break;
                     }
                     // The daemon answered with an error (e.g. the session ended).
+                    // The daemon answered with an error: show it and keep watching.
                     Err(error) if crate::link::refused(&error) => {
                         let _ = proxy.send_event(UiEvent::Error(format!("{error:#}")));
-                        break;
+                        thread::sleep(Duration::from_secs(2));
+                        continue;
                     }
                     Err(error) => match link.failed(crate::link::classify(&error)) {
                         crate::link::Action::Retry { after, status } => {
+                            recovering = true;
                             if let Some(status) = status {
                                 eprintln!("crow-term: daemon slow to answer: {error:#}");
                                 let _ = proxy.send_event(UiEvent::Link {
@@ -254,7 +321,19 @@ pub fn run(
                             thread::sleep(after);
                             continue;
                         }
+                        crate::link::Action::Restart { .. } if crate::ipc::daemon_alive() => {
+                            // Refusing connections while its process lives (full
+                            // backlog, paused): busy, never "stopped".
+                            recovering = true;
+                            let _ = proxy.send_event(UiEvent::Link {
+                                status: Some(crate::link::BUSY.into()),
+                                expires: false,
+                            });
+                            thread::sleep(Duration::from_millis(500));
+                            continue;
+                        }
                         crate::link::Action::Restart { status } => {
+                            recovering = true;
                             let _ = proxy.send_event(UiEvent::Link {
                                 status: Some(status),
                                 expires: false,
@@ -277,15 +356,35 @@ pub fn run(
                                         break;
                                     }
                                 }
-                                Err(error) => {
-                                    let _ = proxy.send_event(UiEvent::Link {
-                                        status: Some(format!(
-                                            "Daemon could not be restarted ({error:#}); retrying"
-                                        )),
-                                        expires: false,
-                                    });
-                                    thread::sleep(Duration::from_secs(2));
-                                }
+                                Err(error) => match error.downcast_ref::<crate::ipc::NoRestart>() {
+                                    // Alive but not accepting right now: it is busy, not gone.
+                                    Some(crate::ipc::NoRestart::StillAlive) => {
+                                        let _ = proxy.send_event(UiEvent::Link {
+                                            status: Some(crate::link::BUSY.into()),
+                                            expires: false,
+                                        });
+                                        thread::sleep(Duration::from_millis(500));
+                                    }
+                                    Some(crate::ipc::NoRestart::StoppedOnPurpose) => {
+                                        let _ = proxy.send_event(UiEvent::Link {
+                                            status: Some(
+                                                "The daemon was stopped (crow-term stop): its sessions ended. Run crow-term to start again."
+                                                    .into(),
+                                            ),
+                                            expires: false,
+                                        });
+                                        break;
+                                    }
+                                    None => {
+                                        let _ = proxy.send_event(UiEvent::Link {
+                                            status: Some(format!(
+                                                "Daemon could not be restarted ({error:#}); retrying"
+                                            )),
+                                            expires: false,
+                                        });
+                                        thread::sleep(Duration::from_secs(2));
+                                    }
+                                },
                             }
                             continue;
                         }
