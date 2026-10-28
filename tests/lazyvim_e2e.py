@@ -196,6 +196,13 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
                 # through the terminal, so attach explicitly if it has not.
                 self.eventually(signed, timeout=10)
             except AssertionError:
+                # Only a detached gitsigns may be attached by hand: if it already
+                # tracks the change, a missing sign is a terminal defect.
+                tracked = self.report(
+                    "vim.b.gitsigns_status_dict ~= nil and ((vim.b.gitsigns_status_dict.changed or 0)"
+                    " + (vim.b.gitsigns_status_dict.added or 0)) > 0")
+                if tracked:
+                    raise AssertionError(f"gitsigns tracks the change but no sign is drawn:\n{last[0]}") from None
                 self.ex("Gitsigns attach")
                 try:
                     self.eventually(signed, timeout=20)

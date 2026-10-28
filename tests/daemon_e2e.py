@@ -48,7 +48,12 @@ class DaemonHarness(unittest.TestCase):
         # autostarts one (with the default config) if it wins the race against
         # this daemon's bind, and the test would then talk to the wrong daemon.
         self.eventually(lambda: "daemon: running" in self.command("doctor").stdout, timeout=15)
-        self.assertIsNone(self.daemon.poll(), f"test daemon exited: {self.log.read()}")
+        self.assertIsNone(self.daemon.poll(), f"test daemon exited: {self.daemon_log()}")
+
+    def daemon_log(self):
+        """The daemon's log so far (the shared handle's offset is at its end)."""
+        self.log.flush()
+        return (self.runtime / "test-daemon.log").read_text(errors="replace")[-4000:]
 
     def daemon_args(self):
         """Extra global CLI arguments for the daemon (e.g. --config)."""
@@ -87,7 +92,7 @@ class DaemonHarness(unittest.TestCase):
             time.sleep(0.03)
         self.log.flush()
         self.log.seek(0)
-        raise AssertionError(f"Condition timed out: {error}; daemon: {self.log.read()}")
+        raise AssertionError(f"Condition timed out: {error}; daemon: {self.daemon_log()}")
 
     def capture(self, pane):
         return self.command("capture-pane", pane).stdout
