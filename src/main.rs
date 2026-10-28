@@ -279,8 +279,17 @@ fn main() -> Result<()> {
                     "not connected"
                 }
             );
+            println!("renderer: native software framebuffer; OpenType shaping; no WebView");
             println!(
-                "renderer: native software framebuffer; OpenType shaping; no WebView; OSC52 disabled"
+                "osc52: {} (terminal output may {}; reading the clipboard is never allowed)",
+                match config.terminal.osc52 {
+                    crow_term::config::Osc52Mode::Copy => "copy",
+                    crow_term::config::Osc52Mode::Off => "off",
+                },
+                match config.terminal.osc52 {
+                    crow_term::config::Osc52Mode::Copy => "set the clipboard",
+                    crow_term::config::Osc52Mode::Off => "not access the clipboard",
+                }
             );
             return Ok(());
         }
