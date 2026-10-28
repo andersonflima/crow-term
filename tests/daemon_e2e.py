@@ -116,6 +116,10 @@ class DaemonTests(unittest.TestCase):
         result=subprocess.run([str(BIN),"shell-setup","--dry-run"],cwd=untrusted,env=self.env,capture_output=True,text=True,timeout=10)
         self.assertNotEqual(result.returncode,0)
         self.assertNotIn("UNTRUSTED_CWD_SCRIPT_EXECUTED",result.stdout)
+        # Forwarded --shell belongs to setup.py, not the terminal's root shell override.
+        result=subprocess.run([str(BIN),"shell-setup","--source",str(ROOT),"--shell","fish","--prefix",str(self.runtime/"profile"),"--dry-run"],env=self.env,capture_output=True,text=True,timeout=10)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertFalse((self.runtime/"profile").exists())
 
     @unittest.skipIf(os.name == "nt", "POSIX shell fixture; Windows uses separate PowerShell smoke")
     def test_pid_survives_clients_and_vt_truecolor_unicode(self):

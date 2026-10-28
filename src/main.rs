@@ -14,7 +14,7 @@ struct Cli {
     config: Option<PathBuf>,
     #[arg(long, global = true, default_value = "main")]
     session: String,
-    #[arg(long, global = true)]
+    #[arg(long)]
     shell: Option<String>,
     #[arg(long, global = true)]
     cwd: Option<PathBuf>,
