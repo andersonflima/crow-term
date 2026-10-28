@@ -93,9 +93,11 @@ machine, and prefix `a` toggles an agent list panel:
   context/tokens, cost, subagents) and a summary line.
 - Data comes from `crow-skills events snapshot --json` (`crow-snapshot/1`), run on
   a worker thread with at most one call in flight, only when crow's state files
-  change or the data is stale (15 s while agents work, 60 s idle, 4x slower while
-  the window is unfocused), with a 5 s timeout, a 2 MiB output cap, exponential
-  back-off on failure and bounded row counts. Unknown fields and newer minor
+  change (at most every 5 s while agents work) or the data is stale (15 s while
+  agents work, 60 s idle; 4x slower while the window is unfocused), with a 5 s
+  timeout that kills the launcher's whole process group, a 2 MiB output cap,
+  exponential back-off on failure and bounded row counts. One call costs about
+  0.14 s CPU (crow-skills is node + python). Unknown fields and newer minor
   versions are ignored; an unknown major version is shown as `crow ?`. The source
   never contains prompt, message or tool I/O text.
 - Without `crow-skills` the crow segments are hidden (the branch remains).

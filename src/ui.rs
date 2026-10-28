@@ -37,6 +37,8 @@ const PADDING: f32 = 10.0;
 /// Crow panel: logical width when docked right, logical line height.
 const PANEL_WIDTH: f32 = 380.0;
 const PANEL_LINE: f32 = 18.0;
+/// Rows of the bottom-docked panel (capped at 2/5 of the window height).
+const PANEL_ROWS: f32 = 12.0;
 
 #[derive(Debug)]
 enum UiEvent {
@@ -217,8 +219,10 @@ pub fn run(
             running.clone(),
             initial_pane,
             |pane| match rpc(&Request::PaneCwd { pane }) {
-                Ok(Response::Cwd(cwd)) => cwd,
-                _ => None,
+                Ok(Response::Cwd(cwd)) => Ok(cwd),
+                // e.g. the pane just closed: not a protocol failure.
+                Ok(Response::Error(_)) => Ok(None),
+                _ => Err(()),
             },
             move |view| crow_proxy.send_event(UiEvent::Crow(Box::new(view))).is_ok(),
         ) {
@@ -918,8 +922,8 @@ impl App {
         let footer = (FOOTER * scale).round() as u32;
         let available = size.height.saturating_sub(top + footer);
         if self.config.crow.panel_position == "bottom" {
-            let lines = self.crow_view.panel.len().max(1) as f32 + 1.0;
-            let h = ((lines * PANEL_LINE + 2.0 * PADDING) * scale) as u32;
+            // Fixed height: content changes must never resize (SIGWINCH) the panes.
+            let h = ((PANEL_ROWS * PANEL_LINE + 2.0 * PADDING) * scale) as u32;
             let h = h.min(available * 2 / 5);
             if available.saturating_sub(h) < (120.0 * scale) as u32 {
                 return None;
@@ -1805,23 +1809,47 @@ impl App {
             )
         };
         let light = light_background(&self.config);
-        let mut hint_x = (12.0 * self.scale) as i32;
-        if !self.prefix && !self.crow_view.status.is_empty() {
-            let gap = (16.0 * self.scale) as i32;
-            for segment in &self.crow_view.status {
-                let width = self.renderer.text(
-                    &mut frame,
-                    fw,
-                    footer,
-                    hint_x,
-                    footer_y + (4.0 * self.scale) as i32,
-                    &segment.text,
+        // Footer order: prefix help alone; otherwise status/error messages first (they
+        // must stay visible), then the crow segments, then the default session hint.
+        let hint_color = if self.prefix {
+            chrome.text
+        } else {
+            chrome.muted
+        };
+        let mut footer_items: Vec<(&str, u32)> = Vec::new();
+        let message_first = self.prefix || !self.status.is_empty();
+        if message_first {
+            footer_items.push((&hint, hint_color));
+        }
+        if !self.prefix {
+            footer_items.extend(self.crow_view.status.iter().map(|segment| {
+                (
+                    segment.text.as_str(),
                     tone_color(segment.tone, &chrome, light),
-                    &self.config,
-                    (11.0 * self.scale) as f32,
-                );
-                hint_x += width.ceil() as i32 + gap;
+                )
+            }));
+        }
+        if !message_first {
+            footer_items.push((&hint, hint_color));
+        }
+        let mut footer_x = (12.0 * self.scale) as i32;
+        let gap = (16.0 * self.scale) as i32;
+        for (text, color) in footer_items {
+            if footer_x >= footer.w as i32 {
+                break;
             }
+            let width = self.renderer.text(
+                &mut frame,
+                fw,
+                footer,
+                footer_x,
+                footer_y + (4.0 * self.scale) as i32,
+                text,
+                color,
+                &self.config,
+                (11.0 * self.scale) as f32,
+            );
+            footer_x += width.ceil() as i32 + gap;
         }
         if let Some(panel) = panel_rect {
             let key = {
@@ -1876,21 +1904,6 @@ impl App {
             shared.pane.store(self.pane_id, Ordering::Relaxed);
             shared.wake();
         }
-        self.renderer.text(
-            &mut frame,
-            fw,
-            footer,
-            hint_x,
-            footer_y + (4.0 * self.scale) as i32,
-            &hint,
-            if self.prefix {
-                chrome.text
-            } else {
-                chrome.muted
-            },
-            &self.config,
-            (11.0 * self.scale) as f32,
-        );
         // Row raster cache is bounded by visible panes; bound glyph growth during long sessions.
         if self.renderer.swash.image_cache.len() > 16384 {
             self.renderer.swash.image_cache.clear();
@@ -2007,13 +2020,7 @@ impl ApplicationHandler<UiEvent> for App {
                 self.redraw();
             }
             UiEvent::Crow(view) => {
-                let resize = self.crow_panel
-                    && self.config.crow.panel_position == "bottom"
-                    && view.panel.len() != self.crow_view.panel.len();
                 self.crow_view = *view;
-                if resize {
-                    self.resize_panes();
-                }
                 self.redraw();
             }
         }

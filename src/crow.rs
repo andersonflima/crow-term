@@ -19,6 +19,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+/// Minimum spacing of snapshots while agents are working (files change constantly).
+const BUSY_GAP: Duration = Duration::from_secs(5);
 const MAX_STDOUT: u64 = 2 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SESSIONS: usize = 64;
@@ -676,6 +678,10 @@ pub fn aged(state: &CrowState, elapsed: Duration) -> CrowState {
 /// `.git/HEAD` (directory or `gitdir:` file, as in worktrees) walking upwards.
 pub fn git_branch(cwd: &Path) -> Option<String> {
     fn read_small(path: &Path) -> Option<String> {
+        // Regular files only: opening a FIFO named HEAD would block the worker.
+        if !std::fs::metadata(path).ok()?.is_file() {
+            return None;
+        }
         let mut text = String::new();
         std::fs::File::open(path)
             .ok()?
@@ -776,7 +782,10 @@ impl Schedule {
         };
         let elapsed = now.saturating_duration_since(last);
         let backoff = self.tick(focused) * (1u32 << self.failures.min(5));
-        if elapsed < backoff {
+        // Busy agents append events continuously: each call costs ~0.13 s CPU, so
+        // change-triggered refreshes are then spaced by at least BUSY_GAP.
+        let gap = if busy { backoff.max(BUSY_GAP) } else { backoff };
+        if elapsed < gap {
             return false;
         }
         if self.failures > 0 || self.last_signature.as_ref() != Some(signature) {
@@ -835,9 +844,17 @@ pub fn run_snapshot(program: &Path) -> Result<Vec<u8>, String> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
+    // Own process group: crow-skills is a launcher (node -> python); a timeout
+    // must terminate the whole tree, not only the direct child.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command.spawn().map_err(|e| format!("spawn: {e}"))?;
     let stdout = child.stdout.take().ok_or("no stdout")?;
-    let reader = thread::Builder::new()
+    let (done, output) = mpsc::sync_channel(1);
+    thread::Builder::new()
         .name("crow-snapshot-read".into())
         .spawn(move || {
             let mut out = Vec::new();
@@ -845,26 +862,47 @@ pub fn run_snapshot(program: &Path) -> Result<Vec<u8>, String> {
             let _ = limited.read_to_end(&mut out);
             // Drain anything beyond the cap so the child never blocks on a full pipe.
             let _ = std::io::copy(&mut limited.into_inner(), &mut std::io::sink());
-            out
+            let _ = done.send(out);
         })
         .map_err(|e| format!("reader: {e}"))?;
-    let started = Instant::now();
+    let deadline = Instant::now() + COMMAND_TIMEOUT;
+    // The child is reaped only after the group is no longer needed, so its PID
+    // (= process group id) cannot be reused while it may still be signalled.
+    let abort = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        if let Some(group) = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    // 1) stdout EOF (all writers, including grandchildren, closed it) ...
+    let out = match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(out) => out,
+        Err(_) => {
+            // The reader thread ends once the killed group closes the pipe.
+            abort(&mut child);
+            return Err("crow-skills timed out".into());
+        }
+    };
+    // 2) ... then the exit status, within the same deadline.
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < COMMAND_TIMEOUT => {
-                thread::sleep(Duration::from_millis(10))
-            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
+                abort(&mut child);
                 return Err("crow-skills timed out".into());
             }
-            Err(e) => return Err(format!("wait: {e}")),
+            Err(e) => {
+                abort(&mut child);
+                return Err(format!("wait: {e}"));
+            }
         }
     };
-    let out = reader.join().map_err(|_| "reader panicked".to_owned())?;
     if !status.success() {
         return Err(format!(
             "crow-skills exited {}",
@@ -886,28 +924,31 @@ pub struct Shared {
     pub focused: AtomicBool,
     pub panel: AtomicBool,
     pub pane: AtomicU64,
-    wake: Mutex<Option<mpsc::Sender<()>>>,
+    wake: Mutex<Option<mpsc::SyncSender<()>>>,
 }
 impl Shared {
     pub fn wake(&self) {
         if let Ok(wake) = self.wake.lock()
             && let Some(sender) = wake.as_ref()
         {
-            let _ = sender.send(());
+            // One pending wake is enough; never queue more.
+            let _ = sender.try_send(());
         }
     }
 }
 
 /// Start the worker. `publish` returns false once the UI is gone. `cwd_of` asks
-/// the daemon for a pane's working directory.
+/// the daemon for a pane's working directory; `Err` means the request itself
+/// failed (e.g. an older daemon that does not know it), and after a few in a row
+/// the worker stops asking for the rest of the session instead of flooding it.
 pub fn spawn(
     config: &CrowConfig,
     running: Arc<AtomicBool>,
     pane: u64,
-    cwd_of: impl Fn(u64) -> Option<String> + Send + 'static,
+    cwd_of: impl Fn(u64) -> Result<Option<String>, ()> + Send + 'static,
     publish: impl Fn(CrowView) -> bool + Send + 'static,
 ) -> std::io::Result<(Arc<Shared>, thread::JoinHandle<()>)> {
-    let (sender, wakes) = mpsc::channel();
+    let (sender, wakes) = mpsc::sync_channel(1);
     let shared = Arc::new(Shared {
         running,
         focused: AtomicBool::new(true),
@@ -930,6 +971,7 @@ pub fn spawn(
             let mut last_sent: Option<CrowView> = None;
             let mut cwd_cache: Option<(u64, Option<String>, Option<String>)> = None;
             let mut first = true;
+            let mut cwd_failures = 0u32;
             while shared.running.load(Ordering::Relaxed) {
                 if !first {
                     let focused = shared.focused.load(Ordering::Relaxed);
@@ -948,7 +990,20 @@ pub fn spawn(
                 // Pane cwd + branch: one IPC + one targeted process query per tick.
                 let pane = shared.pane.load(Ordering::Relaxed);
                 let (cwd, branch) = if config.status_bar {
-                    let cwd = cwd_of(pane);
+                    let cwd = if cwd_failures < 3 {
+                        match cwd_of(pane) {
+                            Ok(cwd) => {
+                                cwd_failures = 0;
+                                cwd
+                            }
+                            Err(()) => {
+                                cwd_failures += 1;
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let branch = match &cwd_cache {
                         Some((p, c, b)) if *p == pane && *c == cwd && !focused => b.clone(),
                         _ => cwd.as_deref().and_then(|c| git_branch(Path::new(c))),
@@ -1287,6 +1342,8 @@ mod tests {
         assert!(!schedule.due(at(1), &s(2), true, false), "min interval");
         assert!(schedule.due(at(2), &s(2), true, false), "changed files");
         assert!(!schedule.due(at(2), &s(1), true, false), "unchanged");
+        assert!(!schedule.due(at(4), &s(9), true, true), "busy gap");
+        assert!(schedule.due(at(5), &s(9), true, true), "busy gap elapsed");
         assert!(!schedule.due(at(14), &s(1), true, true));
         assert!(schedule.due(at(15), &s(1), true, true), "stale while busy");
         assert!(!schedule.due(at(59), &s(1), true, false));
@@ -1369,6 +1426,86 @@ mod tests {
             std::fs::write(&huge, "#!/bin/sh\nhead -c 3000000 /dev/zero\n").unwrap();
             std::fs::set_permissions(&huge, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!(run_snapshot(&huge), Err("snapshot too large".into()));
+            // A launcher whose grandchild keeps stdout open: the deadline still holds
+            // and the whole process group is terminated.
+            let marker = dir.path().join("grandchild.pid");
+            let stuck = dir.path().join("stuck");
+            std::fs::write(
+                &stuck,
+                format!(
+                    "#!/bin/sh\nsh -c 'echo $$ > {}; exec sleep 30' &\nwait\n",
+                    marker.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let started = Instant::now();
+            assert_eq!(run_snapshot(&stuck), Err("crow-skills timed out".into()));
+            assert!(started.elapsed() < COMMAND_TIMEOUT + Duration::from_secs(2));
+            let pid: i32 = std::fs::read_to_string(&marker)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let pid = rustix::process::Pid::from_raw(pid).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while rustix::process::test_kill_process(pid).is_ok() {
+                assert!(Instant::now() < deadline, "grandchild survived the timeout");
+                thread::sleep(Duration::from_millis(20));
+            }
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn git_head_fifo_does_not_block() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let fifo = root.path().join(".git/HEAD");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let path = root.path().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || tx.send(git_branch(&path)).unwrap());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(None));
+    }
+
+    #[test]
+    fn worker_stops_asking_for_cwd_after_repeated_protocol_failures() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let counter = calls.clone();
+        let (views, published) = mpsc::channel();
+        let config = CrowConfig {
+            command: "/definitely/not/here/crow-skills".into(),
+            interval_ms: 1000,
+            ..CrowConfig::default()
+        };
+        let running = Arc::new(AtomicBool::new(true));
+        let (shared, handle) = spawn(
+            &config,
+            running.clone(),
+            1,
+            move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(())
+            },
+            move |view| views.send(view).is_ok(),
+        )
+        .unwrap();
+        for _ in 0..8 {
+            shared.wake();
+            thread::sleep(Duration::from_millis(30));
+        }
+        running.store(false, Ordering::Relaxed);
+        shared.wake();
+        handle.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // Missing crow-skills: nothing but an empty status line is published.
+        assert!(published.try_iter().all(|view| view.status.is_empty()));
     }
 }
