@@ -73,6 +73,15 @@ def main() -> None:
         if args.generate_lock:
             shutil.copyfile(config / "nvim" / "lazy-lock.json", LOCK)
             lock = json.loads(LOCK.read_text())
+    # `Lazy! restore` can leave a freshly installed plugin at its branch head
+    # (seen with nvim-lspconfig on 2026-10-28 once upstream moved past the lock).
+    # Enforce the lockfile directly; anything still off fails below.
+    for name, entry in lock.items():
+        path = lazy_dir / name
+        if path.is_dir() and head(path) != entry["commit"]:
+            git("fetch", "--quiet", "origin", entry["commit"], cwd=path)
+            git("checkout", "--quiet", "--detach", entry["commit"], cwd=path)
+            print(f"{name}: moved to the locked commit {entry['commit'][:12]} after restore", file=sys.stderr)
     wrong = {name: entry["commit"] for name, entry in lock.items()
              if not (lazy_dir / name).is_dir() or head(lazy_dir / name) != entry["commit"]}
     if wrong:

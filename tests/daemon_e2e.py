@@ -44,7 +44,16 @@ class DaemonHarness(unittest.TestCase):
         self.addCleanup(self.log.close)
         self.daemon = subprocess.Popen([str(BIN), *self.daemon_args(), "daemon"], env=self.env, stdout=self.log, stderr=self.log)
         self.addCleanup(self.stop)
-        self.eventually(lambda: self.command("list-sessions"), timeout=8)
+        # Wait with `doctor`, which never starts a daemon: any other command
+        # autostarts one (with the default config) if it wins the race against
+        # this daemon's bind, and the test would then talk to the wrong daemon.
+        self.eventually(lambda: "daemon: running" in self.command("doctor").stdout, timeout=15)
+        self.assertIsNone(self.daemon.poll(), f"test daemon exited: {self.daemon_log()}")
+
+    def daemon_log(self):
+        """The daemon's log so far (the shared handle's offset is at its end)."""
+        self.log.flush()
+        return (self.runtime / "test-daemon.log").read_text(errors="replace")[-4000:]
 
     def daemon_args(self):
         """Extra global CLI arguments for the daemon (e.g. --config)."""
@@ -83,7 +92,7 @@ class DaemonHarness(unittest.TestCase):
             time.sleep(0.03)
         self.log.flush()
         self.log.seek(0)
-        raise AssertionError(f"Condition timed out: {error}; daemon: {self.log.read()}")
+        raise AssertionError(f"Condition timed out: {error}; daemon: {self.daemon_log()}")
 
     def capture(self, pane):
         return self.command("capture-pane", pane).stdout
@@ -102,7 +111,8 @@ class DaemonTests(DaemonHarness):
         self.assertEqual(self.rpc("new-session", "alpha")["Created"], first)
         pane, window = first["pane"], first["window"]
         self.send(pane, "echo CROW_REAL_PTY")
-        self.eventually(lambda: self.output_line(pane,"CROW_REAL_PTY"))
+        # A cold PowerShell start on a CI runner can take several seconds.
+        self.eventually(lambda: self.output_line(pane,"CROW_REAL_PTY"), timeout=30)
         # Reattaching with another CLI default must not change a session's shell profile.
         second = self.rpc("--session", "alpha", "--shell", "crow-nonexistent-shell-fixture", "new-window")["Created"]
         self.send(second["pane"],"echo CROW_ORIGINAL_PROFILE")

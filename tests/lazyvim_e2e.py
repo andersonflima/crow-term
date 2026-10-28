@@ -178,15 +178,37 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
             self.assertIn("alpha.lua", tabline)
             self.assertIn("beta.md", tabline)
         with self.subTest("gitsigns sign"):
+            last = [""]
             def signed():
                 screen = self.rpc("capture-pane", self.pane, "--json")
+                last[0] = "\n".join("".join(cell["text"] for cell in row) for row in screen["cells"])
                 for row in screen["cells"]:
                     line = "".join(cell["text"] for cell in row)
                     if "crowcompletionword = 2" in line:
                         # Sign column sits before the text, after the line number.
-                        return any(cell["text"] in "▎┃▍" for cell in row[:8]) and line
+                        # (An empty cell text is not a sign: "" is in every string.)
+                        return any(cell["text"] and cell["text"] in "▎┃▍" for cell in row[:8]) and line
                 return False
-            self.eventually(signed, timeout=15)
+            try:
+                # gitsigns attaches asynchronously; when the buffer was read before
+                # the plugin loaded (LazyFile) it can stay detached on a busy
+                # runner. What this scenario proves is that the sign renders
+                # through the terminal, so attach explicitly if it has not.
+                self.eventually(signed, timeout=10)
+            except AssertionError:
+                # Only a detached gitsigns may be attached by hand: if it already
+                # tracks the change, a missing sign is a terminal defect.
+                tracked = self.report(
+                    "vim.b.gitsigns_status_dict ~= nil and ((vim.b.gitsigns_status_dict.changed or 0)"
+                    " + (vim.b.gitsigns_status_dict.added or 0)) > 0")
+                if tracked:
+                    raise AssertionError(f"gitsigns tracks the change but no sign is drawn:\n{last[0]}") from None
+                self.ex("Gitsigns attach")
+                try:
+                    self.eventually(signed, timeout=20)
+                except AssertionError:
+                    raise AssertionError(f"no gitsigns sign on the modified line:\n{last[0]}") from None
+                print("gitsigns: attached explicitly", file=sys.stderr)
         with self.subTest("treesitter highlight"):
             active = self.report("vim.treesitter.highlighter.active[vim.api.nvim_get_current_buf()] ~= nil")
             self.assertTrue(active)
