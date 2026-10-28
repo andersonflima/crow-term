@@ -10,14 +10,14 @@ engineering alpha, not a certification of complete terminal compatibility.
 | Public `crow-term` repository | Original Rust application, MIT | Owner explicitly authorized public repo |
 | New engine, no fork | Own native frontend, protocol and daemon | `src/ui.rs:1`, `src/ipc.rs:1`, `src/server.rs:1`; reusable crates are attributed in NOTICE |
 | macOS / Windows / Linux | Winit, native PTY/ConPTY, sockets/named pipes; CI matrix | `.github/workflows/ci.yml:1`; native build/test coverage is distinct from graphical validation |
-| Vim/Neovim/LazyVim/CLIs | VT emulation, alt screen, truecolor, mouse, bracketed paste, keypad, kitty keyboard, underline styles, terminal queries | CI (Linux, macOS) with pinned upstream Neovim 0.11.7 and 0.12.6 (SHA-256, `scripts/fetch_neovim.py`): `tests/nvim_e2e.py` (keyboard chords through the real encoder, termguicolors, background, cursor shapes, undercurl in the capture, no leaked replies), `tests/protocol_probe.py` (reply matrix, also in the native job), and `tests/lazyvim_e2e.py` against LazyVim v16.0.1 from a committed `lazy-lock.json` (dashboard, which-key, snacks picker, noice cmdline, lualine, bufferline, gitsigns sign, treesitter highlight, blink menu, `:checkhealth` errors vs allowlist). CI overrides: no Mason, Lua fuzzy matcher, nvim-treesitter disabled in favour of Neovim's bundled parsers; network only in `tests/lazyvim_bootstrap.py`. Not covered: Windows Neovim/LazyVim, LSP servers, LazyVim extras, the user's own plugin tree |
+| Vim/Neovim/LazyVim/CLIs | VT emulation, alt screen, truecolor, mouse, bracketed paste, keypad, kitty keyboard, underline styles, terminal queries | CI (Linux, macOS) with pinned upstream Neovim 0.11.7 and 0.12.6 (SHA-256, `scripts/fetch_neovim.py`): `tests/nvim_e2e.py` (keyboard chords through the real encoder, termguicolors, background, cursor shapes, undercurl in the capture, no leaked replies), `tests/protocol_probe.py` (reply matrix, also in the native job), and `tests/lazyvim_e2e.py` against LazyVim v16.0.1 from a committed `lazy-lock.json` (dashboard, which-key, snacks picker, noice cmdline, lualine, bufferline, gitsigns sign, treesitter highlight, blink menu, `:checkhealth` errors vs allowlist). CI overrides: no Mason, Lua fuzzy matcher, nvim-treesitter disabled in favour of Neovim's bundled parsers; network only in `tests/lazyvim_bootstrap.py`. Windows: Neovim 0.11.7 through ConPTY in the GUI journeys below (editing, paste, mouse, focus, Ctrl chords), not the keyboard/LazyVim suites. Not covered: Windows LazyVim, LSP servers, LazyVim extras, the user's own plugin tree |
 | Native sessions/windows/panes | Daemon owns PTYs; recursive splits; named sessions and windows | `src/model.rs:1`, `src/server.rs:1`; E2E creates, resizes, reconnects and isolates sessions |
 | Existing tmux configuration | Real tmux compatibility profile; native prefix disabled | `src/config.rs:1`, `src/main.rs:1`; E2E config marker/prefix and detach, not arbitrary plugin certification |
 | Fish/Fisher and zsh | Existing shells plus opt-in offline isolated profiles | `shell/setup.py:1`, pinned licensed sources; real fish/zsh syntax and plugin load tested when installed |
 | Crowquill Ink and Mono | Owner-selected light default, dark example, four embedded OFL faces | `src/config.rs:1`, `assets/`; exact upstream attribution preserved |
 | Underline styles (Neovim diagnostics) | SGR 4:1-4:5 single/double/curly/dotted/dashed and SGR 58/59 underline color carried engine → model → IPC (wire v4) → software renderer (`draw_underline`) | `src/engine.rs` and `src/ui.rs` unit tests, daemon E2E JSON capture; raster geometry is unit-tested, not screenshot-verified on every platform |
 | Terminal queries and events | XTVERSION, XTGETTCAP (Tc/RGB/Smulx/Setulc/Ss/Se, Ms only with OSC 52 copy), DECRQSS (SGR, DECSCUSR), DA2 with the crow-term version, CSI 14t/16t from the GUI's real cell metrics (also TIOCSWINSZ pixels), DEC 1004 focus on pane switch, OSC 8 links kept in the snapshot (not clickable yet), visual bell, DEC 1007 alternate scroll, window title from OSC 0/2 | `src/intercept.rs`, `src/engine.rs` unit tests; GUI behaviours are covered by unit tests of their pure parts, not by native-event automation. Pixel reports are withheld until a GUI reported cell metrics; OSC 52 strings over the cap are discarded before decoding; OSC 8 targets are bounded (64 KiB per snapshot) |
-| Ligatures, icons, emojis | Advanced shaping, cell anchoring, fallback, raster cache | UI unit tests verify substitutions and grid alignment; native Mac screenshot verified `->`, `!=`, `===`, accents, CJK, rocket emoji and Nerd Font icon |
+| Ligatures, icons, emojis | Advanced shaping, cell anchoring, fallback, raster cache; Private Use Area icons from an installed Symbols Nerd Font when the configured font lacks them | UI unit tests verify substitutions and grid alignment; GUI journey J2 checks `->`, accents, CJK width, colour emoji and Nerd icons in the renderer's frames against reviewed goldens on Linux (X11, Wayland), Windows and macOS (see Graphical validation) |
 | Crow agent status (owner request) | Footer status line + toggleable agent panel from `crow-skills events snapshot --json`; focused-pane cwd via `PaneCwd` IPC, git branch from `.git/HEAD` | `src/crow.rs` parsing/format/throttle unit tests, `src/engine.rs` cwd test; versioned, tolerant parser; read-only, no prompt content |
 | Lightweight / fast | Native software renderer, no WebView; dirty row/glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented, **no claim of maximum performance or comparative superiority**; GPU rendering remains follow-up |
 
@@ -26,6 +26,75 @@ The owner explicitly chose a **new engine**, rejecting the fork alternative, and
 normal code/configuration change, not hidden migration. A native mux cannot
 interpret arbitrary tmux shell commands/plugins exactly; the explicit compatibility
 path delegates to tmux itself rather than importing a misleading subset.
+
+## Graphical validation (CI)
+
+Date: 2026-10-28. Workflows `gui-linux.yml` (X11: Xvfb + openbox; Wayland:
+headless sway 1.9, pixman, no Xwayland), `gui-windows.yml` (windows-2025
+interactive desktop) and `gui-macos.yml` (macos-15) run the real GUI against an
+isolated daemon and real PTYs/ConPTY with `tests/gui/journeys.py`. Input is
+native: XTEST (xdotool), the Wayland virtual keyboard/pointer protocols (wayvnc
+driven by an in-repo RFB client), `SendInput` on Windows and Quartz events plus
+System Events on macOS (the hosted image grants Accessibility to its tools).
+The harness never types into the PTY on these runners; a journey that has to
+fall back to daemon input reports `degraded`, which `--expect-pass` rejects.
+
+Rendering evidence is the renderer's own frame (`--features frame-dump`,
+`CROW_TERM_FRAME_DUMP`, `src/frame_dump.rs`; not in release builds), so goldens
+do not depend on compositor or screenshot quirks. An OS screenshot per run only
+proves the window reached the screen (the frame's header strip is located in
+it). Goldens live in `tests/gui/goldens/<platform>/`, were produced by CI and
+reviewed by eye; consecutive CI runs produced pixel-identical frames on every
+platform. The diff is tolerant (channel ≤ 24, ≤ 0.3 % of pixels, ≤ 2 % of any
+cell). `workflow_dispatch` with `update_goldens` uploads candidates as an
+artifact; nothing is committed automatically. Each run uploads frames, diffs,
+screenshots, logs and `results.json` (14 days).
+
+| Journey | Linux X11 | Linux Wayland | Windows | macOS |
+|---|---|---|---|---|
+| J1 launch, first frame, window on screen | pass | pass | pass | pass |
+| J2 fixture text (ligature, accents, CJK width, colour emoji, Nerd icon, golden) | pass | pass | pass | pass |
+| J3 Ctrl-t % / Ctrl-t " splits and h/l navigation (golden) | pass | pass | pass | pass |
+| J4 window resize changes the PTY size | pass | pass | pass | pass |
+| J5 Neovim edit + `:w` through native keys | pass | pass | pass | pass |
+| J6 clipboard paste reaches Neovim as a bracketed paste | pass | pass | pass | pass |
+| J7 mouse click moves the Neovim cursor | pass | pass | pass | pass |
+| J8 focus out/in reach Neovim (DEC 1004) | pass | pass | pass | pass |
+| J10 Ctrl+/ and Ctrl+Return reach Neovim | pass | pass | pass | pass |
+| J9 window close, `attach`, unsaved buffer intact | pass | pass | pass | pass |
+
+Neovim is the pinned 0.11.7 release on every platform (Windows: `nvim-win64.zip`
+by SHA-256), so the Windows column is also the first Neovim-through-ConPTY
+coverage; the keyboard/LazyVim E2E suites (`nvim_e2e.py`, `lazyvim_e2e.py`)
+remain POSIX-only. On Windows Neovim 0.11 negotiates no kitty keyboard flags;
+Ctrl+/ and Ctrl+Return still arrive as distinct keys there.
+
+Defects these journeys found and that are fixed: the Ctrl-t prefix was consumed
+by the Shift press needed to type `%` or `"` (and by Alt), so prefix actions on
+shifted keys never worked with a real keyboard; on Wayland without Xwayland the
+clipboard was unavailable (arboard's `wayland-data-control` is now enabled;
+compositors without the data-control protocol, e.g. GNOME, still go through
+Xwayland); on Windows a CJK system font's vendor glyph in the Private Use Area
+replaced the Nerd icon (PUA cells now prefer an installed Symbols Nerd Font);
+the X11 GUI aborts at startup when `libxkbcommon-x11` is missing (a runtime
+dependency, now documented in [release](release.md)).
+
+On macOS, chords are posted as Quartz key events with the modifier keys
+themselves: System Events' `keystroke "/" using control down` delivered a plain
+`/` (a tool artifact; the same chord as Quartz events reaches Neovim as
+`<C-/>`).
+
+Known and recorded, not fixed: a ZWJ emoji sequence (👩‍💻) is drawn as one glyph
+in the first two cells while the grid model gives the second emoji its own two
+cells, so text after such a sequence is visually offset (informational in J2).
+
+What CI does not prove and still needs a person: input methods and dead keys
+(only ASCII and Ctrl/Shift chords are synthesized; no IME composition, no
+non-US layouts); real compositors and desktops (GNOME/KDE, decorations, fractional
+and HiDPI scaling — CI runs at scale 1, single virtual monitor, no multi-monitor
+or DPI change), GPU drivers (the renderer is CPU softbuffer; X11/Wayland/Windows
+presentation paths only), screen readers and accessibility trees, perceived
+latency and smoothness, WSL, and long-running sessions.
 
 ## Responsibilities and interfaces
 
@@ -80,8 +149,10 @@ wire-size observations, not rendering/latency benchmarks.
 
 ## Explicitly not verified / remaining work
 
-- Full manual Windows/WSL and Linux/Wayland/X11 journeys, including GPU/driver,
-  international input, IME, complex emoji ZWJ clusters and accessibility.
+- What the graphical CI cannot show (see Graphical validation): IME and
+  non-US layouts, real desktops/compositors, HiDPI and fractional scaling,
+  multi-monitor, GPU drivers, screen readers, perceived latency, WSL; ZWJ
+  emoji sequences are drawn offset from the grid.
 - Every Vim/LazyVim plugin, terminal protocol or keyboard extension. Graphics
   protocols, sixel and tmux control-mode integration are not advertised as
   implemented. The kitty keyboard protocol (flags 1/2/4/8/16, push/pop/query/set)
