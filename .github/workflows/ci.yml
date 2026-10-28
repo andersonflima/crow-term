@@ -41,6 +41,8 @@ jobs:
       - name: Offline shell profiles (Unix/WSL contract)
         if: runner.os != 'Windows'
         run: python tests/shell_setup.py
+      - name: Homebrew tap renderer
+        run: python tests/update_tap_test.py
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - name: Release binary

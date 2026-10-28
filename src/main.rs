@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use crow_term::{config::Config, ipc, model::*, server, ui};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -100,6 +100,44 @@ enum Action {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+/// Bundled locations only: next to the invoked path (portable archive, which may be
+/// a symlink), next to the resolved executable (Homebrew `bin` links), and the
+/// macOS app bundle's `Contents/Resources` (signed bundles keep data out of `MacOS`).
+fn bundled_shell_setup_candidates() -> Result<Vec<PathBuf>> {
+    shell_setup_candidates_for(&std::env::current_exe()?)
+}
+fn shell_setup_candidates_for(invoked: &Path) -> Result<Vec<PathBuf>> {
+    let mut bases = vec![
+        invoked
+            .parent()
+            .context("Executable directory missing")?
+            .to_path_buf(),
+    ];
+    if let Some(resolved) = std::fs::canonicalize(invoked)
+        .ok()
+        .and_then(|path| path.parent().map(PathBuf::from))
+    {
+        // Only a real macOS bundle layout (`X.app/Contents/MacOS`) may look in
+        // `../Resources`; elsewhere that path could belong to another user.
+        if cfg!(target_os = "macos")
+            && resolved.ends_with("Contents/MacOS")
+            && resolved
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::extension)
+                .is_some_and(|ext| ext == "app")
+            && let Some(contents) = resolved.parent()
+        {
+            bases.push(contents.join("Resources"));
+        }
+        bases.push(resolved);
+    }
+    Ok(bases
+        .into_iter()
+        .map(|base| base.join("shell/setup.py"))
+        .collect())
 }
 
 fn ensure_daemon(config: Option<&PathBuf>) -> Result<()> {
@@ -230,16 +268,15 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(Action::ShellSetup { source, args }) => {
-            let base = std::env::current_exe()?
-                .parent()
-                .context("Executable directory missing")?
-                .to_path_buf();
-            let script = source.as_ref().unwrap_or(&base).join("shell/setup.py");
-            if !script.is_file() {
+            let candidates = match source {
+                Some(source) => vec![source.join("shell/setup.py")],
+                None => bundled_shell_setup_candidates()?,
+            };
+            let Some(script) = candidates.into_iter().find(|path| path.is_file()) else {
                 bail!(
                     "Bundled shell/setup.py missing; use the full archive, run python3 shell/setup.py explicitly, or pass --source /trusted/checkout"
                 );
-            }
+            };
             let python = which::which("python3")
                 .or_else(|_| which::which("python"))
                 .context("Python3 required only for shell setup")?;
@@ -394,5 +431,35 @@ fn main() -> Result<()> {
             ui::run(config, session, window, pane, spec)
         }
         _ => unreachable!("local commands handled above"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shell_setup_resources_only_inside_an_app_bundle() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let lone = root.join("sub/crow-term");
+        std::fs::create_dir_all(lone.parent().unwrap()).unwrap();
+        std::fs::write(&lone, b"").unwrap();
+        let candidates = shell_setup_candidates_for(&lone).unwrap();
+        assert!(
+            candidates
+                .iter()
+                .all(|c| !c.starts_with(root.join("Resources"))),
+            "{candidates:?}"
+        );
+        let app = root.join("Crow Term.app/Contents/MacOS/crow-term");
+        std::fs::create_dir_all(app.parent().unwrap()).unwrap();
+        std::fs::write(&app, b"").unwrap();
+        let candidates = shell_setup_candidates_for(&app).unwrap();
+        let resources = root.join("Crow Term.app/Contents/Resources/shell/setup.py");
+        assert_eq!(
+            candidates.contains(&resources),
+            cfg!(target_os = "macos"),
+            "{candidates:?}"
+        );
     }
 }

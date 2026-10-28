@@ -88,9 +88,14 @@ wire-size observations, not rendering/latency benchmarks.
   beyond daemon lifetime.
 - GPU renderer and controlled comparative startup/RSS/throughput/input-latency
   benchmarks. Initial software rasterization is deliberate, not a GPU claim.
-- Signed/notarized installers, auto-update and package-manager distribution.
-  Portable artifacts are unsigned alpha builds; Linux libc/desktop requirements
-  still follow the build environment.
+- Release pipeline exists (`.github/workflows/release.yml`, [release](release.md)):
+  macOS Developer ID signing and notarization run only when the signing/notary
+  secrets are configured, otherwise builds are explicitly unsigned; Linux
+  artifacts get keyless build provenance; Windows Authenticode is a documented
+  TODO (no certificate). Homebrew formula/cask templates are rendered by
+  `scripts/update_tap.py`. Not yet verified: a real signed/notarized run on
+  GitHub, Linuxbrew runtime dependencies, auto-update. Linux libc/desktop
+  requirements still follow the build environment.
 - IPC stale-socket recovery after ungraceful daemon termination is currently
   manual: verify no daemon is alive before removing its private socket. A daemon
   crash cannot preserve its child processes.
