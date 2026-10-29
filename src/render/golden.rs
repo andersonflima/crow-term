@@ -8,22 +8,37 @@ use std::path::{Path, PathBuf};
 pub struct Tolerance {
     pub max_channel: u8,
     pub max_fraction: f64,
+    /// Do not count pixels whose largest channel difference is 1 towards
+    /// `max_fraction` (8-bit blend rounding of CPU rasterizers).
+    pub ignore_lsb: bool,
 }
 /// No difference at all: the software renderer against its own goldens.
 pub const EXACT: Tolerance = Tolerance {
     max_channel: 0,
     max_fraction: 0.0,
+    ignore_lsb: false,
 };
 /// Documented renderer tolerance: <= 2 per channel on <= 0.1% of the pixels.
 pub const RENDERER: Tolerance = Tolerance {
     max_channel: 2,
     max_fraction: 0.001,
+    ignore_lsb: false,
+};
+/// CPU rasterizer adapters (Mesa lavapipe/llvmpipe) round fixed-function
+/// blending differently from the software formula by one step on ~0.6% of the
+/// pixels of text-heavy frames. Those one-step differences are tolerated there;
+/// every other bound is the same as [`RENDERER`].
+pub const CPU_ADAPTER: Tolerance = Tolerance {
+    ignore_lsb: true,
+    ..RENDERER
 };
 
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Diff {
     /// Pixels with any channel difference.
     pub differing: usize,
+    /// Differing pixels whose largest difference is exactly 1.
+    pub lsb_only: usize,
     /// Pixels whose difference exceeds the per-channel tolerance.
     pub over: usize,
     pub max_channel: u8,
@@ -31,7 +46,12 @@ pub struct Diff {
 }
 impl Diff {
     pub fn within(&self, tolerance: Tolerance) -> bool {
-        self.over == 0 && self.differing as f64 <= tolerance.max_fraction * self.total as f64
+        let counted = if tolerance.ignore_lsb {
+            self.differing - self.lsb_only
+        } else {
+            self.differing
+        };
+        self.over == 0 && counted as f64 <= tolerance.max_fraction * self.total as f64
     }
 }
 
@@ -52,6 +72,9 @@ pub fn diff(actual: &[u32], expected: &[u32], tolerance: Tolerance) -> Diff {
             .max()
             .unwrap_or(0);
         out.max_channel = out.max_channel.max(delta);
+        if delta == 1 {
+            out.lsb_only += 1;
+        }
         if delta > tolerance.max_channel {
             out.over += 1;
         }
@@ -157,6 +180,15 @@ mod tests {
         assert!(!d.within(RENDERER));
         near[1] = 0xfafafa;
         assert_eq!(diff(&near, &pixels, RENDERER).over, 1);
+        // One-step rounding noise everywhere passes only the CPU-adapter rule.
+        let base = vec![0x808080u32; 100];
+        let noisy: Vec<u32> = base.iter().map(|p| p + 1).collect();
+        assert!(!diff(&noisy, &base, RENDERER).within(RENDERER));
+        assert!(diff(&noisy, &base, CPU_ADAPTER).within(CPU_ADAPTER));
+        let mut two = noisy.clone();
+        two[0] = 0x808082;
+        two[1] = 0x808082;
+        assert!(!diff(&two, &base, CPU_ADAPTER).within(CPU_ADAPTER));
         // Software goldens accept no difference at all.
         assert!(diff(&pixels, &pixels, EXACT).within(EXACT));
         let mut lsb = pixels.clone();

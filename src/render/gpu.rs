@@ -100,9 +100,11 @@ struct Entry {
     top: i32,
 }
 
-/// The atlas ran out of space during a frame.
+/// The atlas page for color (`true`) or mask glyphs ran out of space.
 #[derive(Debug)]
-struct Full;
+struct Full {
+    color: bool,
+}
 
 struct Page {
     texture: wgpu::Texture,
@@ -152,6 +154,11 @@ struct Atlas {
     entries: HashMap<CacheKey, Option<Entry>>,
     generation: u64,
     max_size: u32,
+    /// Set for the rest of a frame whose glyphs do not fit even in pages of
+    /// `max_size`: glyphs that do not fit are skipped instead of failing.
+    overflow: bool,
+    /// Glyphs skipped while `overflow` was set (reported once per frame).
+    dropped: usize,
 }
 impl Atlas {
     fn new(device: &wgpu::Device) -> Self {
@@ -172,6 +179,8 @@ impl Atlas {
             entries: HashMap::new(),
             generation: 0,
             max_size,
+            overflow: false,
+            dropped: 0,
         }
     }
     /// Where `key`'s image is, rasterizing and uploading it on first use.
@@ -204,7 +213,12 @@ impl Atlas {
                 let (w, h) = (image.placement.width, image.placement.height);
                 let Some(allocation) = page.alloc.allocate(etagere::size2(w as i32, h as i32))
                 else {
-                    return Err(Full);
+                    if self.overflow {
+                        // Not cached: retried on the next frame with a fresh page.
+                        self.dropped += 1;
+                        return Ok(None);
+                    }
+                    return Err(Full { color });
                 };
                 let (x, y) = (
                     allocation.rectangle.min.x as u32,
@@ -244,12 +258,25 @@ impl Atlas {
         self.entries.insert(key, entry);
         Ok(entry)
     }
-    /// Double the pages up to the device limit; at the limit start over.
-    fn grow(&mut self, device: &wgpu::Device) {
-        let next = |page: &Page| (page.size * 2).min(self.max_size);
-        let (mask, color) = (next(&self.mask), next(&self.color));
-        self.mask = Page::new(device, mask, self.mask.format, "crow glyph mask atlas");
-        self.color = Page::new(device, color, self.color.format, "crow color glyph atlas");
+    /// Double the full page up to the device limit. At the limit the page
+    /// starts over empty and the frame continues in overflow mode. Either way
+    /// every cached glyph position is invalidated (new generation).
+    fn grow(&mut self, device: &wgpu::Device, full: Full) {
+        let page = if full.color {
+            &mut self.color
+        } else {
+            &mut self.mask
+        };
+        if page.size >= self.max_size {
+            self.overflow = true;
+        }
+        let size = (page.size * 2).min(self.max_size);
+        let label = if full.color {
+            "crow color glyph atlas"
+        } else {
+            "crow glyph mask atlas"
+        };
+        *page = Page::new(device, size, page.format, label);
         self.entries.clear();
         self.generation += 1;
     }
@@ -396,6 +423,8 @@ pub struct GpuRenderer {
     frame: Vec<Instance>,
     draws: Vec<(Pass, std::ops::Range<u32>)>,
     offscreen: Option<(u32, u32, wgpu::Texture, wgpu::Buffer)>,
+    /// Glyphs the last overflowing frame could not place (see [`Self::take_dropped_glyphs`]).
+    dropped_glyphs: usize,
 }
 
 impl GpuRenderer {
@@ -555,10 +584,45 @@ impl GpuRenderer {
             frame: Vec::new(),
             draws: Vec::new(),
             offscreen: None,
+            dropped_glyphs: 0,
         })
     }
     pub fn adapter(&self) -> &AdapterSummary {
         &self.summary
+    }
+    /// Glyphs left out of the last frame because a single frame needed more
+    /// glyph images than the largest atlas page holds (0 normally).
+    pub fn take_dropped_glyphs(&mut self) -> usize {
+        std::mem::take(&mut self.dropped_glyphs)
+    }
+    /// Start over with atlas pages of `size` (max `max_size`) to exercise
+    /// growth and overflow in tests.
+    #[cfg(test)]
+    pub(crate) fn set_atlas_limits(&mut self, size: u32, max_size: u32) {
+        self.atlas.mask = Page::new(
+            &self.device,
+            size,
+            wgpu::TextureFormat::R8Unorm,
+            "test mask",
+        );
+        self.atlas.color = Page::new(
+            &self.device,
+            size,
+            wgpu::TextureFormat::Rgba8Unorm,
+            "test color",
+        );
+        self.atlas.max_size = max_size;
+        self.atlas.entries.clear();
+        self.atlas.generation += 1;
+    }
+    /// (generation, mask page size, color page size).
+    #[cfg(test)]
+    pub(crate) fn atlas_state(&self) -> (u64, u32, u32) {
+        (
+            self.atlas.generation,
+            self.atlas.mask.size,
+            self.atlas.color.size,
+        )
     }
     /// Forget shaped rows (metrics, scale or layout changed).
     pub fn invalidate(&mut self) {
@@ -759,13 +823,17 @@ impl GpuRenderer {
     }
 
     fn prepare(&mut self, scene: &Scene<'_>, shaper: &mut GridShaper, config: &Config) {
-        // A full atlas restarts the frame with bigger pages (all cached glyph
-        // positions are invalidated by the new generation).
-        for _ in 0..3 {
-            match self.build(scene, shaper, config) {
-                Ok(()) => break,
-                Err(Full) => self.atlas.grow(&self.device),
-            }
+        // A full atlas restarts the frame with a bigger page (all cached glyph
+        // positions are invalidated by the new generation). Pages double up to
+        // the device limit; beyond it the frame is drawn in overflow mode,
+        // which never fails, so this loop ends.
+        self.atlas.dropped = 0;
+        while let Err(full) = self.build(scene, shaper, config) {
+            self.atlas.grow(&self.device, full);
+        }
+        if self.atlas.overflow {
+            self.atlas.overflow = false;
+            self.dropped_glyphs = self.atlas.dropped;
         }
         shaper.trim();
         let size = [scene.width as f32, scene.height as f32, 0.0, 0.0];
