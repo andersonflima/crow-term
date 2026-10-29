@@ -107,6 +107,20 @@ class NpmPackages(unittest.TestCase):
         result = subprocess.run([node, str(launcher), "--version", "a b"], capture_output=True, text=True)
         self.assertEqual(result.stdout.strip(), "fake crow-term --version a b")
         self.assertEqual(result.returncode, 7)
+        # A signal sent to the launcher alone reaches the native process.
+        binary = modules / f"crow-term-{host[0]}-{host[1]}" / (
+            f"bin/{npm_package.APP}/Contents/MacOS/crow-term" if host[0] == "darwin" else "bin/crow-term")
+        marker = self.temp / "got-term"
+        binary.write_text(
+            "#!/bin/sh\ntrap 'echo term > \"$CROW_MARK\"; exit 9' TERM\necho ready\n"
+            "while :; do sleep 0.05; done\n")
+        child = subprocess.Popen([node, str(launcher)], stdout=subprocess.PIPE, text=True,
+                                 env=dict(os.environ, CROW_MARK=str(marker)))
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        child.send_signal(15)
+        self.assertEqual(child.wait(timeout=10), 9)
+        child.stdout.close()
+        self.assertEqual(marker.read_text().strip(), "term")
         # Without the platform package the launcher explains instead of crashing.
         shutil.rmtree(modules / f"crow-term-{host[0]}-{host[1]}")
         result = subprocess.run([node, str(launcher)], capture_output=True, text=True)

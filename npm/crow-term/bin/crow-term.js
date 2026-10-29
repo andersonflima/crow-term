@@ -4,7 +4,7 @@
 // esbuild/biome pattern): nothing is downloaded at install or run time.
 "use strict";
 
-const { spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const path = require("node:path");
 
 // `${process.platform} ${process.arch}` -> [package, binary path inside it]
@@ -43,19 +43,30 @@ function main() {
     binary = binaryPath();
   } catch (error) {
     process.stderr.write(`crow-term: ${error.message}\n`);
-    return 1;
+    process.exitCode = 1;
+    return;
   }
-  const result = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
-  if (result.error) {
-    process.stderr.write(`crow-term: cannot run ${binary}: ${result.error.message}\n`);
-    return 1;
-  }
-  if (result.signal) {
-    // Re-raise so the caller sees the same signal (e.g. Ctrl-C in a script).
-    process.kill(process.pid, result.signal);
-    return 1;
-  }
-  return result.status ?? 1;
+  const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
+  // A signal sent to the launcher alone (a supervisor, `timeout`, an IDE) must
+  // reach the native process instead of orphaning it.
+  const forward = (signal) => {
+    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+  };
+  const signals = process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGINT", "SIGTERM", "SIGHUP"];
+  for (const signal of signals) process.on(signal, forward);
+  child.on("error", (error) => {
+    process.stderr.write(`crow-term: cannot run ${binary}: ${error.message}\n`);
+    process.exitCode = 1;
+  });
+  child.on("exit", (code, signal) => {
+    for (const name of signals) process.removeListener(name, forward);
+    if (signal) {
+      // Re-raise so the caller sees the same signal.
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exitCode = code ?? 1;
+  });
 }
 
-process.exitCode = main();
+main();

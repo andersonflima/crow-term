@@ -134,11 +134,14 @@ launcher) without publishing.
 
 One-time setup by the npm account owner, per package (six times): the package
 must exist before a trusted publisher can be attached, so publish the first
-version by hand from the dry-run artifact (`npm publish <tgz> --access public`)
-or with a short-lived token, then on npmjs.com → package → Settings → Trusted
-Publisher add GitHub Actions `andersonflima/crow-term`, workflow `release.yml`.
-Until that is done for a package, its publish step fails and the job stops
-before the launcher is published.
+version by hand from the dry-run `npm-packages` artifact (`npm publish
+./<tgz> --access public --tag latest`; npm needs the explicit tag for a
+prerelease) or with a short-lived token, then on npmjs.com → package → Settings
+→ Trusted Publisher add GitHub Actions `andersonflima/crow-term`, workflow
+`release.yml` (or `npm trust github`). Until that is done for a package, its
+publish fails and the job stops before the launcher is published. The job skips
+versions already on the registry, so re-running it after a partial failure, or
+tagging the version that was hand-published as the bootstrap, is safe.
 
 ## Verify a release
 

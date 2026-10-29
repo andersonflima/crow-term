@@ -433,9 +433,21 @@ jobs:
         if: env.PUBLISH == 'true'
         run: |
           # Alpha-only project: prereleases also take the `latest` tag so that
-          # `npm i -g @andespindola/crow-term` installs them.
-          tag=latest
+          # `npm i -g @andespindola/crow-term` installs them (npm 11 requires an
+          # explicit --tag for a prerelease). Versions already on the registry
+          # (a re-run after a partial failure, or a hand-published bootstrap)
+          # are skipped: npm never republishes a version.
+          publish() {
+            local pack="$1" name
+            name="$(tar -xOzf "${pack}" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).name')"
+            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
+              echo "${name}@${VERSION} already published; skipping"
+              return 0
+            fi
+            # ./ keeps npm from reading packs/x.tgz as GitHub shorthand.
+            npm publish "./${pack}" --access public --tag latest
+          }
           for pack in packs/andespindola-crow-term-*-"${VERSION}".tgz; do
-            npm publish "${pack}" --access public --tag "${tag}"
+            publish "${pack}"
           done
-          npm publish "packs/andespindola-crow-term-${VERSION}.tgz" --access public --tag "${tag}"
+          publish "packs/andespindola-crow-term-${VERSION}.tgz"
