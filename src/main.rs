@@ -4,7 +4,7 @@ use crow_term::{
     config::{Config, RendererMode},
     ipc,
     model::*,
-    server, ui,
+    render, server, ui,
 };
 use std::{
     path::{Path, PathBuf},
@@ -119,6 +119,20 @@ enum Action {
     },
     /// Inspect local tools, daemon and paths without installing anything.
     Doctor,
+    /// Offscreen renderer timings (test aid; not a stable interface).
+    #[command(hide = true)]
+    BenchRender {
+        #[arg(long, value_enum, default_value = "software")]
+        backend: render::bench::Backend,
+        #[arg(long, default_value_t = 120)]
+        cols: usize,
+        #[arg(long, default_value_t = 40)]
+        rows: usize,
+        #[arg(long, default_value_t = 300)]
+        frames: usize,
+        #[arg(long, value_enum, num_args = 1.., default_values = ["idle", "scroll", "one-row"])]
+        scenario: Vec<render::bench::Scenario>,
+    },
     /// Run isolated, opt-in fish/zsh profile setup shipped beside this binary.
     ShellSetup {
         /// Trusted checkout/archive root, explicitly selected instead of guessing from CWD.
@@ -297,6 +311,15 @@ fn main() -> Result<()> {
                 ),
                 Err(error) => println!("renderer: invalid: {error:#}"),
             }
+            match render::gpu::probe() {
+                Ok(adapter) if adapter.cpu => println!(
+                    "gpu: {adapter} is a CPU rasterizer (auto uses the software renderer; --renderer gpu still works)"
+                ),
+                Ok(adapter) => println!("gpu: {adapter} (used by --renderer gpu or auto)"),
+                Err(error) => {
+                    println!("gpu: unavailable: {error:#} (auto uses the software renderer)")
+                }
+            }
             println!(
                 "osc52: {} (terminal output may {}; reading the clipboard is never allowed)",
                 match config.terminal.osc52 {
@@ -327,6 +350,17 @@ fn main() -> Result<()> {
             if !status.success() {
                 bail!("Shell setup failed: {status}");
             }
+            return Ok(());
+        }
+        Some(Action::BenchRender {
+            backend,
+            cols,
+            rows,
+            frames,
+            scenario,
+        }) => {
+            let report = render::bench::run(&config, *backend, *cols, *rows, *frames, scenario)?;
+            println!("{}", serde_json::to_string(&report.to_json())?);
             return Ok(());
         }
         Some(Action::Stop { force }) => {

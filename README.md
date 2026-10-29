@@ -228,8 +228,8 @@ Choose with `--renderer auto|gpu|software`, then `CROW_TERM_RENDERER`, then
 `renderer = "..."` in the config (invalid values are rejected). `software`
 stays the default until the GPU path has been validated by hand on real drivers,
 Wayland compositors and HiDPI displays; `auto` will become the default only
-after that. `crow-term doctor` prints the effective renderer and where it
-came from.
+after that. `crow-term doctor` prints the effective renderer, where it came
+from, and the GPU adapter that `gpu`/`auto` would use.
 
 The GPU renderer uses a non-sRGB surface so blending matches the software
 framebuffer: in CI, offscreen GPU frames of the real UI composition must match
@@ -243,8 +243,11 @@ request (no idle frames), the surface is configured only on resize/DPI changes,
 and presentation is vsync (FIFO).
 
 Redraws are event-driven, output updates are coalesced to at most 60 Hz, queues
-and scrollback are bounded, and release builds use thin LTO. “Optimized to the
-maximum” is a target to measure, not a certification.
+and scrollback are bounded, and release builds use thin LTO. For measurements,
+`crow-term bench-render --backend software|gpu --cols 120 --rows 40` times
+offscreen frames (idle, scroll, one changed row; p50/p95/p99, JSON) and
+`CROW_TERM_FRAME_STATS=1` prints the draw+present times of a real window on
+exit. These are measurements, not a claim of maximum performance.
 
 ## Licensing and upstream components
 
