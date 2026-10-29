@@ -196,6 +196,62 @@ impl<T> RowCache<T> {
     }
 }
 
+/// WCAG 2.x relative luminance of a `0xRRGGBB` color.
+pub fn relative_luminance(color: u32) -> f64 {
+    let channel = |shift: u32| {
+        let c = ((color >> shift) & 255) as f64 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+}
+/// WCAG 2.x contrast ratio of two colors, from 1.0 (equal) to 21.0.
+pub fn contrast_ratio(a: u32, b: u32) -> f64 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+fn mix_towards(color: u32, target: u32, step: u32) -> u32 {
+    let channel = |shift: u32| {
+        let c = (color >> shift) & 255;
+        let t = (target >> shift) & 255;
+        (c * (255 - step) + t * step + 127) / 255
+    };
+    channel(16) << 16 | channel(8) << 8 | channel(0)
+}
+/// `fg` itself when it already has `minimum` contrast against `bg`; otherwise
+/// the least change that reaches it: `fg` mixed towards black or white
+/// (whichever contrasts more with `bg`), which keeps its hue. When even pure
+/// black/white cannot reach `minimum`, that extreme is returned.
+pub fn ensure_contrast(fg: u32, bg: u32, minimum: f32) -> u32 {
+    let minimum = f64::from(minimum);
+    if minimum <= 1.0 || contrast_ratio(fg, bg) >= minimum {
+        return fg;
+    }
+    let target = if contrast_ratio(0xffffff, bg) >= contrast_ratio(0x000000, bg) {
+        0xffffff
+    } else {
+        0x000000
+    };
+    if contrast_ratio(target, bg) < minimum {
+        return target;
+    }
+    // Moving away from the background's luminance only raises the ratio, so
+    // the smallest sufficient step is found by bisection.
+    let (mut low, mut high) = (0u32, 255u32);
+    while low < high {
+        let step = (low + high) / 2;
+        if contrast_ratio(mix_towards(fg, target, step), bg) >= minimum {
+            high = step;
+        } else {
+            low = step + 1;
+        }
+    }
+    mix_towards(fg, target, low)
+}
+
 pub(crate) fn parse_color(value: &str, fallback: u32) -> u32 {
     value
         .strip_prefix('#')
@@ -231,6 +287,61 @@ pub(crate) fn resolve_color(config: &Config, color: ColorSpec) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wcag_contrast_matches_known_pairs() {
+        let close = |a: f64, b: f64| (a - b).abs() < 0.01;
+        assert!(close(contrast_ratio(0x000000, 0xffffff), 21.0));
+        assert!(close(contrast_ratio(0xffffff, 0xffffff), 1.0));
+        // Published WCAG reference values.
+        assert!(close(contrast_ratio(0x777777, 0xffffff), 4.48));
+        assert!(close(contrast_ratio(0x767676, 0xffffff), 4.54));
+        assert!(close(contrast_ratio(0x444444, 0xffffff), 9.74));
+        assert!(close(contrast_ratio(0x0000ff, 0xffffff), 8.59));
+        assert!(close(contrast_ratio(0xff0000, 0xffffff), 4.0));
+        // Symmetric.
+        assert_eq!(
+            contrast_ratio(0x123456, 0xabcdef),
+            contrast_ratio(0xabcdef, 0x123456)
+        );
+    }
+    #[test]
+    fn ensure_contrast_reaches_the_minimum_with_the_least_change() {
+        // Catppuccin Macchiato text on a white background (the reported bug).
+        for fg in [0xcad3f5, 0x8aadf4, 0xf0c6c6, 0x6e738d] {
+            let fixed = ensure_contrast(fg, 0xffffff, 3.0);
+            assert!(
+                contrast_ratio(fixed, 0xffffff) >= 3.0,
+                "{fg:06x} -> {fixed:06x}"
+            );
+            // Darkened (towards black on a light background), not replaced.
+            assert!(relative_luminance(fixed) <= relative_luminance(fg));
+            // Least change: one step less would not be enough.
+            if fixed != fg {
+                let target = 0x000000;
+                let mut found = None;
+                for step in 0..=255 {
+                    if contrast_ratio(mix_towards(fg, target, step), 0xffffff) >= 3.0 {
+                        found = Some(mix_towards(fg, target, step));
+                        break;
+                    }
+                }
+                assert_eq!(Some(fixed), found);
+            }
+        }
+        // Hue kept: a pale blue stays blue-dominant.
+        let blue = ensure_contrast(0xcad3f5, 0xffffff, 3.0);
+        assert!(blue & 0xff > (blue >> 16) & 0xff);
+        // Already sufficient: untouched, byte for byte.
+        assert_eq!(ensure_contrast(0x444444, 0xffffff, 3.0), 0x444444);
+        assert_eq!(ensure_contrast(0xeaeaea, 0x111111, 3.0), 0xeaeaea);
+        // Dark backgrounds lighten.
+        let light = ensure_contrast(0x303446, 0x24273a, 3.0);
+        assert!(contrast_ratio(light, 0x24273a) >= 3.0);
+        assert!(relative_luminance(light) > relative_luminance(0x303446));
+        // Off (1.0) never changes anything; unreachable minimums give the extreme.
+        assert_eq!(ensure_contrast(0xfefefe, 0xffffff, 1.0), 0xfefefe);
+        assert_eq!(ensure_contrast(0x777777, 0x777777, 21.0), 0x000000);
+    }
     use crate::model::UnderlineStyle;
     fn row(text: &str) -> Vec<Cell> {
         text.chars()
