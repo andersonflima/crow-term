@@ -1,7 +1,9 @@
+pub mod clip;
 pub mod config;
 pub mod crow;
 pub mod engine;
 pub mod frame_dump;
+pub mod hyperlinks;
 pub mod intercept;
 pub mod ipc;
 pub mod keyboard;

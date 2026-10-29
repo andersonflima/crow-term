@@ -62,6 +62,9 @@ pub struct FrameMeta {
     pub ime: String,
     /// Pane whose program is not reading its input, if any (footer note).
     pub stuck_pane: Option<u64>,
+    /// The link under the pointer while the link modifier is held.
+    #[serde(default)]
+    pub hover_link: Option<String>,
 }
 
 pub struct FrameDump {
@@ -190,6 +193,7 @@ mod tests {
             status: String::new(),
             ime: String::new(),
             stuck_pane: None,
+            hover_link: None,
         }
     }
 

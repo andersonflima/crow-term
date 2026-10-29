@@ -41,6 +41,14 @@ class Driver:
     def click(self, gui, x, y):
         raise NotImplementedError
 
+    def move(self, gui, x, y):
+        """Move the pointer over a client-area point without clicking."""
+        raise NotImplementedError
+
+    def modifier(self, gui, name, down):
+        """Hold ("ctrl", "super") or release a modifier key on its own."""
+        raise NotImplementedError
+
     def resize(self, gui, width, height):
         """Request a client-area size in physical pixels."""
         raise NotImplementedError

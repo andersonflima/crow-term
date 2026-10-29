@@ -89,6 +89,44 @@ Without the prefix, Vim control chords go to the PTY. Clipboard shortcuts are
 `Ctrl-Shift-C/V` and `Command-C/V` on macOS. Scrollback, selection, bracketed paste,
 truecolor, alternate screen and application mouse reporting are implemented.
 
+### Links, copy and paste
+
+- **Links:** `Command`-click (macOS) or `Ctrl`-click (Linux, Windows) opens the
+  link under the pointer: an OSC 8 hyperlink, or a URL in the text, also when
+  it wraps across lines. Holding the modifier underlines the link, shows a hand
+  pointer and puts the real target in the status line (`scheme://host:port`
+  always in full, the host in punycode, invisible characters escaped; only the
+  path is shortened). The click is the terminal's; the program never gets it.
+  - `http`/`https` open directly, unless the URL has a user name before the
+    host or an OSC 8 text names a different host anywhere in it: then a second,
+    deliberate click (at least 0.5 s later, button released in between, within
+    5 s) is required. URLs with a backslash, spaces or control characters are
+    refused (browsers read `\` as `/`).
+  - `mailto` opens with only `to`, `cc`, `bcc`, `subject` and `body` kept.
+  - Local `file:` links ask first, then resolve symlinks and `..`, and open
+    only a regular, non-executable document: `txt`, `md`, `markdown`, `pdf`,
+    `png`, `jpg`, `jpeg`, `gif`, `webp`, `csv`, `tsv`, `log`, `json`. Anything
+    else (folders, `.app` bundles and paths inside them, HTML, SVG, source code,
+    scripts, `.webloc`, `.lnk`, `.exe`…) is shown in Finder/Explorer, never
+    opened. Remote and UNC `file:` links are refused.
+  - Every other scheme is refused. Links open through the OS opener (`open`,
+    `xdg-open`, the Windows URL handler) with the URL as one argument, never a
+    shell.
+- **Paste** (`Ctrl-Shift-V`, `Command-V`) takes, in this order: copied
+  **files** (pasted as paths), an **image** alone on the clipboard (written as a
+  PNG to a private `pasted-images` cache directory, mode 0700, files older than
+  24 h removed, and its path pasted), else **text** (bracketed paste; every ESC
+  in it is removed so it cannot end the paste). Files dropped on the window
+  paste their paths the same way. A path is pasted as `'<path>'`, a form every
+  shell (sh, bash, zsh, dash, ksh, fish, tcsh, PowerShell) reads verbatim; a
+  name containing `'`, `\`, `!`, `$`, a backtick or a control character (on
+  Windows also `& | ^ % ( ) < > "`) is not pasted, and the status line says
+  why. Plain `Ctrl-V` and `Ctrl-C` are never taken: they reach the program as
+  keys (agent CLIs read clipboard images on `Ctrl-V`).
+- **Copy** (`Ctrl-Shift-C`, `Command-C`) copies the selection as plain text:
+  soft-wrapped lines are joined, wide characters and emoji kept, trailing
+  blanks of each line trimmed. OSC 52 is unchanged (below).
+
 ## Crow agent status bar and panel
 
 When the [`crow-skills`](https://github.com/andersonflima/crow-skills) CLI is

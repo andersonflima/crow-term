@@ -97,9 +97,20 @@ class X11(Driver):
         time.sleep(0.05)
 
     def click(self, gui, x, y):
-        window = self.activate(gui)
-        run("xdotool", "mousemove", "--window", window, "--sync", int(x), int(y))
+        self.move(gui, x, y)
         run("xdotool", "click", "1")
+
+    def move(self, gui, x, y):
+        window = self.activate(gui)
+        # No --sync: it waits for a pointer motion, which never comes when the
+        # pointer is already there (a click right after move()).
+        run("xdotool", "mousemove", "--window", window, int(x), int(y))
+        time.sleep(0.15)
+
+    def modifier(self, gui, name, down):
+        self.activate(gui)
+        run("xdotool", "keydown" if down else "keyup", name)
+        time.sleep(0.05)
 
     def resize(self, gui, width, height):
         window = self.activate(gui)

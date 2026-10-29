@@ -68,6 +68,9 @@ static class WinGui
                 case "key": Key(args[1]); return 0;
                 case "type": TypeText(Encoding.UTF8.GetString(Convert.FromBase64String(args[1]))); return 0;
                 case "click": Click(Hwnd(args[1]), int.Parse(args[2]), int.Parse(args[3])); return 0;
+                case "move": Move(Hwnd(args[1]), int.Parse(args[2]), int.Parse(args[3])); return 0;
+                case "keydown": SendKeys(new[] { Vk(args[1]) }, true); return 0;
+                case "keyup": SendKeys(new[] { Vk(args[1]) }, false); return 0;
                 case "resize": Resize(Hwnd(args[1]), int.Parse(args[2]), int.Parse(args[3])); return 0;
                 case "close": PostMessage(Hwnd(args[1]), 0x0010, IntPtr.Zero, IntPtr.Zero); return 0;
                 case "screenshot": Screenshot(args[1]); return 0;
@@ -184,13 +187,18 @@ static class WinGui
         }
     }
 
-    static void Click(IntPtr hwnd, int x, int y)
+    static void Move(IntPtr hwnd, int x, int y)
     {
         var point = new POINT();
         point.X = x; point.Y = y;
         ClientToScreen(hwnd, ref point);
         SetCursorPos(point.X, point.Y);
         Thread.Sleep(60);
+    }
+
+    static void Click(IntPtr hwnd, int x, int y)
+    {
+        Move(hwnd, x, y);
         var inputs = new INPUT[2];
         inputs[0].type = INPUT_MOUSE; inputs[0].u.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
         inputs[1].type = INPUT_MOUSE; inputs[1].u.mi.dwFlags = MOUSEEVENTF_LEFTUP;
