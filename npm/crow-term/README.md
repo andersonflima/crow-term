@@ -16,8 +16,15 @@ linux-arm64, win32-x64) through optional dependencies; this package only holds a
 small launcher. Nothing is downloaded by install scripts. Do not install with
 `--omit=optional` / `--no-optional`, or the binary is missing.
 
-The macOS binary is the signed (and, when the release says so, notarized) app
-bundle; Windows builds are not code-signed yet. Linux needs libxkbcommon, plus
-libxkbcommon-x11 on X11 and libwayland-client on Wayland.
+The macOS binary is the Developer ID signed (and, when the release says so,
+notarized) app bundle; Windows builds are not code-signed yet. Linux needs
+**glibc 2.35 or newer** (Ubuntu 22.04, Debian 12, Fedora 36 and later; musl
+systems such as Alpine are not supported) and libxkbcommon, plus
+libxkbcommon-x11 on X11 and libwayland-client on Wayland. The launcher says so
+and stops if the system's glibc is too old.
 
-MIT licensed; third-party notices are in `THIRD_PARTY_LICENSES.txt`.
+Install Crow Term one way only (this package, or the Homebrew formula, or the
+cask): every `crow-term` of a user shares one daemon socket.
+
+MIT licensed; third-party notices are in `THIRD_PARTY_LICENSES.txt` (inside the
+app bundle on macOS), font and theme licenses in `assets/`.

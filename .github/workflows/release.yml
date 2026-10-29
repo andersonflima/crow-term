@@ -75,8 +75,10 @@ jobs:
           - { os: macos-15, target: macos-arm64 }
           # Intel macOS: macos-13 is retired; macos-15-intel is the supported x86_64 label.
           - { os: macos-15-intel, target: macos-x86_64 }
-          - { os: ubuntu-24.04, target: linux-x86_64 }
-          - { os: ubuntu-24.04-arm, target: linux-arm64 }
+          # Linux builds on the oldest supported runner: the binary needs the glibc
+          # it was linked against (2.35 here) or newer; 24.04 would require 2.39.
+          - { os: ubuntu-22.04, target: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, target: linux-arm64 }
           - { os: windows-2025, target: windows-x86_64 }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -239,8 +241,17 @@ jobs:
         run: |
           python scripts/package.py archive --version "${VERSION}"
           mkdir -p dist/status
-          printf '{"target":"%s","signed":%s,"notarized":%s}\n' \
-            "${TARGET}" "${SIGNED:-false}" "${NOTARIZED:-false}" > "dist/status/${TARGET}.json"
+          glibc=null
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            # Newest GLIBC_x.y symbol version the binary references: the minimum
+            # glibc it runs on (published in the npm package and checked by its launcher).
+            glibc="$(objdump -T "${STAGE}/crow-term" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+            [[ -n "${glibc}" ]] || { echo "::error::no GLIBC symbol versions found"; exit 1; }
+            echo "Linux binary needs glibc >= ${glibc}"
+            glibc="\"${glibc}\""
+          fi
+          printf '{"target":"%s","signed":%s,"notarized":%s,"glibc":%s}\n' \
+            "${TARGET}" "${SIGNED:-false}" "${NOTARIZED:-false}" "${glibc}" > "dist/status/${TARGET}.json"
           cat "dist/status/${TARGET}.json"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -317,6 +328,7 @@ jobs:
             dist/*.zip
             dist/*.sha256
             dist/SHA256SUMS
+            dist/status/*.json
           if-no-files-found: error
           retention-days: 14
 
@@ -400,15 +412,39 @@ jobs:
           node-version: '22'
           registry-url: https://registry.npmjs.org
       - name: npm with trusted publishing support
-        run: npm install -g npm@11 && npm --version
+        # Exact version: this job holds id-token: write, so nothing in it may float.
+        run: npm install -g npm@11.20.0 && npm --version
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-bundle
           path: dist
+      - name: macOS packages must be Developer ID signed on a tag
+        run: |
+          # npm versions can never be replaced: an ad-hoc signed bundle published
+          # once stays published. A dry run reports; a tag build refuses.
+          refuse=false
+          for target in macos-arm64 macos-x86_64; do
+            status="dist/status/${target}.json"
+            [[ -f "${status}" ]] || { echo "::error::missing ${status}"; exit 1; }
+            signed="$(jq -r .signed "${status}")"
+            notarized="$(jq -r .notarized "${status}")"
+            echo "${target}: signed=${signed} notarized=${notarized}"
+            if [[ "${signed}" != "true" ]]; then
+              refuse=true
+            elif [[ "${notarized}" != "true" ]]; then
+              echo "::warning::${target} is signed but not notarized"
+            fi
+          done
+          if [[ "${refuse}" == "true" ]]; then
+            if [[ "${PUBLISH}" == "true" ]]; then
+              echo "::error::macOS builds are only ad-hoc signed; refusing to publish npm packages"; exit 1
+            fi
+            echo "::warning::macOS builds are only ad-hoc signed (dry run: nothing is published)"
+          fi
       - name: Build the npm packages from the release archives
         run: |
           python tests/npm_package_test.py
-          python scripts/npm_package.py --dist dist --out npm-dist --version "${VERSION}"
+          python scripts/npm_package.py --dist dist --out npm-dist --version "${VERSION}" --status dist/status
       - name: Pack and smoke-test the linux-x64 install layout
         run: |
           mkdir -p packs
@@ -434,15 +470,21 @@ jobs:
         run: |
           # Alpha-only project: prereleases also take the `latest` tag so that
           # `npm i -g @andespindola/crow-term` installs them (npm 11 requires an
-          # explicit --tag for a prerelease). Versions already on the registry
-          # (a re-run after a partial failure, or a hand-published bootstrap)
-          # are skipped: npm never republishes a version.
+          # explicit --tag for a prerelease). npm never republishes a version, so
+          # a version already on the registry is skipped only when it is this
+          # exact tarball (a re-run after a partial failure); anything else under
+          # this version (a hand-published or different build) fails the job.
           publish() {
-            local pack="$1" name
+            local pack="$1" name local_integrity remote_integrity
             name="$(tar -xOzf "${pack}" package/package.json | node -p 'JSON.parse(require("fs").readFileSync(0, "utf8")).name')"
-            if npm view "${name}@${VERSION}" version >/dev/null 2>&1; then
-              echo "${name}@${VERSION} already published; skipping"
-              return 0
+            local_integrity="sha512-$(openssl dgst -sha512 -binary "${pack}" | base64 -w0)"
+            if remote_integrity="$(npm view "${name}@${VERSION}" dist.integrity 2>/dev/null)" && [[ -n "${remote_integrity}" ]]; then
+              if [[ "${remote_integrity}" == "${local_integrity}" ]]; then
+                echo "${name}@${VERSION} already published with this exact tarball; skipping"
+                return 0
+              fi
+              echo "::error::${name}@${VERSION} is on the registry with a different tarball (${remote_integrity}, built ${local_integrity})"
+              return 1
             fi
             # ./ keeps npm from reading packs/x.tgz as GitHub shorthand.
             npm publish "./${pack}" --access public --tag latest
