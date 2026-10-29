@@ -538,7 +538,7 @@ pub fn ascii_host(host: &str) -> String {
 
 /// Characters that change how text looks without being seen: bidi controls,
 /// zero-width characters, the BOM.
-fn invisible(c: char) -> bool {
+pub fn invisible(c: char) -> bool {
     matches!(c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}'
         | '\u{2066}'..='\u{2069}' | '\u{061c}' | '\u{feff}' | '\u{180e}' | '\u{00ad}')
 }

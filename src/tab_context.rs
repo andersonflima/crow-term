@@ -1,20 +1,24 @@
 //! What a tab and the status bar say about a pane: which program runs in it,
 //! which agent (and task) it belongs to, which repository and branch. Pure
-//! and unit-tested; the UI only measures and paints the result.
+//! and unit-tested; the UI only measures and paints the result, and never
+//! touches the filesystem for it (the daemon's summary thread reads the
+//! repository from `.git` files; nothing ever runs `git`).
 //!
-//! * Tab label, first that applies: the user's name for the window (`rename`),
-//!   the program's own title (OSC 0/2), an agent CLI and its task, the
-//!   foreground program, `repo@branch`, the shell.
-//! * Footer, for the focused pane, in priority order (lower-priority segments
+//! * Tab label, first that applies: the user's name for the window (rename),
+//!   the agent CLI in the foreground and its task, a title the foreground
+//!   program set (not a shell's prompt title, a path or the program's own
+//!   name), the foreground program, `repo@branch`, the shell.
+//! * Footer, for the focused pane, in priority order (lower-priority parts
 //!   are dropped first when space runs out): agent and state, task or tool,
-//!   run progress, model and context use, `repo@branch` with dirty/ahead/
-//!   behind marks; without an agent, the foreground program and directory.
-//!   One compact global segment sits on the right: crow on/off, active agent
-//!   sessions, memory only under pressure.
+//!   run progress, model and context use, `repo@branch`; without an agent,
+//!   the foreground program and directory. One compact global part sits on
+//!   the right: crow on/off, active agent sessions, memory only under
+//!   pressure.
 use crate::model::PaneSummary;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Shells: when one is in the foreground the pane is "idle at a prompt".
-pub const SHELLS: [&str; 14] = [
+pub const SHELLS: [&str; 15] = [
     "sh",
     "bash",
     "zsh",
@@ -29,6 +33,7 @@ pub const SHELLS: [&str; 14] = [
     "elvish",
     "pwsh",
     "powershell",
+    "cmd",
 ];
 /// Agent CLIs matched to crow sessions.
 pub const AGENTS: [&str; 5] = ["claude", "codex", "gemini", "agy", "devin"];
@@ -53,70 +58,104 @@ pub fn is_shell(name: &str) -> bool {
     SHELLS.contains(&program_name(name).as_str())
 }
 
+/// Text from programs and agents as it may be painted: no control, bidi or
+/// zero-width characters (they could reorder or hide what is shown).
+pub fn sanitize(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !c.is_control() && !crate::hyperlinks::invisible(c))
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
 /// The arguments worth showing for `program` (daemon side, before anything
 /// leaves the process): only for allowlisted programs, only the first plain
-/// argument, and only if it cannot be a secret (no `=`, `@`, `:`, no flags,
-/// short, plain characters). Paths are reduced to their file name.
+/// argument that is not the value of a flag (`nvim -u NONE x` → `x`, `npm
+/// --otp 123456 publish` → `publish`), and only if it cannot be a secret (no
+/// `=`, `@`, `:`, short, plain characters). Paths are reduced to their name.
 pub fn safe_args(program: &str, args: &[String]) -> Vec<String> {
     if !SHOW_ARGUMENT.contains(&program_name(program).as_str()) {
         return Vec::new();
     }
-    let plain = |arg: &&String| {
-        !arg.starts_with('-')
-            && !arg.is_empty()
+    let plain = |arg: &str| {
+        !arg.is_empty()
             && arg.chars().count() <= 64
             && arg
                 .chars()
                 .all(|c| c.is_alphanumeric() || "._/-+".contains(c))
     };
-    args.iter()
-        .find(plain)
-        .map(|arg| {
+    let mut after_flag = false;
+    for arg in args {
+        if arg.starts_with('-') {
+            // `--flag=value` carries its value; `-f value` takes the next word.
+            after_flag = !arg.contains('=') && arg != "-" && arg != "--";
+            continue;
+        }
+        if std::mem::take(&mut after_flag) {
+            continue;
+        }
+        if plain(arg) {
             let name = arg.rsplit('/').next().unwrap_or(arg);
-            if name.is_empty() {
+            return vec![if name.is_empty() {
                 arg.clone()
             } else {
                 name.to_owned()
+            }];
+        }
+        return Vec::new();
+    }
+    Vec::new()
+}
+
+/// Shorten `text` until `fits` accepts it: `…` in the middle (keeping the
+/// distinctive end) or, for `Words`, at the end of a word when that leaves
+/// at least half of it. Cuts only between grapheme clusters, so a ZWJ
+/// sequence, a flag or a letter with its accents stays whole.
+pub fn shorten(text: &str, style: Shorten, mut fits: impl FnMut(&str) -> bool) -> Option<String> {
+    if fits(text) {
+        return Some(text.to_owned());
+    }
+    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    for keep in (1..graphemes.len()).rev() {
+        let candidate = match style {
+            Shorten::Middle => {
+                let tail = keep / 2 + keep % 2;
+                let head = keep - tail;
+                format!(
+                    "{}…{}",
+                    graphemes[..head].concat(),
+                    graphemes[graphemes.len() - tail..].concat()
+                )
             }
-        })
-        .into_iter()
-        .collect()
+            Shorten::Words => {
+                let cut = graphemes[..keep].concat();
+                match cut.rfind(' ') {
+                    Some(at) if cut[..at].graphemes(true).count() >= keep / 2 => {
+                        format!("{}…", cut[..at].trim_end())
+                    }
+                    _ => format!("{cut}…"),
+                }
+            }
+        };
+        if fits(&candidate) {
+            return Some(candidate);
+        }
+    }
+    fits("…").then(|| "…".to_owned())
 }
 
-/// `…` in the middle, keeping the distinctive end (`crow-ter…/feature/x`).
+/// Display width in terminal cells (wide characters count two).
+pub fn cells(text: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(text)
+}
+
+/// `…` in the middle so that `text` fits `max` cells.
 pub fn middle_ellipsis(text: &str, max: usize) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max {
-        return text.to_owned();
-    }
-    if max <= 1 {
-        return "…".chars().take(max).collect();
-    }
-    let tail = (max - 1) / 2 + (max - 1) % 2;
-    let head = max - 1 - tail;
-    let mut out: String = chars[..head].iter().collect();
-    out.push('…');
-    out.extend(&chars[chars.len() - tail..]);
-    out
-}
-
-/// Shorten at a word boundary when one leaves enough text; else cut with `…`.
-pub fn word_ellipsis(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_owned();
-    }
-    if max <= 1 {
-        return "…".chars().take(max).collect();
-    }
-    let cut: String = text.chars().take(max - 1).collect();
-    match cut.rfind(' ') {
-        Some(at) if cut[..at].chars().count() >= max / 2 => format!("{}…", cut[..at].trim_end()),
-        _ => format!("{cut}…"),
-    }
+    shorten(text, Shorten::Middle, |t| cells(t) <= max).unwrap_or_default()
 }
 
 /// An agent CLI session as published by crow-skills (only what matching and
-/// display need).
+/// display need; text already sanitized).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Agent {
     pub host: String,
@@ -141,97 +180,42 @@ pub struct Progress {
     pub failed: u64,
 }
 
-/// `git status --porcelain=v2 --branch` digest.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
-pub struct Repo {
-    pub name: String,
-    pub branch: String,
-    pub dirty: bool,
-    pub ahead: u64,
-    pub behind: u64,
+/// `name@branch` of the pane's repository (from `PaneSummary::repo`).
+fn repo_label(pane: &PaneSummary) -> Option<String> {
+    pane.repo
+        .as_ref()
+        .map(|(name, branch)| format!("{}@{}", sanitize(name), sanitize(branch)))
 }
 
-impl Repo {
-    /// `crow-term@main *↑2↓1`.
-    pub fn label(&self) -> String {
-        let mut out = format!("{}@{}", self.name, self.branch);
-        let marks: String = [
-            self.dirty.then(|| "*".to_owned()),
-            (self.ahead > 0).then(|| format!("↑{}", self.ahead)),
-            (self.behind > 0).then(|| format!("↓{}", self.behind)),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        if !marks.is_empty() {
-            out.push(' ');
-            out.push_str(&marks);
-        }
-        out
-    }
-}
-
-/// Parse `git status --porcelain=v2 --branch` (repository name from `top`).
-pub fn parse_git_status(output: &str, top: &str) -> Option<Repo> {
-    let mut repo = Repo {
-        name: top
-            .trim_end_matches(['/', '\\'])
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or_default()
-            .to_owned(),
-        ..Repo::default()
-    };
-    let mut head = None;
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("# branch.head ") {
-            head = Some(rest.trim().to_owned());
-        } else if let Some(rest) = line.strip_prefix("# branch.oid ") {
-            if head.as_deref() == Some("(detached)") || head.is_none() {
-                repo.branch = rest.chars().take(7).collect();
-            }
-        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
-            for part in rest.split_whitespace() {
-                if let Some(n) = part.strip_prefix('+') {
-                    repo.ahead = n.parse().unwrap_or(0);
-                } else if let Some(n) = part.strip_prefix('-') {
-                    repo.behind = n.parse().unwrap_or(0);
-                }
-            }
-        } else if !line.starts_with('#') && !line.is_empty() {
-            repo.dirty = true;
-        }
-    }
-    match head.as_deref() {
-        Some("(detached)") | None => {}
-        Some(branch) => repo.branch = branch.to_owned(),
-    }
-    (!repo.branch.is_empty() && !repo.name.is_empty()).then_some(repo)
-}
-
-/// The agent session running in `pane`: by process id, then by terminal,
-/// then (when the foreground is an agent CLI) by directory, most recently
-/// active first.
+/// The agent session running in `pane`. The pane's foreground program must
+/// be that agent CLI; then the session with the pane's process id, else with
+/// its terminal, else the only session of that CLI in the pane's directory
+/// that reports neither (two of them there: no guess).
 pub fn agent_for<'a>(pane: &PaneSummary, agents: &'a [Agent]) -> Option<&'a Agent> {
-    if let Some(agent) = agents.iter().find(|a| a.pid.is_some() && a.pid == pane.pid) {
+    let process = program_name(&pane.process);
+    if !AGENTS.contains(&process.as_str()) {
+        return None;
+    }
+    let same_cli: Vec<&Agent> = agents.iter().filter(|a| a.host == process).collect();
+    if let Some(agent) = same_cli
+        .iter()
+        .find(|a| a.pid.is_some() && a.pid == pane.pid)
+    {
         return Some(agent);
     }
     if !pane.tty.is_empty()
-        && let Some(agent) = agents
+        && let Some(agent) = same_cli
             .iter()
             .find(|a| a.tty.as_deref() == Some(pane.tty.as_str()))
     {
         return Some(agent);
     }
-    let process = program_name(&pane.process);
-    if !AGENTS.contains(&process.as_str()) {
-        return None;
-    }
     let cwd = pane.cwd.as_deref()?;
-    agents
-        .iter()
-        .filter(|a| a.host == process && same_dir(&a.cwd, cwd))
-        .min_by_key(|a| a.age_seconds)
+    let mut here = same_cli
+        .into_iter()
+        .filter(|a| a.pid.is_none() && a.tty.is_none() && same_dir(&a.cwd, cwd));
+    let first = here.next()?;
+    here.next().is_none().then_some(first)
 }
 
 fn same_dir(a: &str, b: &str) -> bool {
@@ -248,52 +232,78 @@ pub fn short_dir(cwd: &str, home: Option<&str>) -> String {
     }
 }
 
+fn looks_like_path(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.starts_with('/')
+        || text.starts_with('~')
+        || text.contains('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        || text.to_ascii_lowercase().ends_with(".exe")
+}
+
+/// A title worth showing: set by a program in the foreground (not by the
+/// shell's prompt), not a path (ConPTY's executable path, `~/dir`), not
+/// `user@host: dir`, not the program's own name (with or without a path).
+pub fn useful_title(pane: &PaneSummary) -> Option<String> {
+    if pane.process.is_empty() || is_shell(&pane.process) {
+        return None;
+    }
+    let title = sanitize(&pane.title);
+    let program = program_name(&pane.process);
+    let lower = title.to_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    let rest = lower[first.len()..].trim();
+    let user_host = title
+        .split_once('@')
+        .is_some_and(|(_, after)| after.contains(':'));
+    let useless = title.is_empty()
+        || looks_like_path(&title)
+        || user_host
+        || lower == program
+        || (program_name(first) == program && (rest.is_empty() || looks_like_path(rest)));
+    (!useless).then_some(title)
+}
+
 /// Everything a tab label can be made from.
 pub struct LabelInput<'a> {
     /// The window's name when the user renamed it (`None` for the default).
     pub rename: Option<&'a str>,
     pub pane: Option<&'a PaneSummary>,
     pub agent: Option<&'a Agent>,
-    pub repo: Option<&'a Repo>,
     pub shell: &'a str,
 }
 
-/// The tab label (full; the UI middle-ellipsizes it to the tab width).
+/// The tab label (full; the UI shortens it to the tab width).
 pub fn tab_label(input: &LabelInput<'_>) -> String {
-    if let Some(name) = input.rename.filter(|n| !n.trim().is_empty()) {
-        return name.to_owned();
+    if let Some(name) = input.rename.map(sanitize).filter(|n| !n.is_empty()) {
+        return name;
     }
     if let Some(pane) = input.pane {
-        let title = pane.title.trim();
-        if !title.is_empty() {
-            return title.to_owned();
-        }
         if let Some(agent) = input.agent {
             return match agent.task.as_deref().or(agent.tool.as_deref()) {
                 Some(task) => format!("{} · {task}", agent.host),
                 None => agent.host.clone(),
             };
         }
+        if let Some(title) = useful_title(pane) {
+            return title;
+        }
         if !pane.process.is_empty() && !is_shell(&pane.process) {
             let mut label = program_name(&pane.process);
             for arg in &pane.args {
                 label.push(' ');
-                label.push_str(arg);
+                label.push_str(&sanitize(arg));
             }
             return label;
         }
+        if let Some(repo) = repo_label(pane) {
+            return repo;
+        }
+        if !pane.process.is_empty() {
+            return program_name(&pane.process);
+        }
     }
-    if let Some(repo) = input.repo {
-        return format!("{}@{}", repo.name, repo.branch);
-    }
-    match input
-        .pane
-        .map(|p| program_name(&p.process))
-        .filter(|p| !p.is_empty())
-    {
-        Some(shell) => shell,
-        None => program_name(input.shell),
-    }
+    program_name(input.shell)
 }
 
 /// How a segment is painted (the UI maps it to theme colours).
@@ -330,6 +340,7 @@ pub enum Shorten {
 }
 
 fn segment(text: String, tone: Tone, priority: u8, shorten: Shorten) -> Segment {
+    let text = sanitize(&text);
     Segment {
         full: text.clone(),
         text,
@@ -344,7 +355,6 @@ pub struct FooterInput<'a> {
     pub pane: Option<&'a PaneSummary>,
     pub agent: Option<&'a Agent>,
     pub progress: Option<&'a Progress>,
-    pub repo: Option<&'a Repo>,
     pub home: Option<&'a str>,
     /// The session name, shown only when more than one session exists.
     pub session: Option<&'a str>,
@@ -426,8 +436,8 @@ pub fn footer_segments(input: &FooterInput<'_>) -> Vec<Segment> {
             out.push(segment(text, tone, 3, Shorten::Middle));
         }
     }
-    if let Some(repo) = input.repo {
-        out.push(segment(repo.label(), Tone::Plain, 4, Shorten::Middle));
+    if let Some(repo) = input.pane.and_then(repo_label) {
+        out.push(segment(repo, Tone::Plain, 4, Shorten::Middle));
     } else if input.agent.is_none()
         && let Some(cwd) = input.pane.and_then(|p| p.cwd.as_deref())
     {
@@ -502,21 +512,22 @@ pub fn global_segment(input: &GlobalInput) -> Option<Segment> {
     (!parts.is_empty()).then(|| segment(parts.join(" · "), tone, 0, Shorten::Middle))
 }
 
-/// Fit `segments` into `width` (in the units `measure` returns), with `gap`
-/// between them: whole low-priority segments go first; when only one is
-/// left and it still does not fit, it is shortened (middle ellipsis for
-/// names, at a word for task text). Order is kept.
+/// Fit `segments` into `width` (in the units `measure` returns, real glyph
+/// widths in the UI), with `gap` between them: whole low-priority segments
+/// go first; when only one is left and it still does not fit, it is
+/// shortened (middle ellipsis for names, at a word for task text). Order is
+/// kept.
 pub fn fit(
     mut segments: Vec<Segment>,
     width: f32,
     gap: f32,
-    measure: impl Fn(&str) -> f32,
+    mut measure: impl FnMut(&str) -> f32,
 ) -> Vec<Segment> {
-    let total = |segments: &[Segment]| {
+    let total = |segments: &[Segment], measure: &mut dyn FnMut(&str) -> f32| {
         segments.iter().map(|s| measure(&s.text)).sum::<f32>()
             + gap * segments.len().saturating_sub(1) as f32
     };
-    while segments.len() > 1 && total(&segments) > width {
+    while segments.len() > 1 && total(&segments, &mut measure) > width {
         let worst = segments
             .iter()
             .enumerate()
@@ -526,48 +537,17 @@ pub fn fit(
         segments.remove(worst);
     }
     if let Some(only) = segments.first_mut()
-        && total(std::slice::from_ref(only)) > width
+        && measure(&only.text) > width
     {
-        let full = only.full.clone();
-        let mut max = full.chars().count();
-        while max > 1 {
-            max -= 1;
-            let text = match only.shorten {
-                Shorten::Middle => middle_ellipsis(&full, max),
-                Shorten::Words => word_ellipsis(&full, max),
-            };
-            if measure(&text) <= width {
-                only.text = text;
-                break;
-            }
-        }
-        if measure(&only.text) > width {
-            segments.clear();
+        match shorten(&only.full, only.shorten, |t| measure(t) <= width) {
+            Some(text) => only.text = text,
+            None => segments.clear(),
         }
     }
     segments
 }
 
-/// WCAG relative luminance of `0xRRGGBB`.
-pub fn luminance(rgb: u32) -> f64 {
-    let channel = |shift: u32| {
-        let c = f64::from((rgb >> shift) & 0xff) / 255.0;
-        if c <= 0.03928 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
-}
-
-/// WCAG contrast ratio between two colours.
-pub fn contrast(a: u32, b: u32) -> f64 {
-    let (la, lb) = (luminance(a), luminance(b));
-    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
-}
-
-/// Shows a label only after it held for `DEBOUNCE`, so a tab does not
+/// Shows a label only after it held for `DELAY`, so a tab does not
 /// flicker through every short-lived command.
 #[derive(Debug, Default)]
 pub struct Debounce {
@@ -609,13 +589,12 @@ impl Debounce {
     }
 }
 
-/// Per-GUI state: the latest pane summaries, debounced tab labels, and the
-/// repository of each directory (read from `.git`, cached for 5 s).
+/// Per-GUI state: the latest pane summaries and the debounced tab labels.
+/// Pure data: no filesystem access (repositories come in the summaries).
 #[derive(Default)]
 pub struct State {
     panes: std::collections::HashMap<u64, PaneSummary>,
     debounce: Debounce,
-    repos: std::collections::HashMap<String, (std::time::Instant, Option<Repo>)>,
 }
 
 impl State {
@@ -630,29 +609,6 @@ impl State {
         self.panes.get(&id)
     }
 
-    fn repo(&mut self, cwd: Option<&str>) -> Option<Repo> {
-        let cwd = cwd?;
-        let now = std::time::Instant::now();
-        if let Some((at, repo)) = self.repos.get(cwd)
-            && now.duration_since(*at) < std::time::Duration::from_secs(5)
-        {
-            return repo.clone();
-        }
-        let repo = crate::crow::git_repo(std::path::Path::new(cwd)).map(|(top, branch)| Repo {
-            name: top
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            branch,
-            ..Repo::default()
-        });
-        if self.repos.len() > 64 {
-            self.repos.clear();
-        }
-        self.repos.insert(cwd.to_owned(), (now, repo.clone()));
-        repo
-    }
-
     /// The (debounced, full-length) label of a tab showing `pane`.
     pub fn tab_label(
         &mut self,
@@ -661,54 +617,43 @@ impl State {
         pane: Option<u64>,
         agents: &[Agent],
         shell: &str,
+        now: std::time::Instant,
     ) -> String {
         // "shell" is the name every window starts with; anything else is the user's.
         let rename = (name != "shell").then_some(name);
-        let summary = pane.and_then(|p| self.panes.get(&p)).cloned();
-        let agent = summary.as_ref().and_then(|s| agent_for(s, agents)).cloned();
-        let repo = self.repo(summary.as_ref().and_then(|s| s.cwd.as_deref()));
+        let summary = pane.and_then(|p| self.panes.get(&p));
+        let agent = summary.and_then(|s| agent_for(s, agents));
         let label = tab_label(&LabelInput {
             rename,
-            pane: summary.as_ref(),
-            agent: agent.as_ref(),
-            repo: repo.as_ref(),
+            pane: summary,
+            agent,
             shell,
         });
-        self.debounce
-            .label(window, label, std::time::Instant::now())
+        self.debounce.label(window, label, now)
     }
 
     /// When a debounced label is due (the UI schedules a redraw).
-    pub fn next_change(&self) -> Option<std::time::Duration> {
-        self.debounce.next_change(std::time::Instant::now())
+    pub fn next_change(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        self.debounce.next_change(now)
     }
 
     /// Footer segments for the focused `pane` and the global segment.
     pub fn footer(
-        &mut self,
+        &self,
         pane: u64,
         context: &crate::crow::Context,
         session: Option<&str>,
+        home: Option<&str>,
     ) -> (Vec<Segment>, Option<Segment>) {
-        let summary = self.panes.get(&pane).cloned();
-        let agent = summary
-            .as_ref()
-            .and_then(|s| agent_for(s, &context.agents))
-            .cloned();
-        // The worker's facts are about the pane it last looked at.
+        let summary = self.panes.get(&pane);
+        let agent = summary.and_then(|s| agent_for(s, &context.agents));
+        // The worker's run progress is about the pane it last looked at.
         let current = context.pane == pane;
-        let repo = if current && context.repo.is_some() {
-            context.repo.clone()
-        } else {
-            self.repo(summary.as_ref().and_then(|s| s.cwd.as_deref()))
-        };
-        let home = std::env::var("HOME").ok();
         let segments = footer_segments(&FooterInput {
-            pane: summary.as_ref(),
-            agent: agent.as_ref(),
+            pane: summary,
+            agent,
             progress: context.progress.as_ref().filter(|_| current),
-            repo: repo.as_ref(),
-            home: home.as_deref(),
+            home,
             session,
         });
         (segments, context.global.clone())
@@ -727,6 +672,7 @@ mod tests {
             pid: Some(4242),
             tty: "/dev/ttys004".into(),
             cwd: cwd.map(str::to_owned),
+            repo: None,
         }
     }
 
@@ -740,14 +686,31 @@ mod tests {
         }
     }
 
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn arguments_are_shown_only_when_they_cannot_be_secrets() {
-        let args = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            safe_args("/opt/homebrew/bin/nvim", &args(&["-p", "src/main.rs"])),
+            safe_args("/opt/homebrew/bin/nvim", &args(&["src/main.rs"])),
             ["main.rs"]
         );
         assert_eq!(safe_args("cargo", &args(&["test", "--lib"])), ["test"]);
+        // A flag's value is never shown.
+        assert!(safe_args("nvim", &args(&["-u", "NONE"])).is_empty());
+        assert_eq!(
+            safe_args("nvim", &args(&["-u", "NONE", "notes.md"])),
+            ["notes.md"]
+        );
+        assert_eq!(
+            safe_args("npm", &args(&["--otp", "123456", "publish"])),
+            ["publish"]
+        );
+        assert_eq!(
+            safe_args("npm", &args(&["--otp=123456", "publish"])),
+            ["publish"]
+        );
         assert!(
             safe_args("curl", &args(&["https://x"])).is_empty(),
             "not allowlisted"
@@ -764,96 +727,130 @@ mod tests {
 
     #[test]
     fn tab_labels_follow_the_documented_order() {
-        let p = pane("nvim", "", Some("/w/crow-term"));
-        let repo = Repo {
-            name: "crow-term".into(),
-            branch: "main".into(),
-            ..Repo::default()
-        };
+        let mut p = pane("nvim", "", Some("/w/crow-term"));
+        p.repo = Some(("crow-term".into(), "main".into()));
         let mut a = agent("claude", "/w/crow-term", 3);
         a.task = Some("fix login".into());
-        let input = |rename, pane, agent, repo| LabelInput {
-            rename,
-            pane,
-            agent,
-            repo,
-            shell: "/bin/zsh",
+        let label = |rename, pane: &PaneSummary, agent| {
+            tab_label(&LabelInput {
+                rename,
+                pane: Some(pane),
+                agent,
+                shell: "/bin/zsh",
+            })
         };
+        let mut agent_pane = pane("claude", "✳ Claude Code", Some("/w/crow-term"));
+        agent_pane.repo = p.repo.clone();
         assert_eq!(
-            tab_label(&input(Some("api"), Some(&p), Some(&a), Some(&repo))),
-            "api"
+            label(Some("api"), &agent_pane, Some(&a)),
+            "api",
+            "rename wins"
+        );
+        assert_eq!(
+            label(None, &agent_pane, Some(&a)),
+            "claude · fix login",
+            "agent beats its title"
         );
         let titled = pane("nvim", "main.rs - NVIM", None);
-        assert_eq!(
-            tab_label(&input(None, Some(&titled), Some(&a), Some(&repo))),
-            "main.rs - NVIM"
-        );
-        assert_eq!(
-            tab_label(&input(None, Some(&p), Some(&a), Some(&repo))),
-            "claude · fix login"
-        );
+        assert_eq!(label(None, &titled, None), "main.rs - NVIM");
         let mut with_arg = p.clone();
         with_arg.args = vec!["main.rs".into()];
+        assert_eq!(label(None, &with_arg, None), "nvim main.rs");
+        let mut shell = pane("-zsh", "user@mac: ~/w/crow-term", Some("/w/crow-term"));
+        shell.repo = p.repo.clone();
         assert_eq!(
-            tab_label(&input(None, Some(&with_arg), None, Some(&repo))),
-            "nvim main.rs"
+            label(None, &shell, None),
+            "crow-term@main",
+            "a shell's title is ignored"
         );
-        let shell = pane("-zsh", "", Some("/w/crow-term"));
+        shell.repo = None;
+        assert_eq!(label(None, &shell, None), "zsh");
         assert_eq!(
-            tab_label(&input(None, Some(&shell), None, Some(&repo))),
-            "crow-term@main"
+            tab_label(&LabelInput {
+                rename: None,
+                pane: None,
+                agent: None,
+                shell: "/bin/zsh"
+            }),
+            "zsh"
         );
-        assert_eq!(tab_label(&input(None, Some(&shell), None, None)), "zsh");
-        assert_eq!(tab_label(&input(None, None, None, None)), "zsh");
     }
 
     #[test]
-    fn agents_are_matched_by_pid_then_tty_then_directory() {
-        let mut by_pid = agent("codex", "/elsewhere", 50);
+    fn titles_that_say_nothing_are_ignored() {
+        let useful = |process: &str, title: &str| useful_title(&pane(process, title, None));
+        assert_eq!(
+            useful("nvim", "main.rs (~/w) - NVIM").as_deref(),
+            Some("main.rs (~/w) - NVIM")
+        );
+        for (process, title) in [
+            ("nvim.exe", "D:\\a\\_temp\\nvim\\bin\\nvim.exe"),
+            ("nvim", "C:\\Users\\runneradmin\\"),
+            ("htop", "/usr/bin/htop"),
+            ("htop", "htop"),
+            ("less", "less ~/notes.txt"),
+            ("vim", "~/w/crow-term"),
+            ("ssh", "user@prod: ~"),
+            ("fish", "fish ~/w"),
+            ("zsh", "My Project"),
+            ("nvim", "\u{202e}"),
+        ] {
+            assert_eq!(useful(process, title), None, "{process}: {title:?}");
+        }
+    }
+
+    #[test]
+    fn agents_are_matched_only_to_a_pane_running_that_cli() {
+        let mut by_pid = agent("claude", "/elsewhere", 50);
         by_pid.pid = Some(4242);
-        let mut by_tty = agent("gemini", "/elsewhere", 50);
+        let mut codex_pid = agent("codex", "/elsewhere", 50);
+        codex_pid.pid = Some(4242);
+        let mut by_tty = agent("claude", "/elsewhere", 50);
         by_tty.tty = Some("/dev/ttys004".into());
-        let old = agent("claude", "/w/crow-term", 300);
-        let recent = agent("claude", "/w/crow-term/", 2);
-        let other_dir = agent("claude", "/w/api", 1);
         let p = pane("claude", "", Some("/w/crow-term"));
         assert_eq!(
-            agent_for(&p, &[old.clone(), by_pid.clone(), by_tty.clone()])
+            agent_for(&p, &[by_tty.clone(), by_pid.clone()])
                 .unwrap()
-                .host,
-            "codex"
+                .pid,
+            Some(4242)
+        );
+        assert!(
+            agent_for(&p, &[codex_pid.clone()]).is_none(),
+            "same pid, another CLI"
         );
         assert_eq!(
-            agent_for(&p, &[old.clone(), by_tty.clone()]).unwrap().host,
-            "gemini"
+            agent_for(&p, std::slice::from_ref(&by_tty))
+                .unwrap()
+                .tty
+                .as_deref(),
+            Some("/dev/ttys004")
         );
-        let all = [old.clone(), recent.clone(), other_dir.clone()];
-        let found = agent_for(&p, &all).unwrap();
-        assert_eq!(
-            found.age_seconds, 2,
-            "most recently active in the same directory"
-        );
-        // A shell in that directory is not the agent.
+        // A shell (or anything else) in front is never an agent, whatever the pid says.
         let shell = pane("zsh", "", Some("/w/crow-term"));
-        assert!(agent_for(&shell, &[recent]).is_none());
-        assert!(agent_for(&p, &[other_dir]).is_none());
-    }
-
-    #[test]
-    fn git_status_gives_branch_dirty_ahead_behind() {
-        let out = "# branch.oid 1234567890abcdef\n# branch.head feature/x\n# branch.upstream origin/feature/x\n# branch.ab +2 -1\n1 .M N... 100644 100644 100644 a b src/ui.rs\n";
-        let repo = parse_git_status(out, "/w/crow-term").unwrap();
-        assert_eq!(repo.label(), "crow-term@feature/x *↑2↓1");
-        let clean =
-            parse_git_status("# branch.oid abcdef1234\n# branch.head main\n", "/w/api/").unwrap();
-        assert_eq!(clean.label(), "api@main");
-        let detached = parse_git_status(
-            "# branch.oid abcdef1234\n# branch.head (detached)\n",
-            "/w/api",
-        )
-        .unwrap();
-        assert_eq!(detached.label(), "api@abcdef1");
-        assert!(parse_git_status("", "/w/api").is_none());
+        assert!(agent_for(&shell, &[by_pid.clone(), by_tty.clone()]).is_none());
+        // By directory only when exactly one session there reports no pid/tty.
+        let one = agent("claude", "/w/crow-term/", 2);
+        assert_eq!(
+            agent_for(&p, std::slice::from_ref(&one))
+                .unwrap()
+                .age_seconds,
+            2
+        );
+        let two = [
+            agent("claude", "/w/crow-term", 2),
+            agent("claude", "/w/crow-term", 9),
+        ];
+        assert!(
+            agent_for(&p, &two).is_none(),
+            "two agents in one directory: no guess"
+        );
+        let mut elsewhere_pid = agent("claude", "/w/crow-term", 1);
+        elsewhere_pid.pid = Some(1);
+        assert!(
+            agent_for(&p, &[elsewhere_pid]).is_none(),
+            "its pid says it is another pane"
+        );
+        assert!(agent_for(&p, &[agent("claude", "/w/api", 1)]).is_none());
     }
 
     fn sample() -> Vec<Segment> {
@@ -867,19 +864,12 @@ mod tests {
             total: 8,
             failed: 0,
         };
-        let repo = Repo {
-            name: "crow-term".into(),
-            branch: "feature/tab-context".into(),
-            dirty: true,
-            ahead: 1,
-            behind: 0,
-        };
-        let p = pane("claude", "", Some("/w/crow-term"));
+        let mut p = pane("claude", "", Some("/w/crow-term"));
+        p.repo = Some(("crow-term".into(), "feature/tab-context".into()));
         footer_segments(&FooterInput {
             pane: Some(&p),
             agent: Some(&a),
             progress: Some(&progress),
-            repo: Some(&repo),
             home: None,
             session: Some("work"),
         })
@@ -898,7 +888,7 @@ mod tests {
                 "implement the tab context footer and labels",
                 "3/8 · 37% ▰▰▰▱▱▱▱▱",
                 "opus-5.5 · ctx 57%",
-                "crow-term@feature/tab-context *↑1",
+                "crow-term@feature/tab-context",
                 "session work",
             ]
         );
@@ -908,24 +898,33 @@ mod tests {
             pane: Some(&p),
             agent: None,
             progress: None,
-            repo: None,
             home: Some("/Users/u"),
             session: None,
         });
         assert_eq!(texts(&plain), ["nvim", "~/w/crow-term"]);
+        // Invisible and control characters never reach the screen.
+        let mut a = agent("claude", "/w", 1);
+        a.task = Some("pay \u{202e}lacol\u{200b}\x1b[31m".into());
+        let segs = footer_segments(&FooterInput {
+            pane: None,
+            agent: Some(&a),
+            progress: None,
+            home: None,
+            session: None,
+        });
+        assert_eq!(segs[1].text, "pay lacol[31m");
     }
 
     #[test]
     fn narrow_footers_drop_whole_low_priority_segments_first() {
-        let chars = |s: &str| s.chars().count() as f32;
-        let at = |width: f32| texts(&fit(sample(), width, 3.0, chars));
+        let width = |s: &str| cells(s) as f32;
+        let at = |w: f32| texts(&fit(sample(), w, 3.0, width));
         assert_eq!(at(240.0).len(), 6, "everything fits at 240 columns");
         assert_eq!(at(160.0).len(), 6, "and at 160");
         let w140 = at(140.0);
-        assert_eq!(w140.len(), 5, "{w140:?}");
         assert!(
             !w140.contains(&"session work".to_owned()),
-            "lowest priority goes first"
+            "lowest priority goes first: {w140:?}"
         );
         let w120 = at(120.0);
         assert!(
@@ -935,30 +934,52 @@ mod tests {
         let w100 = at(100.0);
         assert!(w100.len() >= 2 && w100.len() < 6, "{w100:?}");
         assert_eq!(w100[0], "claude ● working");
-        let w60 = at(60.0);
-        assert_eq!(w60[0], "claude ● working");
-        for width in [60.0, 100.0, 160.0, 240.0] {
-            let fitted = fit(sample(), width, 3.0, chars);
-            let used: f32 = fitted.iter().map(|s| chars(&s.text)).sum::<f32>()
+        assert_eq!(at(60.0)[0], "claude ● working");
+        for w in [60.0, 100.0, 160.0, 240.0] {
+            let fitted = fit(sample(), w, 3.0, width);
+            let used: f32 = fitted.iter().map(|s| width(&s.text)).sum::<f32>()
                 + 3.0 * fitted.len().saturating_sub(1) as f32;
-            assert!(used <= width, "{width}: {used}");
-            // Kept segments are whole (never cut) unless only one remains.
+            assert!(used <= w, "{w}: {used}");
             if fitted.len() > 1 {
-                assert!(fitted.iter().all(|s| s.text == s.full), "{width}");
+                assert!(fitted.iter().all(|s| s.text == s.full), "{w}");
             }
         }
-        // One segment left that does not fit: shortened, never cut mid-word
-        // when a word boundary leaves enough text.
         let task = vec![sample().remove(1)];
-        let one = fit(task, 20.0, 3.0, chars);
-        assert_eq!(one[0].text, "implement the tab…");
+        assert_eq!(fit(task, 20.0, 3.0, width)[0].text, "implement the tab…");
         let name = vec![segment(
             "crow-term@feature/very-long-branch".into(),
             Tone::Plain,
             0,
             Shorten::Middle,
         )];
-        assert_eq!(fit(name, 15.0, 3.0, chars)[0].text, "crow-te…-branch");
+        assert_eq!(fit(name, 15.0, 3.0, width)[0].text, "crow-te…-branch");
+    }
+
+    #[test]
+    fn shortening_counts_wide_cells_and_never_splits_a_cluster() {
+        // CJK is two cells per character.
+        let cjk = middle_ellipsis("日本語のタブ名前です", 9);
+        assert!(cells(&cjk) <= 9, "{cjk}");
+        assert!(cjk.contains('…'));
+        // A family emoji (ZWJ sequence), a flag and an accented letter stay whole.
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let text = format!("{family}{family} ok 🇧🇷 é\u{301}tude end");
+        for max in 1..cells(&text) {
+            let short = middle_ellipsis(&text, max);
+            assert!(cells(&short) <= max, "{max}: {short}");
+            for piece in short.split('…') {
+                assert!(text.contains(piece), "{max}: {piece:?} is not a clean cut");
+            }
+            assert!(
+                !short.contains('\u{200d}') || short.contains(family),
+                "{max}: {short}"
+            );
+        }
+        // The default agent label fits a default-width tab.
+        assert_eq!(
+            middle_ellipsis("claude · Fixture task", 24),
+            "claude · Fixture task"
+        );
     }
 
     #[test]
@@ -984,12 +1005,7 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_shortened_in_the_middle_and_debounced() {
-        assert_eq!(
-            middle_ellipsis("crow-term@feature/tab-context", 14),
-            "crow-t…context"
-        );
-        assert_eq!(middle_ellipsis("short", 14), "short");
+    fn labels_are_debounced() {
         assert_eq!(short_model("claude-opus-5-5"), "opus-5.5");
         assert_eq!(short_model("gpt-5-codex"), "gpt-5-codex");
         let start = std::time::Instant::now();
@@ -1006,11 +1022,5 @@ mod tests {
         assert!(debounce.next_change(at(300)).is_some());
         assert_eq!(debounce.label(1, "nvim".into(), at(900)), "nvim");
         assert!(debounce.next_change(at(900)).is_none());
-    }
-
-    #[test]
-    fn contrast_follows_wcag() {
-        assert!((contrast(0x000000, 0xffffff) - 21.0).abs() < 1e-9);
-        assert!((contrast(0x777777, 0xffffff) - 4.48).abs() < 0.01);
     }
 }

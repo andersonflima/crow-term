@@ -1746,7 +1746,7 @@ impl App {
         let width = if windows.is_empty() {
             0
         } else {
-            (available / windows.len() as u32).min((190.0 * self.scale) as u32)
+            (available / windows.len() as u32).min((240.0 * self.scale) as u32)
         };
         windows
             .iter()
@@ -2005,10 +2005,13 @@ impl App {
             Option<crate::tab_context::Segment>,
         )>,
     ) {
+        let now = Instant::now();
         let tabs = self.tab_rects();
         let windows = self.windows();
         let mut tab_labels = Vec::new();
         let mut tab_full = Vec::new();
+        // Real glyph widths, as `compose` will draw them.
+        let tab_size = (14.0 * self.scale) as f32;
         for &(id, rect) in &tabs {
             let Some(info) = windows.iter().find(|info| info.id == id) else {
                 continue;
@@ -2025,13 +2028,22 @@ impl App {
                     pane,
                     &self.crow_view.context.agents,
                     &self.shell.program,
+                    now,
                 )
             } else {
-                info.name.clone()
+                crate::tab_context::sanitize(&info.name)
             };
-            let room = ((rect.w as f32 - 20.0 * self.scale as f32) / (8.0 * self.scale as f32))
-                .max(4.0) as usize;
-            let label = crate::tab_context::middle_ellipsis(&full, room.saturating_sub(3));
+            let index = windows.iter().position(|w| w.id == id).unwrap_or(0) + 1;
+            let room = rect.w as f32 - 20.0 * self.scale as f32;
+            let (config, shaper) = (&self.config, &mut self.shaper);
+            let label =
+                crate::tab_context::shorten(&full, crate::tab_context::Shorten::Middle, |text| {
+                    shaper
+                        .shape_text(config, 0, 0, &format!("{index}  {text}"), 0, tab_size)
+                        .1
+                        <= room
+                })
+                .unwrap_or_default();
             if label != full {
                 tab_full.push((id, full));
             }
@@ -2040,13 +2052,15 @@ impl App {
         let context = (!self.prefix).then(|| {
             let sessions = self.view.as_ref().map_or(0, |v| v.sessions.len());
             let session = (sessions > 1).then_some(self.session.as_str());
-            self.tab_context
-                .footer(self.pane_id, &self.crow_view.context, session)
+            let home = std::env::var("HOME").ok();
+            self.tab_context.footer(
+                self.pane_id,
+                &self.crow_view.context,
+                session,
+                home.as_deref(),
+            )
         });
-        self.label_due = self
-            .tab_context
-            .next_change()
-            .map(|after| Instant::now() + after);
+        self.label_due = self.tab_context.next_change(now).map(|after| now + after);
         self.drawn = Drawn {
             tab_full,
             ..Drawn::default()
@@ -2627,8 +2641,8 @@ fn compose<'a>(
     if let Some((segments, global)) = &parts.context {
         // The focused pane's context, fitted to what is left: whole
         // low-priority parts go first (tab_context::fit).
-        let advance = shaper.shape_text(config, 0, 0, "0000000000", 0, size_px).1 / 10.0;
-        let measure = |text: &str| unicode_width::UnicodeWidthStr::width(text) as f32 * advance;
+        // Real glyph widths, as drawn.
+        let mut measure = |text: &str| shaper.shape_text(config, 0, 0, text, 0, size_px).1;
         let right = (12.0 * scale) as i32;
         let global_width = global.as_ref().map_or(0.0, |g| measure(&g.text));
         let room = (footer.w as f32 - x as f32 - right as f32 - global_width - gap).max(0.0);
@@ -2966,16 +2980,6 @@ impl ApplicationHandler<UiEvent> for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // A debounced tab label becomes due: draw it then.
-        if let Some(due) = self.label_due {
-            if Instant::now() >= due {
-                self.label_due = None;
-                self.redraw();
-            } else if self.status_expires.is_none() && self.bell_flash.is_none() {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
-                return;
-            }
-        }
         // Timed redraws: transient status notes, the visual bell and retries
         // of skipped GPU frames; otherwise stay event-driven.
         let now = Instant::now();
@@ -2998,10 +3002,18 @@ impl ApplicationHandler<UiEvent> for App {
             self.retry_due = None;
             self.redraw();
         }
+        // A debounced tab label becomes due: draw it then.
+        if let Some(due) = self.label_due
+            && now >= due
+        {
+            self.label_due = None;
+            self.redraw();
+        }
         let next = [
             self.status_expires,
             self.bell_flash.as_ref().map(|(until, _)| *until),
             self.retry_due,
+            self.label_due,
         ]
         .into_iter()
         .flatten()
@@ -4119,5 +4131,31 @@ mod tests {
             }
         ));
         assert_eq!(mailbox.take().unwrap().0, 2);
+    }
+    #[test]
+    fn every_footer_tone_is_readable_on_light_and_dark_footers() {
+        use crate::render::contrast_ratio as contrast;
+        use crate::tab_context::Tone as T;
+        let light = Config::default();
+        let dark = Config {
+            background: "#1E1E1E".into(),
+            foreground: "#D4D4D4".into(),
+            ..Config::default()
+        };
+        for config in [&light, &dark] {
+            let chrome = Chrome::new(config);
+            let is_light = light_background(config);
+            for tone in [T::Plain, T::On, T::Accent, T::Warn, T::Alert] {
+                let ratio = contrast(
+                    tone_color(context_tone(tone), &chrome, is_light),
+                    chrome.surface,
+                );
+                assert!(
+                    ratio >= 4.5,
+                    "{tone:?} on the {} footer: {ratio:.2}:1",
+                    if is_light { "light" } else { "dark" }
+                );
+            }
+        }
     }
 }

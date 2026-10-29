@@ -132,6 +132,10 @@ pub struct Server {
     /// Pane summaries (tab labels, status bar), refreshed by their own thread
     /// once a second; a view only copies them, never computes them.
     summaries: Mutex<HashMap<u64, crate::model::PaneSummary>>,
+    /// When a GUI last watched (ms since start): summaries are refreshed only
+    /// while one is attached.
+    last_watch: std::sync::atomic::AtomicU64,
+    started: std::time::Instant,
     config: Config,
 }
 impl Server {
@@ -151,6 +155,8 @@ impl Server {
             signals: Arc::default(),
             stopped: AtomicBool::new(false),
             summaries: Mutex::default(),
+            last_watch: std::sync::atomic::AtomicU64::new(0),
+            started: std::time::Instant::now(),
             config: config.clone(),
         }
     }
@@ -272,6 +278,10 @@ impl Server {
                 window,
                 since,
             } => {
+                self.last_watch.store(
+                    self.started.elapsed().as_millis() as u64 + 1,
+                    Ordering::Relaxed,
+                );
                 self.signals.wait(since);
                 #[cfg(feature = "test-hooks")]
                 stall_for_tests(&session);
@@ -522,6 +532,13 @@ pub fn validate_name(name: &str) -> Result<()> {
 }
 
 impl Server {
+    /// Summaries serve tab labels and the status bar of attached GUIs: none
+    /// when both are off, or when no GUI watched in the last 5 s.
+    fn summaries_wanted(&self) -> bool {
+        let enabled = self.config.tab_labels || self.config.crow.status_bar;
+        let last = self.last_watch.load(Ordering::Relaxed);
+        enabled && last > 0 && self.started.elapsed().as_millis() as u64 <= last + 5_000
+    }
     /// Recompute every pane's summary (off the request path; one pane at a
     /// time, never waiting on a busy pane) and wake watchers when any changed.
     fn refresh_summaries(&self) {
@@ -563,7 +580,9 @@ pub fn run(config: Config) -> Result<()> {
             .name("crow-summaries".into())
             .spawn(move || {
                 while !server.stopped.load(Ordering::Acquire) {
-                    server.refresh_summaries();
+                    if server.summaries_wanted() {
+                        server.refresh_summaries();
+                    }
                     std::thread::sleep(Duration::from_secs(1));
                 }
             })?;
@@ -672,6 +691,13 @@ mod tests {
         else {
             panic!("not created");
         };
+        // No GUI has watched yet: the summary thread stays idle.
+        assert!(!server.summaries_wanted());
+        server.last_watch.store(
+            server.started.elapsed().as_millis() as u64 + 1,
+            Ordering::Relaxed,
+        );
+        assert!(server.summaries_wanted(), "a GUI is attached");
         // Before the summary thread ran, a view has screens but no summaries:
         // nothing is computed while answering.
         let view = server.view(Some("s"), window, Some(0)).unwrap();

@@ -679,10 +679,18 @@ pub struct Engine {
     summary: Mutex<SummaryCache>,
 }
 
+/// (pid, read at, cwd, (repository name, branch)).
+type CachedPlace = (
+    u32,
+    std::time::Instant,
+    Option<String>,
+    Option<(String, String)>,
+);
+
 #[derive(Default)]
 struct SummaryCache {
     process: Option<(u32, std::time::Instant, String, Vec<String>)>,
-    cwd: Option<(u32, std::time::Instant, Option<String>)>,
+    cwd: Option<CachedPlace>,
     tty: Option<String>,
     title: String,
 }
@@ -1200,36 +1208,36 @@ impl Engine {
         if !self.alive() {
             return summary;
         }
+        // The PTY master only if it is free (a resize or a kill holds it).
         #[cfg(unix)]
-        let foreground = foreground_group(&self.master)
-            .ok()
-            .flatten()
-            .map(|pid| pid.as_raw_nonzero().get() as u32);
+        let (foreground, tty) = match self.master.try_lock() {
+            Ok(master) => match master.as_ref() {
+                Some(master) => (
+                    master.process_group_leader().map(|pid| pid as u32),
+                    master.tty_name().map(|p| p.to_string_lossy().into_owned()),
+                ),
+                None => (None, None),
+            },
+            Err(_) => (None, None),
+        };
+        // Windows: the pane's own program; ConPTY has no terminal device name.
         #[cfg(not(unix))]
-        let foreground: Option<u32> = None;
-        let pid = foreground.or_else(|| {
+        let (foreground, tty): (Option<u32>, Option<String>) = (None, Some(String::new()));
+        let child = || {
             self.process
                 .child
-                .lock()
+                .try_lock()
                 .ok()
                 .and_then(|child| child.as_ref().and_then(|c| c.process_id()))
-        });
+        };
         let Ok(mut cache) = self.summary.lock() else {
             return summary;
         };
+        let pid = foreground
+            .or_else(child)
+            .or(cache.process.as_ref().map(|(pid, _, _, _)| *pid));
         if cache.tty.is_none() {
-            #[cfg(unix)]
-            let tty = self
-                .master
-                .lock()
-                .ok()
-                .and_then(|m| m.as_ref().and_then(|m| m.tty_name()))
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            // Windows: ConPTY has no terminal device name.
-            #[cfg(not(unix))]
-            let tty = String::new();
-            cache.tty = Some(tty);
+            cache.tty = tty;
         }
         summary.tty = cache.tty.clone().unwrap_or_default();
         let Some(pid) = pid else {
@@ -1265,19 +1273,34 @@ impl Engine {
             summary.process = name.clone();
             summary.args = args.clone();
         }
-        let fresh = cache.cwd.as_ref().is_some_and(|(cached, at, _)| {
+        let fresh = cache.cwd.as_ref().is_some_and(|(cached, at, _, _)| {
             *cached == pid && at.elapsed() < std::time::Duration::from_secs(2)
         });
-        if !fresh {
+        let cache = if fresh {
+            cache
+        } else {
             drop(cache);
             let cwd = self.cwd();
+            // Branch from `.git` files only: no git command, nothing the
+            // repository configures (hooks, filters, fsmonitor) ever runs.
+            let repo = cwd.as_deref().and_then(|cwd| {
+                crate::crow::git_repo(std::path::Path::new(cwd)).map(|(top, branch)| {
+                    let name = top
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (name, branch)
+                })
+            });
             let Ok(mut cache) = self.summary.lock() else {
                 return summary;
             };
-            cache.cwd = Some((pid, std::time::Instant::now(), cwd));
-            summary.cwd = cache.cwd.as_ref().and_then(|(_, _, cwd)| cwd.clone());
-        } else {
-            summary.cwd = cache.cwd.as_ref().and_then(|(_, _, cwd)| cwd.clone());
+            cache.cwd = Some((pid, std::time::Instant::now(), cwd, repo));
+            cache
+        };
+        if let Some((_, _, cwd, repo)) = &cache.cwd {
+            summary.cwd = cwd.clone();
+            summary.repo = repo.clone();
         }
         summary
     }
@@ -1907,7 +1930,7 @@ mod tests {
             program: "/bin/sh".into(),
             args: vec![
                 "-c".into(),
-                "printf '\\033]2;Crow Title\\007READY'; exec less -R /etc/hosts".into(),
+                "printf '\\033]2;Crow Title\\007READY'; exec less /etc/hosts".into(),
             ],
             cwd: Some(dir.to_string_lossy().into_owned()),
         };

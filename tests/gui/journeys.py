@@ -952,10 +952,51 @@ print(json.dumps({"schema_version": 1, "ok": True, "command": "events", "data": 
 """
 
 
+def agent_stand_in(work):
+    """A real program named like an agent CLI (built from C, or a copy of
+    PING.EXE on Windows): the pane's own process, matched by its pid."""
+    bin_dir = work / "agent-bin"
+    bin_dir.mkdir(exist_ok=True)
+    if os.name == "nt":
+        source = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE"
+        program, args = bin_dir / "claude.exe", ["-n", "3600", "127.0.0.1"]
+        shutil.copyfile(source, program)
+        return program, args
+    # Unix: a tiny native program built here, named `claude` (a copied
+    # system binary is killed by macOS code signing; a symlink keeps the
+    # target's name there).
+    import subprocess
+    code = bin_dir / "claude.c"
+    code.write_text("#include <unistd.h>\nint main(void) { sleep(3600); return 0; }\n")
+    program = bin_dir / "claude"
+    built = subprocess.run(["cc", "-o", str(program), str(code)], capture_output=True, text=True, timeout=120)
+    if built.returncode:
+        raise AssertionError(f"cannot build the agent stand-in: {built.stderr}")
+    return program, []
+
+
+def pid_of(program):
+    """Process id of the running copy at `program` (exact path)."""
+    import subprocess
+    if os.name == "nt":
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq '"
+                              + str(program) + "' } | ForEach-Object { $_.ProcessId }"],
+                             capture_output=True, text=True, timeout=60).stdout.split()
+        return int(out[0]) if out else None
+    out = subprocess.run(["ps", "-A", "-o", "pid=,args="], capture_output=True, text=True, timeout=30).stdout
+    for line in out.splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if args.strip().startswith(str(program)):
+            return int(pid)
+    return None
+
+
 @journey("J19", "the footer and the tab show the focused pane's agent, task, progress and model")
 def j19_tab_context(ctx):
-    import re
+    import subprocess
     work = ctx.run.work
+    real = os.path.realpath(work)
     fixture = work / "crow_fixture.py"
     fixture.write_text(CROW_FIXTURE, encoding="utf-8")
     if os.name == "nt":
@@ -965,23 +1006,21 @@ def j19_tab_context(ctx):
         command = work / "crow-fixture"
         command.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{fixture}' \"$@\"\n", encoding="utf-8")
         command.chmod(0o755)
+    program, args = agent_stand_in(work)
     config = work / "context.toml"
-    config.write_text(harness.CONFIG.replace("[crow]\nenabled = false\n",
-                                             f"[crow]\nenabled = true\ncommand = {json.dumps(str(command))}\ninterval_ms = 1000\n"),
-                      encoding="utf-8")
-    # The session and its stand-in agent exist first, so the GUI's first crow
-    # snapshot already has them (later ones are minutes apart when idle).
-    pane = ctx.run.rpc("new-session", "agentctx")["Created"]["pane"]
-    quiet_screen(ctx, pane)
-    real = os.path.realpath(work)
-    if os.name == "nt":
-        ctx.run.send_keys(pane, f"cd '{real}'; echo \"PID:$PID\"\r")
-    else:
-        ctx.run.send_keys(pane, f"cd '{real}' && sh -c 'echo PID:$$; exec sleep 600'\r")
-    found = eventually(lambda: next((m for l in ctx.run.capture(pane).splitlines()
-                                     if (m := re.fullmatch(r"PID:(\d+)", l.strip()))), None),
-                       20, what="the agent stand-in's process id")
-    pid = int(found.group(1))
+    config.write_text(
+        f"shell = {json.dumps(str(program))}\nshell_args = {json.dumps(args)}\n"
+        + harness.CONFIG.replace("[crow]\nenabled = false\n",
+                                 f"[crow]\nenabled = true\ncommand = {json.dumps(str(command))}\ninterval_ms = 1000\n"),
+        encoding="utf-8")
+    # The pane runs the stand-in itself (on Windows the pane's own program is
+    # its foreground); it exists before the GUI, so the first crow snapshot
+    # already names its pid.
+    created = subprocess.run([str(harness.BIN), "--config", str(config), "--cwd", real, "new-session", "agentctx"],
+                             env=ctx.run.env, capture_output=True, text=True, timeout=30)
+    if created.returncode:
+        raise AssertionError(f"new-session: {created.stderr}")
+    pid = eventually(lambda: pid_of(program), 20, what="the agent stand-in's process")
     snapshot = {
         "sessions": [{"schema": "crow-session/1", "host": "claude", "state": "working", "blocked": False,
                       "cwd": real, "model": "claude-opus-5-5", "currentTool": "Bash", "pid": pid,
@@ -995,16 +1034,14 @@ def j19_tab_context(ctx):
         gui.wait_frame(lambda m, i: m["revision"] > 0, what="agentctx frame")
         ctx.driver.attach(gui)
         want = ["claude ● working", "Fixture task", "3/8 · 37% ▰▰▰▱▱▱▱▱", "opus-5.5 · ctx 57%"]
-        frame = gui.wait_frame(lambda m, i: m["footer"][:4] == want, timeout=30,
-                               what=f"footer {want}")
+        frame = gui.wait_frame(lambda m, i: m["footer"][:4] == want and m["tabs"][:1] == ["claude · Fixture task"],
+                               timeout=30, what=f"footer {want} and tab 'claude · Fixture task'")
         footer, tab = frame[1]["footer"], frame[1]["tabs"][0]
         if footer[-1] != "crow on · 1 active":
             raise AssertionError(f"global segment: {footer}")
-        if not (tab.startswith("claude") and tab.endswith("task")):
-            raise AssertionError(f"tab label {tab!r}: expected the agent and its task")
     finally:
         gui.kill()
-    return f"footer {footer}; tab {tab!r}", [ctx.save_frame("j19-tab-context", frame)]
+    return f"agent pid {pid}: footer {footer}; tab {tab!r}", [ctx.save_frame("j19-tab-context", frame)]
 
 
 @journey("J11", "a daemon that keeps stalling is waited for, never reported as disconnected")

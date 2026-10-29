@@ -226,10 +226,6 @@ pub(crate) fn cases() -> Vec<(&'static str, App)> {
         HashSet::from([12u64]),
     ));
     panel.crow_view = CrowView {
-        status: vec![Segment {
-            text: "crow on".into(),
-            tone: Tone::On,
-        }],
         panel: vec![
             vec![Segment {
                 text: "AGENTS".into(),
@@ -638,4 +634,63 @@ fn gpu_mode_recreates_the_device_once_per_presented_frame() {
             .as_deref()
             .is_some_and(|f| f.contains("device lost again"))
     );
+}
+
+/// Shortened footer parts and tab labels open whole: a click on the footer
+/// part, hovering the tab. Widths come from the real shaper.
+#[test]
+fn shortened_tab_and_footer_text_open_whole_on_click_and_hover() {
+    let mut app = app(Config::default(), 1.0, PhysicalSize::new(420, 200));
+    app.status.clear();
+    if let Some(view) = &mut app.view {
+        for window in &mut view.sessions[0].windows {
+            window.name = "shell".into();
+        }
+    }
+    let long = "a-buffer-with-a-really-long-name-for-the-tab-label.rs - NVIM";
+    let summary = |title: &str| {
+        PaneSummary {
+        title: title.into(),
+        process: "nvim".into(),
+        args: vec!["notes-with-a-very-long-name-that-cannot-fit-in-the-footer-of-a-narrow-window-at-all.md".into()],
+        pid: Some(1),
+        tty: String::new(),
+        cwd: Some("/a/very/deep/directory/that/does/not/fit/in/the/footer/at/all".into()),
+        repo: None,
+    }
+    };
+    app.tab_context
+        .update(&[(11, summary(long)), (21, summary("logs.txt - NVIM"))]);
+    software_frame(&mut app);
+    // The tab label was shortened (with an ellipsis) and its full text kept.
+    let (window, full) = app
+        .drawn
+        .tab_full
+        .first()
+        .cloned()
+        .expect("a shortened tab");
+    assert_eq!((window, full.as_str()), (1, long));
+    assert!(app.drawn.tabs[0].contains('…'), "{:?}", app.drawn.tabs);
+    let (_, rect) = app
+        .tab_rects()
+        .into_iter()
+        .find(|(id, _)| *id == 1)
+        .unwrap();
+    app.cursor = PhysicalPosition::new(f64::from(rect.x) + 30.0, 10.0);
+    app.mouse_move();
+    assert_eq!(app.status, long, "hovering the tab shows the whole label");
+    // A footer part that had to be shortened shows whole when clicked.
+    app.status.clear();
+    software_frame(&mut app);
+    let (from, _, full) = app
+        .drawn
+        .footer_full
+        .first()
+        .cloned()
+        .expect("a shortened footer part");
+    assert!(full.starts_with("nvim notes-with"), "{full}");
+    let size = app.window_size().unwrap();
+    app.cursor = PhysicalPosition::new(f64::from(from) + 2.0, f64::from(size.height) - 6.0);
+    app.mouse_click(ElementState::Pressed, MouseButton::Left);
+    assert_eq!(app.status, full);
 }

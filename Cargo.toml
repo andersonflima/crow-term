@@ -24,6 +24,7 @@ arboard = { version = "3.7", features = ["wayland-data-control"] }
 clap = { version = "4", features = ["derive"] }
 which = "8"
 unicode-width = "0.2"
+unicode-segmentation = "1"
 etagere = "0.3"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }

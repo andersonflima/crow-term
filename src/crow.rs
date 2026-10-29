@@ -336,7 +336,6 @@ pub type Line = Vec<Segment>;
 /// What the worker publishes; the UI only paints it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct CrowView {
-    pub status: Vec<Segment>,
     pub panel: Vec<Line>,
     /// Facts for the tab context (footer and tab labels).
     pub context: Context,
@@ -348,7 +347,6 @@ pub struct CrowView {
 pub struct Context {
     pub agents: Vec<crate::tab_context::Agent>,
     pub progress: Option<crate::tab_context::Progress>,
-    pub repo: Option<crate::tab_context::Repo>,
     pub global: Option<crate::tab_context::Segment>,
     /// The pane and cwd these facts are about.
     pub pane: u64,
@@ -356,15 +354,9 @@ pub struct Context {
 }
 
 /// The tab-context facts of `source` for the focused pane's `cwd`.
-pub fn context(
-    source: &Source,
-    pane: u64,
-    cwd: Option<&str>,
-    repo: Option<crate::tab_context::Repo>,
-) -> Context {
+pub fn context(source: &Source, pane: u64, cwd: Option<&str>) -> Context {
     use crate::tab_context::{Agent, GlobalInput, Progress, global_segment};
     let mut out = Context {
-        repo,
         pane,
         cwd: cwd.map(str::to_owned),
         ..Context::default()
@@ -379,20 +371,26 @@ pub fn context(
             .filter(|r| r.status == "running" && is_ancestor(&r.cwd, dir))
             .max_by_key(|r| r.cwd.len())
     };
+    let clean = |text: &Option<String>| {
+        text.as_deref()
+            .map(crate::tab_context::sanitize)
+            .filter(|t| !t.is_empty())
+    };
     out.agents = state
         .sessions
         .iter()
-        .filter(|s| s.live())
+        // A session whose agent process is gone is stale, whatever it says.
+        .filter(|s| s.live() && s.pid.is_none_or(pid_alive))
         .map(|s| Agent {
-            host: s.host.clone(),
-            state: s.state.clone(),
+            host: crate::tab_context::sanitize(&s.host),
+            state: crate::tab_context::sanitize(&s.state),
             blocked: s.blocked,
             cwd: s.cwd.clone(),
             pid: s.pid,
             tty: s.tty.clone(),
-            model: s.model.clone(),
-            tool: s.tool.clone(),
-            task: run_for(&s.cwd).map(|r| r.title.clone()),
+            model: clean(&s.model),
+            tool: clean(&s.tool),
+            task: run_for(&s.cwd).map(|r| crate::tab_context::sanitize(&r.title)),
             context_percent: s.context_percent.map(|p| p.round() as u8),
             age_seconds: s.age_seconds,
         })
@@ -418,6 +416,31 @@ pub fn context(
     out
 }
 
+/// Whether a process with this id exists (no signal is sent).
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(raw) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: kill with signal 0 only checks for the process.
+        let status = unsafe { libc::kill(raw, 0) };
+        status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut system = System::new();
+        let id = Pid::from_u32(pid);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[id]),
+            false,
+            ProcessRefreshKind::nothing(),
+        );
+        system.process(id).is_some()
+    }
+}
+
 /// The repository containing `cwd` and its branch, from `.git` files only.
 pub fn git_repo(cwd: &Path) -> Option<(PathBuf, String)> {
     for dir in cwd.ancestors().take(64) {
@@ -426,47 +449,6 @@ pub fn git_repo(cwd: &Path) -> Option<(PathBuf, String)> {
         }
     }
     None
-}
-
-/// Branch, dirty state and ahead/behind of the repository at `cwd`, from
-/// `git status` (bounded to 1 s; no index lock is taken).
-pub fn git_status(cwd: &Path) -> Option<crate::tab_context::Repo> {
-    let (top, _) = git_repo(cwd)?;
-    let mut child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&top)
-        .args([
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "--untracked-files=no",
-        ])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
-    let reader = thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
-    });
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
-    let text = reader.join().ok()?;
-    crate::tab_context::parse_git_status(&text, &top.to_string_lossy())
 }
 
 /// Snapshot availability as seen by the worker.
@@ -539,87 +521,6 @@ pub fn active_run<'a>(state: &'a CrowState, cwd: Option<&str>) -> Option<(&'a Ru
         })
         .or_else(|| running.first().copied())?;
     Some((chosen, running.len()))
-}
-
-/// The footer line: `▸▸ crow on · claude 2 · codex 1 · ⚠ 1 blocked · <run> 3/7 · mem 41% · ⎇ main`.
-pub fn status_segments(source: &Source, branch: Option<&str>, cwd: Option<&str>) -> Vec<Segment> {
-    let mut out = Vec::new();
-    match source {
-        Source::Pending | Source::Missing => {}
-        Source::Failed(error) => {
-            out.push(seg("▸▸ crow ?", Tone::Muted));
-            out.push(seg(short(error, 40), Tone::Muted));
-        }
-        Source::Ready(state) => {
-            out.push(match state.mode_on {
-                Some(true) | None => seg("▸▸ crow on", Tone::On),
-                Some(false) => seg("▸▸ crow off", Tone::Off),
-            });
-            let mut hosts: Vec<(String, usize)> = Vec::new();
-            for session in state.sessions.iter().filter(|s| s.live()) {
-                match hosts.iter_mut().find(|(host, _)| *host == session.host) {
-                    Some((_, count)) => *count += 1,
-                    None => hosts.push((session.host.clone(), 1)),
-                }
-            }
-            if hosts.is_empty() {
-                out.push(seg("no agents", Tone::Muted));
-            } else {
-                hosts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                let text = hosts
-                    .iter()
-                    .map(|(host, count)| format!("{host} {count}"))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                out.push(seg(text, Tone::Plain));
-            }
-            let blocked = state
-                .sessions
-                .iter()
-                .filter(|s| s.blocked || s.state == "blocked")
-                .count();
-            if blocked > 0 {
-                out.push(seg(format!("⚠ {blocked} blocked"), Tone::Alert));
-            }
-            let errors = state
-                .sessions
-                .iter()
-                .filter(|s| s.state == "error" && !s.blocked)
-                .count();
-            if errors > 0 {
-                out.push(seg(format!("✗ {errors} error"), Tone::Alert));
-            }
-            if let Some((run, count)) = active_run(state, cwd) {
-                let mut text = format!("{} {}/{}", short(&run.title, 32), run.done, run.total);
-                if count > 1 {
-                    text.push_str(&format!(" +{}", count - 1));
-                }
-                out.push(seg(
-                    text,
-                    if run.failed > 0 {
-                        Tone::Warn
-                    } else {
-                        Tone::Accent
-                    },
-                ));
-            }
-            if let Some(memory) = &state.memory {
-                let percent = memory
-                    .used_percent
-                    .map(|p| format!(" {p:.0}%"))
-                    .unwrap_or_default();
-                out.push(match memory.level.as_str() {
-                    "warn" => seg(format!("mem warn{percent}"), Tone::Warn),
-                    "critical" => seg(format!("mem critical{percent}"), Tone::Alert),
-                    _ => seg(format!("mem{percent}"), Tone::Muted),
-                });
-            }
-        }
-    }
-    if let Some(branch) = branch {
-        out.push(seg(format!("⎇ {}", short(branch, 40)), Tone::Plain));
-    }
-    out
 }
 
 fn session_glyph(session: &AgentSession) -> Segment {
@@ -1128,13 +1029,7 @@ pub fn spawn(
             let mut source = Source::Pending;
             let mut fetched_at = Instant::now();
             let mut last_sent: Option<CrowView> = None;
-            let mut cwd_cache: Option<(u64, Option<String>, Option<String>)> = None;
-            // `git status` of the focused cwd: on a cwd change, else every 5 s.
-            let mut repo_cache: Option<(
-                Option<String>,
-                Instant,
-                Option<crate::tab_context::Repo>,
-            )> = None;
+            let mut cwd_cache: Option<(u64, Option<String>)> = None;
             let mut first = true;
             let mut cwd_failures = 0u32;
             let mut cwd_failed_at: Option<Instant> = None;
@@ -1157,11 +1052,11 @@ pub fn spawn(
                 let pane = shared.pane.load(Ordering::Relaxed);
                 // Another pane (focus change, reattach): earlier failures were
                 // about the old one.
-                if cwd_cache.as_ref().is_some_and(|(p, _, _)| *p != pane) {
+                if cwd_cache.as_ref().is_some_and(|(p, _)| *p != pane) {
                     cwd_failures = 0;
                     cwd_failed_at = None;
                 }
-                let (cwd, branch) = if config.status_bar {
+                let cwd = if config.status_bar {
                     // After 3 failures in a row (closed pane, daemon restart, or an older
                     // daemon that rejects the request and logs it) retry once a minute.
                     let retry = cwd_failed_at.is_none_or(|t| now.duration_since(t) >= CWD_RETRY);
@@ -1183,14 +1078,10 @@ pub fn spawn(
                     } else {
                         None
                     };
-                    let branch = match &cwd_cache {
-                        Some((p, c, b)) if *p == pane && *c == cwd && !focused => b.clone(),
-                        _ => cwd.as_deref().and_then(|c| git_branch(Path::new(c))),
-                    };
-                    cwd_cache = Some((pane, cwd.clone(), branch.clone()));
-                    (cwd, branch)
+                    cwd_cache = Some((pane, cwd.clone()));
+                    cwd
                 } else {
-                    (None, None)
+                    None
                 };
                 // (Re)resolve the command at start and every minute while missing.
                 if program.is_none()
@@ -1231,32 +1122,11 @@ pub fn spawn(
                     Source::Ready(state) => Source::Ready(aged(state, fetched_at.elapsed())),
                     other => other.clone(),
                 };
-                let repo = if config.status_bar {
-                    match &repo_cache {
-                        Some((c, at, repo))
-                            if *c == cwd && at.elapsed() < Duration::from_secs(5) =>
-                        {
-                            repo.clone()
-                        }
-                        _ => {
-                            let repo = cwd.as_deref().and_then(|c| git_status(Path::new(c)));
-                            repo_cache = Some((cwd.clone(), Instant::now(), repo.clone()));
-                            repo
-                        }
-                    }
-                } else {
-                    None
-                };
                 let view = CrowView {
                     context: if config.status_bar {
-                        context(&current, pane, cwd.as_deref(), repo)
+                        context(&current, pane, cwd.as_deref())
                     } else {
                         Context::default()
-                    },
-                    status: if config.status_bar {
-                        status_segments(&current, branch.as_deref(), cwd.as_deref())
-                    } else {
-                        Vec::new()
                     },
                     panel: if shared.panel.load(Ordering::Relaxed) {
                         panel_lines(&current)
@@ -1304,13 +1174,6 @@ mod tests {
 
     fn state() -> CrowState {
         parse_snapshot(CURRENT.as_bytes()).unwrap()
-    }
-    fn plain(segments: &[Segment]) -> String {
-        segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ")
     }
 
     #[test]
@@ -1361,9 +1224,8 @@ mod tests {
                 used_percent: Some(82.4)
             })
         );
-        let status = plain(&status_segments(&Source::Ready(s), None, None));
-        assert!(status.starts_with("▸▸ crow off | gemini 1"), "{status}");
-        assert!(status.ends_with("mem warn 82%"), "{status}");
+        let global = context(&Source::Ready(s), 1, None).global.unwrap().text;
+        assert_eq!(global, "crow off · 1 active · mem 82%");
         // Unknown resources major and null resources are ignored, not errors.
         for resources in [
             r#"{"schema":"crow-resources/2","memory":{"usedPercent":1}}"#,
@@ -1427,33 +1289,6 @@ mod tests {
                 .iter()
                 .flatten()
                 .any(|seg| seg.text == format!("+{} more sessions", MAX_SESSIONS - PANEL_SESSIONS))
-        );
-    }
-
-    #[test]
-    fn status_bar_format() {
-        let s = Source::Ready(state());
-        let status = status_segments(&s, Some("feature/x"), Some("/w/crow-term/src"));
-        assert_eq!(
-            plain(&status),
-            "▸▸ crow on | claude 2  codex 1 | ⚠ 1 blocked | ✗ 1 error | Crow panel 3/7 | ⎇ feature/x"
-        );
-        assert_eq!(status[0].tone, Tone::On);
-        assert_eq!(status[2].tone, Tone::Alert);
-        assert_eq!(status[4].tone, Tone::Accent);
-        // Absent CLI: crow segments hidden, branch still shown.
-        assert_eq!(
-            plain(&status_segments(&Source::Missing, Some("main"), None)),
-            "⎇ main"
-        );
-        assert!(status_segments(&Source::Missing, None, None).is_empty());
-        assert_eq!(
-            plain(&status_segments(
-                &Source::Failed("crow-skills timed out".into()),
-                None,
-                None
-            )),
-            "▸▸ crow ? | crow-skills timed out"
         );
     }
 
@@ -1723,44 +1558,63 @@ mod tests {
         shared.wake();
         handle.join().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 3, "then once per CWD_RETRY");
-        // Missing crow-skills: nothing but an empty status line is published.
-        assert!(published.try_iter().all(|view| view.status.is_empty()));
+        // Missing crow-skills: no agents, no global part.
+        assert!(
+            published
+                .try_iter()
+                .all(|view| view.context.agents.is_empty() && view.context.global.is_none())
+        );
     }
     #[test]
-    fn the_tab_context_gets_agents_their_run_and_the_global_summary() {
-        let with_ids = CURRENT.replace(
-            r#""ageSeconds":3,"ledgerRun":"r1""#,
-            r#""ageSeconds":3,"ledgerRun":"r1","pid":4242,"tty":"/dev/ttys004""#,
-        );
+    fn the_tab_context_gets_live_agents_their_run_and_the_global_summary() {
+        let alive = std::process::id();
+        let with_ids = CURRENT
+            .replace(
+                r#""ageSeconds":3,"ledgerRun":"r1""#,
+                &format!(r#""ageSeconds":3,"ledgerRun":"r1","pid":{alive},"tty":"/dev/ttys004""#),
+            )
+            // codex's process is gone (pid of a process that cannot exist).
+            .replace(
+                r#""lastAction":"permission_request","#,
+                r#""lastAction":"permission_request","pid":4000000000,"#,
+            )
+            .replace(
+                r#""currentTool":"Bash""#,
+                r#""currentTool":"Ba\u202esh\u200b""#,
+            );
         let state = parse_snapshot(with_ids.as_bytes()).unwrap();
-        assert_eq!(state.sessions[0].pid, Some(4242));
+        assert_eq!(state.sessions[0].pid, Some(alive));
         assert_eq!(state.sessions[0].tty.as_deref(), Some("/dev/ttys004"));
-        let context = context(&Source::Ready(state), 7, Some("/w/crow-term/src"), None);
+        let context = context(&Source::Ready(state), 7, Some("/w/crow-term/src"));
         assert_eq!(context.pane, 7);
-        // Live sessions only (the ended one is left out).
+        // Live sessions only: the ended one and the one whose process is gone
+        // are left out.
         let hosts: Vec<_> = context.agents.iter().map(|a| a.host.as_str()).collect();
-        assert_eq!(hosts, ["claude", "codex", "claude"]);
+        assert_eq!(hosts, ["claude", "claude"]);
         let claude = &context.agents[0];
         assert_eq!(
             claude.task.as_deref(),
             Some("Crow panel"),
             "the run of its directory"
         );
+        assert_eq!(
+            claude.tool.as_deref(),
+            Some("Bash"),
+            "invisible characters removed"
+        );
         assert_eq!(claude.context_percent, Some(57));
-        assert_eq!(claude.pid, Some(4242));
+        assert_eq!(claude.pid, Some(alive));
         let progress = context.progress.unwrap();
         assert_eq!((progress.done, progress.total), (3, 7));
-        // Active = working or blocked: 2 of the 3 live sessions.
+        // Active = working or blocked.
         assert_eq!(context.global.unwrap().text, "crow on · 2 active");
-        // Nothing to say before the first snapshot.
-        assert_eq!(
-            super::context(&Source::Pending, 1, None, None).agents.len(),
-            0
-        );
+        assert_eq!(super::context(&Source::Pending, 1, None).agents.len(), 0);
+        assert!(pid_alive(alive));
+        assert!(!pid_alive(4_000_000_000));
     }
 
     #[test]
-    fn git_repo_and_status_read_the_real_repository() {
+    fn the_repository_is_read_without_running_anything_it_configures() {
         let dir = tempfile_dir();
         let git = |args: &[&str]| {
             std::process::Command::new("git")
@@ -1776,22 +1630,40 @@ mod tests {
                 ])
                 .args(args)
                 .output()
-                .unwrap()
         };
-        if git(&["init", "-q", "-b", "trunk"]).status.code() != Some(0) {
+        if !git(&["init", "-q", "-b", "trunk"]).is_ok_and(|out| out.status.success()) {
             return; // git not installed
         }
         std::fs::write(dir.join("a.txt"), "1").unwrap();
-        git(&["add", "."]);
-        git(&["commit", "-qm", "one"]);
+        git(&["add", "."]).unwrap();
+        git(&["commit", "-qm", "one"]).unwrap();
+        // A hostile repository: every way git runs repository-configured
+        // commands would leave a marker file.
+        let marker = |name: &str| dir.join(format!("MARKER-{name}"));
+        let touch = |name: &str| format!("touch '{}'", marker(name).display());
+        let mut config = std::fs::read_to_string(dir.join(".git/config")).unwrap();
+        config.push_str(&format!(
+            "[core]\n\tfsmonitor = {}\n\thooksPath = hooks\n[filter \"evil\"]\n\tclean = {}\n\tsmudge = {}\n",
+            touch("fsmonitor"),
+            touch("clean"),
+            touch("smudge")
+        ));
+        std::fs::write(dir.join(".git/config"), config).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=evil\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "2").unwrap();
         let sub = dir.join("deep/er");
         std::fs::create_dir_all(&sub).unwrap();
         let (top, branch) = git_repo(&sub).unwrap();
         assert_eq!((top.as_path(), branch.as_str()), (dir.as_path(), "trunk"));
-        let repo = git_status(&sub).unwrap();
-        assert_eq!((repo.branch.as_str(), repo.dirty), ("trunk", false));
-        std::fs::write(dir.join("a.txt"), "2").unwrap();
-        assert!(git_status(&sub).unwrap().dirty);
+        for name in ["fsmonitor", "clean", "smudge"] {
+            assert!(!marker(name).exists(), "{name} ran");
+        }
+        // The fixture is real: git itself would run them.
+        let _ = git(&["status", "--porcelain"]);
+        assert!(
+            marker("fsmonitor").exists() || marker("clean").exists(),
+            "fixture never triggers git"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

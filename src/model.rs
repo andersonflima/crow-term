@@ -203,6 +203,8 @@ pub struct PaneSummary {
     /// The pane's terminal device (`/dev/ttys004`), empty when unknown.
     pub tty: String,
     pub cwd: Option<String>,
+    /// (repository name, branch) of `cwd`, read from `.git` files only.
+    pub repo: Option<(String, String)>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
