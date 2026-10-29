@@ -126,7 +126,7 @@ class Run:
         self.cli("send-keys", pane, text, check=True)
 
     # -------------------------------------------------------------------- GUI
-    def launch(self, session, *program, attach=False, name=None):
+    def launch(self, session, *program, attach=False, name=None, config=None):
         """Start a GUI. `program` runs without a shell (`start -- program...`)."""
         name = name or "gui"
         if any(gui.name == name for gui in self.guis):
@@ -134,7 +134,7 @@ class Run:
         frame_dir = self.frames / name
         frame_dir.mkdir()
         log = (self.artifacts / f"{name}.log").open("w")
-        args = [str(BIN), "--config", str(self.config), "--shell", self.shell, "--session", session]
+        args = [str(BIN), "--config", str(config or self.config), "--shell", self.shell, "--session", session]
         if attach:
             args += ["attach", session]
         elif program:

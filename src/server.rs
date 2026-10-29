@@ -129,6 +129,16 @@ pub struct Server {
     registry: Mutex<Registry>,
     signals: Arc<Signals>,
     stopped: AtomicBool,
+    /// Pane summaries (tab labels, status bar), refreshed by their own thread
+    /// once a second; a view only copies them, never computes them.
+    summaries: Mutex<HashMap<u64, crate::model::PaneSummary>>,
+    /// When a GUI last watched (ms since start): summaries are refreshed only
+    /// while one is attached.
+    last_watch: std::sync::atomic::AtomicU64,
+    /// Pids of live agent sessions each GUI asked about (`AgentPids`), with
+    /// when it last did; the union of fresh lists is matched.
+    agent_pids: Mutex<HashMap<u64, (Vec<u32>, std::time::Instant)>>,
+    started: std::time::Instant,
     config: Config,
 }
 impl Server {
@@ -147,6 +157,10 @@ impl Server {
             registry: Mutex::new(Registry::default()),
             signals: Arc::default(),
             stopped: AtomicBool::new(false),
+            summaries: Mutex::default(),
+            last_watch: std::sync::atomic::AtomicU64::new(0),
+            agent_pids: Mutex::default(),
+            started: std::time::Instant::now(),
             config: config.clone(),
         }
     }
@@ -192,6 +206,16 @@ impl Server {
             vec![]
         };
         let sessions = registry.infos();
+        // Summaries of every pane of the watched session (tab labels), sent
+        // along with screens: copied from the cache the summary thread keeps.
+        let summarized: Vec<u64> = if screens {
+            session
+                .and_then(|s| registry.sessions.get(s))
+                .map(|windows| windows.iter().flat_map(|w| w.layout.panes()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let engines: Vec<_> = panes
             .into_iter()
             .filter_map(|id| registry.panes.get(&id).cloned().map(|e| (id, e)))
@@ -221,11 +245,22 @@ impl Server {
                 .map(|(id, engine)| Ok((id, engine.snapshot()?)))
                 .collect::<Result<_>>()?
         };
+        let panes = {
+            let cache = self
+                .summaries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("summaries poisoned"))?;
+            summarized
+                .into_iter()
+                .filter_map(|id| cache.get(&id).map(|summary| (id, summary.clone())))
+                .collect()
+        };
         Ok(View {
             instance: self.instance,
             revision,
             sessions,
             screens,
+            panes,
         })
     }
     pub fn handle(&self, request: Request) -> Result<Response> {
@@ -247,6 +282,10 @@ impl Server {
                 window,
                 since,
             } => {
+                self.last_watch.store(
+                    self.started.elapsed().as_millis() as u64 + 1,
+                    Ordering::Relaxed,
+                );
                 self.signals.wait(since);
                 #[cfg(feature = "test-hooks")]
                 stall_for_tests(&session);
@@ -378,6 +417,15 @@ impl Server {
                 validate_size(size)?;
                 self.pane(pane)?.resize_with_cell(size, cell)?;
             }
+            Request::AgentPids { client, mut pids } => {
+                pids.truncate(256);
+                if let Ok(mut lists) = self.agent_pids.lock() {
+                    lists.retain(|_, (_, at)| at.elapsed() < AGENT_PIDS_TTL);
+                    lists.truncate_to(64);
+                    lists.insert(client, (pids, std::time::Instant::now()));
+                }
+                return Ok(Response::Ok);
+            }
             Request::PaneCwd { pane } => return Ok(Response::Cwd(self.pane(pane)?.cwd())),
             Request::Clipboard { pane } => {
                 return Ok(Response::Clipboard(self.pane(pane)?.clipboard()?));
@@ -496,6 +544,101 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A GUI resends its agent pids at least this often (crow keepalive); a
+/// list older than this belongs to a GUI that is gone.
+pub const AGENT_PIDS_TTL: Duration = Duration::from_secs(45);
+
+trait TruncateTo {
+    fn truncate_to(&mut self, max: usize);
+}
+impl<K: Copy + Eq + std::hash::Hash, V> TruncateTo for HashMap<K, (V, std::time::Instant)> {
+    /// Keep at most `max` entries, dropping the oldest.
+    fn truncate_to(&mut self, max: usize) {
+        while self.len() >= max {
+            let Some(oldest) = self.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+}
+
+impl Server {
+    /// The union of the fresh agent pid lists of every GUI.
+    fn agent_pids(&self) -> Vec<u32> {
+        let Ok(lists) = self.agent_pids.lock() else {
+            return Vec::new();
+        };
+        let mut pids: Vec<u32> = lists
+            .values()
+            .filter(|(_, at)| at.elapsed() < AGENT_PIDS_TTL)
+            .flat_map(|(pids, _)| pids.iter().copied())
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
+    /// Summaries serve tab labels and the status bar of attached GUIs: none
+    /// when both are off, or when no GUI watched in the last 5 s.
+    fn summaries_wanted(&self) -> bool {
+        let enabled = self.config.tab_labels || self.config.crow.status_bar;
+        let last = self.last_watch.load(Ordering::Relaxed);
+        enabled && last > 0 && self.started.elapsed().as_millis() as u64 <= last + 5_000
+    }
+    /// Recompute every pane's summary (off the request path; one pane at a
+    /// time, never waiting on a busy pane) and wake watchers when any changed.
+    fn refresh_summaries(&self) {
+        let engines: Vec<(u64, Arc<Engine>)> = match self.lock() {
+            Ok(registry) => registry
+                .panes
+                .iter()
+                .map(|(id, engine)| (*id, engine.clone()))
+                .collect(),
+            Err(_) => return,
+        };
+        // A process table only while agent sessions are live: who is whose
+        // child, so an agent under a runtime or wrapper is found in the job
+        // of the pane that started it.
+        let agents = self.agent_pids();
+        let children = (!agents.is_empty()).then(|| {
+            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+            for (pid, process) in system.processes() {
+                if let Some(parent) = process.parent() {
+                    children
+                        .entry(parent.as_u32())
+                        .or_default()
+                        .push(pid.as_u32());
+                }
+            }
+            children
+        });
+        let fresh: HashMap<u64, crate::model::PaneSummary> = engines
+            .into_iter()
+            .map(|(id, engine)| {
+                let tree = children.as_ref().map(|c| (c, agents.as_slice()));
+                (id, engine.summary(tree))
+            })
+            .collect();
+        let changed = match self.summaries.lock() {
+            Ok(mut cache) if *cache != fresh => {
+                *cache = fresh;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.signals.bump();
+        }
+    }
+}
+
 pub fn run(config: Config) -> Result<()> {
     // Held for the daemon's whole life: starters use it to tell a live but
     // unresponsive daemon from a dead one (never replace a live daemon).
@@ -503,6 +646,19 @@ pub fn run(config: Config) -> Result<()> {
     let _ = std::fs::remove_file(ipc::runtime_dir()?.join(ipc::STOPPED_MARKER));
     let listener = ipc::listen()?;
     let server = Arc::new(Server::new(&config));
+    {
+        let server = server.clone();
+        std::thread::Builder::new()
+            .name("crow-summaries".into())
+            .spawn(move || {
+                while !server.stopped.load(Ordering::Acquire) {
+                    if server.summaries_wanted() {
+                        server.refresh_summaries();
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            })?;
+    }
     let active = Arc::new(AtomicUsize::new(0));
     while !server.stopped.load(Ordering::Acquire) {
         match listener.accept() {
@@ -589,6 +745,115 @@ pub fn run(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(unix)]
+    fn views_carry_cached_pane_summaries_refreshed_off_the_request_path() {
+        let server = Server::new(&Config::default());
+        let Response::Created { window, pane } = server
+            .handle(Request::Ensure {
+                session: "s".into(),
+                shell: ShellSpec {
+                    program: "/bin/sh".into(),
+                    // A background child of the foreground job: in its tree.
+                    args: vec!["-c".into(), "sleep 29 & exec sleep 30".into()],
+                    cwd: None,
+                },
+                size: Size::default(),
+            })
+            .unwrap()
+        else {
+            panic!("not created");
+        };
+        // No GUI has watched yet: the summary thread stays idle.
+        assert!(!server.summaries_wanted());
+        server.last_watch.store(
+            server.started.elapsed().as_millis() as u64 + 1,
+            Ordering::Relaxed,
+        );
+        assert!(server.summaries_wanted(), "a GUI is attached");
+        // Before the summary thread ran, a view has screens but no summaries:
+        // nothing is computed while answering.
+        let view = server.view(Some("s"), window, Some(0)).unwrap();
+        assert!(!view.screens.is_empty());
+        assert!(view.panes.is_empty(), "{:?}", view.panes);
+        let revision = server.signals.revision();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let summary = loop {
+            server.refresh_summaries();
+            let view = server.view(Some("s"), window, Some(0)).unwrap();
+            if let Some((_, summary)) = view.panes.iter().find(|(id, _)| *id == pane)
+                && summary.process == "sleep"
+            {
+                break summary.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "no summary");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let leader = summary.pid.unwrap();
+        assert_eq!(
+            summary.agent_pid, None,
+            "no agent pids asked about: no process scan"
+        );
+        assert!(
+            server.signals.revision() > revision,
+            "a changed summary wakes watchers"
+        );
+        // Unchanged summaries do not wake anyone.
+        let settled = server.signals.revision();
+        server.refresh_summaries();
+        assert_eq!(server.signals.revision(), settled);
+        // An agent session whose process is a child of the pane's job (here
+        // the background `sleep 29`) is matched by the daemon.
+        let child = {
+            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            system
+                .processes()
+                .iter()
+                .find(|(_, p)| p.parent().map(|p| p.as_u32()) == Some(leader))
+                .map(|(pid, _)| pid.as_u32())
+                .expect("the background child")
+        };
+        let matched = |server: &Server| {
+            server.refresh_summaries();
+            let view = server.view(Some("s"), window, Some(0)).unwrap();
+            view.panes
+                .iter()
+                .find(|(id, _)| *id == pane)
+                .unwrap()
+                .1
+                .agent_pid
+        };
+        let ask = |client: u64, pids: Vec<u32>| {
+            server.handle(Request::AgentPids { client, pids }).unwrap();
+        };
+        ask(1, vec![999_999_999, child]);
+        assert_eq!(matched(&server), Some(child));
+        // Another GUI with no agents does not erase the first one's list.
+        ask(2, vec![]);
+        assert_eq!(matched(&server), Some(child), "union of the GUIs' lists");
+        ask(1, vec![]);
+        assert_eq!(matched(&server), None, "the list was replaced");
+        // A GUI that stopped resending (gone) no longer counts.
+        ask(3, vec![child]);
+        assert_eq!(matched(&server), Some(child));
+        if let Ok(mut lists) = server.agent_pids.lock()
+            && let Some((_, at)) = lists.get_mut(&3)
+        {
+            *at -= AGENT_PIDS_TTL;
+        }
+        assert_eq!(matched(&server), None, "stale list expired");
+        server
+            .handle(Request::KillSession {
+                session: "s".into(),
+            })
+            .unwrap();
+    }
     #[test]
     fn guarded_commands_run_only_on_the_daemon_instance_they_were_made_for() {
         // Two daemons in a row reuse pane ids from 1: a command made for the

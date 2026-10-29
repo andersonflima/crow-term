@@ -52,6 +52,10 @@ pub struct AgentSession {
     pub context_percent: Option<f64>,
     pub tokens: Option<u64>,
     pub age_seconds: u64,
+    /// Process id and terminal of the agent CLI, when crow-skills reports
+    /// them: they tie the session to a pane exactly.
+    pub pid: Option<u32>,
+    pub tty: Option<String>,
 }
 impl AgentSession {
     pub fn live(&self) -> bool {
@@ -267,6 +271,8 @@ fn parse_session(item: &Value) -> AgentSession {
             .map(|p| p.clamp(0.0, 100.0)),
         tokens,
         age_seconds: uint(item, "ageSeconds").unwrap_or(0),
+        pid: uint(item, "pid").and_then(|pid| u32::try_from(pid).ok()),
+        tty: text(item, "tty"),
     }
 }
 
@@ -330,8 +336,119 @@ pub type Line = Vec<Segment>;
 /// What the worker publishes; the UI only paints it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct CrowView {
-    pub status: Vec<Segment>,
     pub panel: Vec<Line>,
+    /// Facts for the tab context (footer and tab labels).
+    pub context: Context,
+}
+
+/// Agent sessions, the focused pane's run and repository, the global crow
+/// summary: the UI composes them with `tab_context`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Context {
+    pub agents: Vec<crate::tab_context::Agent>,
+    pub progress: Option<crate::tab_context::Progress>,
+    pub global: Option<crate::tab_context::Segment>,
+    /// The pane and cwd these facts are about.
+    pub pane: u64,
+    pub cwd: Option<String>,
+}
+
+/// The tab-context facts of `source` for the focused pane's `cwd`.
+pub fn context(source: &Source, pane: u64, cwd: Option<&str>) -> Context {
+    use crate::tab_context::{Agent, GlobalInput, Progress, global_segment};
+    let mut out = Context {
+        pane,
+        cwd: cwd.map(str::to_owned),
+        ..Context::default()
+    };
+    let Source::Ready(state) = source else {
+        return out;
+    };
+    let run_for = |dir: &str| {
+        state
+            .runs
+            .iter()
+            .filter(|r| r.status == "running" && is_ancestor(&r.cwd, dir))
+            .max_by_key(|r| r.cwd.len())
+    };
+    let clean = |text: &Option<String>| {
+        text.as_deref()
+            .map(crate::tab_context::sanitize)
+            .filter(|t| !t.is_empty())
+    };
+    out.agents = state
+        .sessions
+        .iter()
+        // A session whose agent process is gone is stale, whatever it says.
+        .filter(|s| s.live() && s.pid.is_none_or(pid_alive))
+        .map(|s| Agent {
+            host: crate::tab_context::sanitize(&s.host),
+            state: crate::tab_context::sanitize(&s.state),
+            blocked: s.blocked,
+            cwd: s.cwd.clone(),
+            pid: s.pid,
+            tty: s.tty.clone(),
+            model: clean(&s.model),
+            tool: clean(&s.tool),
+            task: run_for(&s.cwd).map(|r| crate::tab_context::sanitize(&r.title)),
+            context_percent: s.context_percent.map(|p| p.round() as u8),
+            age_seconds: s.age_seconds,
+        })
+        .collect();
+    out.progress = cwd.and_then(run_for).map(|r| Progress {
+        title: r.title.clone(),
+        done: r.done,
+        total: r.total,
+        failed: r.failed,
+    });
+    out.global = global_segment(&GlobalInput {
+        crow_on: Some(state.mode_on != Some(false)),
+        active_sessions: state
+            .sessions
+            .iter()
+            .filter(|s| s.state == "working" || s.blocked || s.state == "blocked")
+            .count(),
+        memory: state
+            .memory
+            .as_ref()
+            .map(|m| (m.level.clone(), m.used_percent.map(|p| p.round() as u8))),
+    });
+    out
+}
+
+/// Whether a process with this id exists (no signal is sent).
+pub fn pid_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(raw) = i32::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: kill with signal 0 only checks for the process.
+        let status = unsafe { libc::kill(raw, 0) };
+        status == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let mut system = System::new();
+        let id = Pid::from_u32(pid);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[id]),
+            false,
+            ProcessRefreshKind::nothing(),
+        );
+        system.process(id).is_some()
+    }
+}
+
+/// The repository containing `cwd` and its branch, from `.git` files only.
+pub fn git_repo(cwd: &Path) -> Option<(PathBuf, String)> {
+    for dir in cwd.ancestors().take(64) {
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return git_branch(dir).map(|branch| (dir.to_path_buf(), branch));
+        }
+    }
+    None
 }
 
 /// Snapshot availability as seen by the worker.
@@ -404,87 +521,6 @@ pub fn active_run<'a>(state: &'a CrowState, cwd: Option<&str>) -> Option<(&'a Ru
         })
         .or_else(|| running.first().copied())?;
     Some((chosen, running.len()))
-}
-
-/// The footer line: `▸▸ crow on · claude 2 · codex 1 · ⚠ 1 blocked · <run> 3/7 · mem 41% · ⎇ main`.
-pub fn status_segments(source: &Source, branch: Option<&str>, cwd: Option<&str>) -> Vec<Segment> {
-    let mut out = Vec::new();
-    match source {
-        Source::Pending | Source::Missing => {}
-        Source::Failed(error) => {
-            out.push(seg("▸▸ crow ?", Tone::Muted));
-            out.push(seg(short(error, 40), Tone::Muted));
-        }
-        Source::Ready(state) => {
-            out.push(match state.mode_on {
-                Some(true) | None => seg("▸▸ crow on", Tone::On),
-                Some(false) => seg("▸▸ crow off", Tone::Off),
-            });
-            let mut hosts: Vec<(String, usize)> = Vec::new();
-            for session in state.sessions.iter().filter(|s| s.live()) {
-                match hosts.iter_mut().find(|(host, _)| *host == session.host) {
-                    Some((_, count)) => *count += 1,
-                    None => hosts.push((session.host.clone(), 1)),
-                }
-            }
-            if hosts.is_empty() {
-                out.push(seg("no agents", Tone::Muted));
-            } else {
-                hosts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                let text = hosts
-                    .iter()
-                    .map(|(host, count)| format!("{host} {count}"))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                out.push(seg(text, Tone::Plain));
-            }
-            let blocked = state
-                .sessions
-                .iter()
-                .filter(|s| s.blocked || s.state == "blocked")
-                .count();
-            if blocked > 0 {
-                out.push(seg(format!("⚠ {blocked} blocked"), Tone::Alert));
-            }
-            let errors = state
-                .sessions
-                .iter()
-                .filter(|s| s.state == "error" && !s.blocked)
-                .count();
-            if errors > 0 {
-                out.push(seg(format!("✗ {errors} error"), Tone::Alert));
-            }
-            if let Some((run, count)) = active_run(state, cwd) {
-                let mut text = format!("{} {}/{}", short(&run.title, 32), run.done, run.total);
-                if count > 1 {
-                    text.push_str(&format!(" +{}", count - 1));
-                }
-                out.push(seg(
-                    text,
-                    if run.failed > 0 {
-                        Tone::Warn
-                    } else {
-                        Tone::Accent
-                    },
-                ));
-            }
-            if let Some(memory) = &state.memory {
-                let percent = memory
-                    .used_percent
-                    .map(|p| format!(" {p:.0}%"))
-                    .unwrap_or_default();
-                out.push(match memory.level.as_str() {
-                    "warn" => seg(format!("mem warn{percent}"), Tone::Warn),
-                    "critical" => seg(format!("mem critical{percent}"), Tone::Alert),
-                    _ => seg(format!("mem{percent}"), Tone::Muted),
-                });
-            }
-        }
-    }
-    if let Some(branch) = branch {
-        out.push(seg(format!("⎇ {}", short(branch, 40)), Tone::Plain));
-    }
-    out
 }
 
 fn session_glyph(session: &AgentSession) -> Segment {
@@ -698,39 +734,149 @@ pub fn aged(state: &CrowState, elapsed: Duration) -> CrowState {
 // ---------------------------------------------------------------------------
 // Git branch without a subprocess
 
+/// `base.join(target)` with `.` and `..` resolved lexically (the filesystem
+/// is not touched, so no symlink or automount is followed to do it).
+pub fn normalize(base: &Path, target: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in base.join(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Device and UNC forms: never a local repository (`\\host\share`,
+/// `//host`, `\\?\UNC\`, `\??\`, `\\.\`).
+fn device_or_unc(text: &str) -> bool {
+    let text = text.replace('\\', "/");
+    text.starts_with("//") || text.starts_with("/??/")
+}
+
+/// Where a `gitdir:` pointer may lead: under the user's home or the
+/// repository's own directory, as a plain local path. On Windows only a
+/// drive path (`X:\…`) under the user profile or the repository.
+fn allowed_gitdir(raw: &str, target: &Path, roots: &[&Path]) -> bool {
+    if device_or_unc(raw) || device_or_unc(&target.to_string_lossy()) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let text = target.to_string_lossy();
+        let bytes = text.as_bytes();
+        if !(bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':') {
+            return false;
+        }
+    }
+    roots.iter().any(|root| target.starts_with(root))
+}
+
+/// The contents (first 4 KiB) of a regular file that is not a symlink;
+/// opened without following a symlink or blocking on a FIFO, the type
+/// checked again on the open file.
+fn read_regular(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(4096).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// No component of `path` below `root` is a symlink (nothing is followed).
+fn no_symlinks_below(path: &Path, root: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in rest.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
 /// Branch (or short detached SHA) of the repository containing `cwd`, reading
 /// `.git/HEAD` (directory or `gitdir:` file, as in worktrees) walking upwards.
+/// Nothing is executed and no symlink is followed; a `gitdir:` pointer is
+/// followed only to a local path under the user's home or the repository.
 pub fn git_branch(cwd: &Path) -> Option<String> {
-    fn read_small(path: &Path) -> Option<String> {
-        // Regular files only: opening a FIFO named HEAD would block the worker.
-        if !std::fs::metadata(path).ok()?.is_file() {
-            return None;
+    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    git_branch_with_home(cwd, home.as_deref())
+}
+
+/// `\\?\C:\…` (Windows' verbatim form of a local drive path, as
+/// `canonicalize` returns it) as the plain `C:\…`; anything else unchanged.
+fn plain_local(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.len() >= 2
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && rest.as_bytes()[1] == b':' =>
+        {
+            PathBuf::from(rest)
         }
-        let mut text = String::new();
-        std::fs::File::open(path)
-            .ok()?
-            .take(4096)
-            .read_to_string(&mut text)
-            .ok()?;
-        Some(text)
+        _ => path.to_path_buf(),
     }
+}
+
+fn git_branch_with_home(cwd: &Path, home: Option<&Path>) -> Option<String> {
+    let cwd = plain_local(cwd);
+    let home = home.map(plain_local);
+    let home = home.as_deref();
     for dir in cwd.ancestors().take(64) {
         let dot_git = dir.join(".git");
-        let git_dir = if dot_git.is_dir() {
-            dot_git
-        } else if dot_git.is_file() {
-            let pointer = read_small(&dot_git)?;
-            let target = pointer.trim().strip_prefix("gitdir:")?.trim();
-            let target = Path::new(target);
-            if target.is_absolute() {
-                target.to_path_buf()
-            } else {
-                dir.join(target)
-            }
-        } else {
+        let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
             continue;
         };
-        let head = read_small(&git_dir.join("HEAD"))?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            return None;
+        }
+        let (git_dir, root) = if kind.is_dir() {
+            (dot_git, dir.to_path_buf())
+        } else if kind.is_file() {
+            let pointer = read_regular(&dot_git)?;
+            let raw = pointer.trim().strip_prefix("gitdir:")?.trim();
+            let target = normalize(dir, Path::new(raw));
+            let roots: Vec<&Path> = [Some(dir), home].into_iter().flatten().collect();
+            if !allowed_gitdir(raw, &target, &roots) {
+                return None;
+            }
+            let root = roots
+                .iter()
+                .find(|root| target.starts_with(root))?
+                .to_path_buf();
+            (target, root)
+        } else {
+            return None;
+        };
+        if !no_symlinks_below(&git_dir, &root) {
+            return None;
+        }
+        let head = read_regular(&git_dir.join("HEAD"))?;
         let head = head.trim();
         if let Some(reference) = head.strip_prefix("ref:") {
             let reference = reference.trim();
@@ -993,7 +1139,11 @@ pub fn spawn(
             let mut source = Source::Pending;
             let mut fetched_at = Instant::now();
             let mut last_sent: Option<CrowView> = None;
-            let mut cwd_cache: Option<(u64, Option<String>, Option<String>)> = None;
+            // Published at least this often even when unchanged: the GUI
+            // resends its agent pids to the daemon on each view.
+            const KEEPALIVE: Duration = Duration::from_secs(15);
+            let mut sent_at = Instant::now();
+            let mut cwd_cache: Option<(u64, Option<String>)> = None;
             let mut first = true;
             let mut cwd_failures = 0u32;
             let mut cwd_failed_at: Option<Instant> = None;
@@ -1016,11 +1166,11 @@ pub fn spawn(
                 let pane = shared.pane.load(Ordering::Relaxed);
                 // Another pane (focus change, reattach): earlier failures were
                 // about the old one.
-                if cwd_cache.as_ref().is_some_and(|(p, _, _)| *p != pane) {
+                if cwd_cache.as_ref().is_some_and(|(p, _)| *p != pane) {
                     cwd_failures = 0;
                     cwd_failed_at = None;
                 }
-                let (cwd, branch) = if config.status_bar {
+                let cwd = if config.status_bar {
                     // After 3 failures in a row (closed pane, daemon restart, or an older
                     // daemon that rejects the request and logs it) retry once a minute.
                     let retry = cwd_failed_at.is_none_or(|t| now.duration_since(t) >= CWD_RETRY);
@@ -1042,14 +1192,10 @@ pub fn spawn(
                     } else {
                         None
                     };
-                    let branch = match &cwd_cache {
-                        Some((p, c, b)) if *p == pane && *c == cwd && !focused => b.clone(),
-                        _ => cwd.as_deref().and_then(|c| git_branch(Path::new(c))),
-                    };
-                    cwd_cache = Some((pane, cwd.clone(), branch.clone()));
-                    (cwd, branch)
+                    cwd_cache = Some((pane, cwd.clone()));
+                    cwd
                 } else {
-                    (None, None)
+                    None
                 };
                 // (Re)resolve the command at start and every minute while missing.
                 if program.is_none()
@@ -1091,10 +1237,10 @@ pub fn spawn(
                     other => other.clone(),
                 };
                 let view = CrowView {
-                    status: if config.status_bar {
-                        status_segments(&current, branch.as_deref(), cwd.as_deref())
+                    context: if config.status_bar {
+                        context(&current, pane, cwd.as_deref())
                     } else {
-                        Vec::new()
+                        Context::default()
                     },
                     panel: if shared.panel.load(Ordering::Relaxed) {
                         panel_lines(&current)
@@ -1102,11 +1248,12 @@ pub fn spawn(
                         Vec::new()
                     },
                 };
-                if last_sent.as_ref() != Some(&view) {
+                if last_sent.as_ref() != Some(&view) || sent_at.elapsed() >= KEEPALIVE {
                     if !publish(view.clone()) {
                         break;
                     }
                     last_sent = Some(view);
+                    sent_at = Instant::now();
                 }
             }
         })?;
@@ -1142,13 +1289,6 @@ mod tests {
 
     fn state() -> CrowState {
         parse_snapshot(CURRENT.as_bytes()).unwrap()
-    }
-    fn plain(segments: &[Segment]) -> String {
-        segments
-            .iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" | ")
     }
 
     #[test]
@@ -1199,9 +1339,8 @@ mod tests {
                 used_percent: Some(82.4)
             })
         );
-        let status = plain(&status_segments(&Source::Ready(s), None, None));
-        assert!(status.starts_with("▸▸ crow off | gemini 1"), "{status}");
-        assert!(status.ends_with("mem warn 82%"), "{status}");
+        let global = context(&Source::Ready(s), 1, None).global.unwrap().text;
+        assert_eq!(global, "crow off · 1 active · mem 82%");
         // Unknown resources major and null resources are ignored, not errors.
         for resources in [
             r#"{"schema":"crow-resources/2","memory":{"usedPercent":1}}"#,
@@ -1265,33 +1404,6 @@ mod tests {
                 .iter()
                 .flatten()
                 .any(|seg| seg.text == format!("+{} more sessions", MAX_SESSIONS - PANEL_SESSIONS))
-        );
-    }
-
-    #[test]
-    fn status_bar_format() {
-        let s = Source::Ready(state());
-        let status = status_segments(&s, Some("feature/x"), Some("/w/crow-term/src"));
-        assert_eq!(
-            plain(&status),
-            "▸▸ crow on | claude 2  codex 1 | ⚠ 1 blocked | ✗ 1 error | Crow panel 3/7 | ⎇ feature/x"
-        );
-        assert_eq!(status[0].tone, Tone::On);
-        assert_eq!(status[2].tone, Tone::Alert);
-        assert_eq!(status[4].tone, Tone::Accent);
-        // Absent CLI: crow segments hidden, branch still shown.
-        assert_eq!(
-            plain(&status_segments(&Source::Missing, Some("main"), None)),
-            "⎇ main"
-        );
-        assert!(status_segments(&Source::Missing, None, None).is_empty());
-        assert_eq!(
-            plain(&status_segments(
-                &Source::Failed("crow-skills timed out".into()),
-                None,
-                None
-            )),
-            "▸▸ crow ? | crow-skills timed out"
         );
     }
 
@@ -1451,7 +1563,15 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
-        assert_eq!(git_branch(&worktree).as_deref(), Some("0123456"));
+        // A pointer outside the worktree is followed only under the home.
+        assert_eq!(
+            git_branch_with_home(&worktree, Some(root.path())).as_deref(),
+            Some("0123456")
+        );
+        assert_eq!(
+            git_branch_with_home(&worktree, Some(Path::new("/nonexistent-home"))),
+            None
+        );
         assert_eq!(git_branch(&root.path().join("nowhere")), None);
         std::fs::write(repo.join(".git/HEAD"), "garbage").unwrap();
         assert_eq!(git_branch(&repo), None);
@@ -1561,7 +1681,209 @@ mod tests {
         shared.wake();
         handle.join().unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 3, "then once per CWD_RETRY");
-        // Missing crow-skills: nothing but an empty status line is published.
-        assert!(published.try_iter().all(|view| view.status.is_empty()));
+        // Missing crow-skills: no agents, no global part.
+        assert!(
+            published
+                .try_iter()
+                .all(|view| view.context.agents.is_empty() && view.context.global.is_none())
+        );
+    }
+    #[test]
+    fn the_tab_context_gets_live_agents_their_run_and_the_global_summary() {
+        let alive = std::process::id();
+        let with_ids = CURRENT
+            .replace(
+                r#""ageSeconds":3,"ledgerRun":"r1""#,
+                &format!(r#""ageSeconds":3,"ledgerRun":"r1","pid":{alive},"tty":"/dev/ttys004""#),
+            )
+            // codex's process is gone (pid of a process that cannot exist).
+            .replace(
+                r#""lastAction":"permission_request","#,
+                r#""lastAction":"permission_request","pid":4000000000,"#,
+            )
+            .replace(
+                r#""currentTool":"Bash""#,
+                r#""currentTool":"Ba\u202esh\u200b""#,
+            );
+        let state = parse_snapshot(with_ids.as_bytes()).unwrap();
+        assert_eq!(state.sessions[0].pid, Some(alive));
+        assert_eq!(state.sessions[0].tty.as_deref(), Some("/dev/ttys004"));
+        let context = context(&Source::Ready(state), 7, Some("/w/crow-term/src"));
+        assert_eq!(context.pane, 7);
+        // Live sessions only: the ended one and the one whose process is gone
+        // are left out.
+        let hosts: Vec<_> = context.agents.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(hosts, ["claude", "claude"]);
+        let claude = &context.agents[0];
+        assert_eq!(
+            claude.task.as_deref(),
+            Some("Crow panel"),
+            "the run of its directory"
+        );
+        assert_eq!(
+            claude.tool.as_deref(),
+            Some("Bash"),
+            "invisible characters removed"
+        );
+        assert_eq!(claude.context_percent, Some(57));
+        assert_eq!(claude.pid, Some(alive));
+        let progress = context.progress.unwrap();
+        assert_eq!((progress.done, progress.total), (3, 7));
+        // Active = working or blocked.
+        assert_eq!(context.global.unwrap().text, "crow on · 2 active");
+        assert_eq!(super::context(&Source::Pending, 1, None).agents.len(), 0);
+        assert!(pid_alive(alive));
+        assert!(!pid_alive(4_000_000_000));
+    }
+
+    #[test]
+    fn the_repository_is_read_without_running_anything_it_configures() {
+        let dir = tempfile_dir();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+        };
+        if !git(&["init", "-q", "-b", "trunk"]).is_ok_and(|out| out.status.success()) {
+            return; // git not installed
+        }
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        git(&["add", "."]).unwrap();
+        git(&["commit", "-qm", "one"]).unwrap();
+        // A hostile repository: every way git runs repository-configured
+        // commands would leave a marker file.
+        let marker = |name: &str| dir.join(format!("MARKER-{name}"));
+        // Forward slashes: a backslash is an escape in git config values
+        // (and Git for Windows' sh reads `C:/…` paths).
+        let touch = |name: &str| {
+            format!(
+                "touch '{}'",
+                marker(name).to_string_lossy().replace('\\', "/")
+            )
+        };
+        let mut config = std::fs::read_to_string(dir.join(".git/config")).unwrap();
+        config.push_str(&format!(
+            "[core]\n\tfsmonitor = {}\n\thooksPath = hooks\n[filter \"evil\"]\n\tclean = {}\n\tsmudge = {}\n",
+            touch("fsmonitor"),
+            touch("clean"),
+            touch("smudge")
+        ));
+        std::fs::write(dir.join(".git/config"), config).unwrap();
+        std::fs::write(dir.join(".gitattributes"), "* filter=evil\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "2").unwrap();
+        let sub = dir.join("deep/er");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (top, branch) = git_repo(&sub).unwrap();
+        assert_eq!((top.as_path(), branch.as_str()), (dir.as_path(), "trunk"));
+        for name in ["fsmonitor", "clean", "smudge"] {
+            assert!(!marker(name).exists(), "{name} ran");
+        }
+        // The fixture is real: git itself would run them.
+        let _ = git(&["status", "--porcelain"]);
+        assert!(
+            marker("fsmonitor").exists() || marker("clean").exists(),
+            "fixture never triggers git"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gitdir_pointers_never_leave_home_or_the_repository_and_no_symlink_is_followed() {
+        let home = tempfile_dir();
+        let repo = home.join("repo");
+        let branch = |dir: &Path| git_branch_with_home(dir, Some(&home));
+        std::fs::create_dir_all(repo.join("real.git")).unwrap();
+        std::fs::write(repo.join("real.git/HEAD"), "ref: refs/heads/ok\n").unwrap();
+        let point = |target: &str| {
+            std::fs::write(repo.join(".git"), format!("gitdir: {target}\n")).unwrap()
+        };
+        point("real.git");
+        assert_eq!(
+            branch(&repo).as_deref(),
+            Some("ok"),
+            "a pointer inside the repository"
+        );
+        // A repository with a real `.git` directory shows its branch wherever
+        // it is, home or not (here the "home" is elsewhere entirely).
+        let plain = home.join("plain");
+        std::fs::create_dir_all(plain.join(".git")).unwrap();
+        std::fs::write(plain.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(plain.join("src")).unwrap();
+        assert_eq!(
+            git_branch_with_home(&plain.join("src"), Some(Path::new("/nonexistent-home")))
+                .as_deref(),
+            Some("main")
+        );
+        // Every reviewer bypass is refused before anything is opened.
+        let depth = "../".repeat(repo.components().count() + 2);
+        for hostile in [
+            "/net/host/repo".to_owned(),
+            "/./net/host/repo".to_owned(),
+            format!("{depth}net/host/repo"),
+            "\\\\host\\share\\repo".to_owned(),
+            "//host/share/repo".to_owned(),
+            "\\\\?\\UNC\\host\\share".to_owned(),
+            "\\??\\UNC\\host\\share".to_owned(),
+            "\\\\.\\pipe\\x".to_owned(),
+            "/Volumes/share/repo".to_owned(),
+        ] {
+            point(&hostile);
+            assert_eq!(branch(&repo), None, "{hostile}");
+        }
+        assert_eq!(
+            normalize(Path::new("/a/b"), Path::new("./../../../net/x")),
+            PathBuf::from("/net/x")
+        );
+        #[cfg(unix)]
+        {
+            // A symlinked `.git`, `HEAD` or directory on the way: no branch.
+            std::fs::remove_file(repo.join(".git")).unwrap();
+            std::os::unix::fs::symlink(repo.join("real.git"), repo.join(".git")).unwrap();
+            assert_eq!(branch(&repo), None, "symlinked .git");
+            std::fs::remove_file(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::os::unix::fs::symlink(repo.join("real.git/HEAD"), repo.join(".git/HEAD")).unwrap();
+            assert_eq!(branch(&repo), None, "symlinked HEAD");
+            std::fs::remove_dir_all(repo.join(".git")).unwrap();
+            std::os::unix::fs::symlink(repo.join("real.git"), repo.join("link.git")).unwrap();
+            point("link.git");
+            assert_eq!(branch(&repo), None, "symlinked gitdir");
+            // A FIFO named HEAD: reading it must not block.
+            point("real.git");
+            std::fs::remove_file(repo.join("real.git/HEAD")).unwrap();
+            let name =
+                std::ffi::CString::new(repo.join("real.git/HEAD").to_string_lossy().as_bytes())
+                    .unwrap();
+            // SAFETY: valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (dir, root) = (repo.clone(), home.clone());
+            thread::spawn(move || tx.send(git_branch_with_home(&dir, Some(&root))).unwrap());
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), None);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "crow-git-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

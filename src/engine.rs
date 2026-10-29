@@ -200,7 +200,16 @@ impl State {
     fn events(&mut self, writer: &mpsc::SyncSender<WriteMessage>) {
         for event in self.pending_events.try_iter() {
             let response = match event {
-                Event::Title(title) => {
+                Event::Title(mut title) => {
+                    // Bounded where it is stored: a huge OSC title is never
+                    // cloned into snapshots or summaries.
+                    if title.len() > MAX_TITLE_BYTES {
+                        let mut end = MAX_TITLE_BYTES;
+                        while !title.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        title.truncate(end);
+                    }
                     self.title = title;
                     None
                 }
@@ -674,6 +683,55 @@ pub struct Engine {
     /// Snapshot readers waiting for `state`: the PTY reader steps aside for
     /// them (std mutexes are not fair; a flooding reader re-locks at once).
     snapshot_waiters: Arc<AtomicUsize>,
+    /// Foreground process facts by pid, and the cwd with when it was read:
+    /// one OS query per change of foreground job (cwd at most every 2 s).
+    summary: Mutex<SummaryCache>,
+}
+
+/// Children by parent pid (one process table per summary refresh).
+pub type ProcessTree = std::collections::HashMap<u32, Vec<u32>>;
+
+/// Longest OSC title the engine keeps (bytes).
+pub const MAX_TITLE_BYTES: usize = 4096;
+
+/// Longest title (in grapheme clusters) a pane summary carries.
+pub const MAX_SUMMARY_TEXT: usize = 256;
+
+/// Working directory of a process: one targeted OS query (no enumeration,
+/// environment or command line).
+fn cwd_of(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    let id = Pid::from_u32(pid);
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[id]),
+        false,
+        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+    );
+    system
+        .process(id)
+        .and_then(|process| process.cwd())
+        .filter(|cwd| !cwd.as_os_str().is_empty())
+        .map(|cwd| cwd.to_string_lossy().into_owned())
+}
+
+/// (pid, read at, name, safe args, agent CLI).
+type CachedProcess = (u32, std::time::Instant, String, Vec<String>, Option<String>);
+/// (pid, read at, cwd, (repository name, branch)).
+type CachedPlace = (
+    u32,
+    std::time::Instant,
+    Option<String>,
+    Option<(String, String)>,
+);
+
+#[derive(Default)]
+struct SummaryCache {
+    /// (pid, read at, name, safe args, agent CLI).
+    process: Option<CachedProcess>,
+    cwd: Option<CachedPlace>,
+    tty: Option<String>,
+    title: String,
 }
 // Unix cleanup must run before any wait/try_wait reaps the session leader.
 #[cfg(unix)]
@@ -874,6 +932,7 @@ impl Engine {
             process: process.clone(),
             notify: notify.clone(),
             snapshot_waiters: Arc::default(),
+            summary: Mutex::default(),
         };
 
         // Set defaults before the reader/parser can answer an application's first OSC query.
@@ -1162,37 +1221,191 @@ impl Engine {
     pub fn alive(&self) -> bool {
         self.process.alive.load(Ordering::Acquire)
     }
-    /// Working directory of the pane's foreground process (falling back to its
-    /// shell). One targeted OS query: no process enumeration, environment or
-    /// command line is read. `None` when the platform does not expose it.
-    pub fn cwd(&self) -> Option<String> {
+    /// What the pane runs, for tab labels and the status bar. Called by the
+    /// daemon's summary thread, never on a request, and never waiting on the
+    /// pane: the PTY master, the child handle and the terminal state are used
+    /// only when free; otherwise the last known values stand. The foreground
+    /// job is one syscall; its name and arguments are read at most every 2 s
+    /// (`exec` keeps the pid), its directory and repository too. Every text
+    /// is bounded here, before it leaves the daemon.
+    ///
+    /// `tree` (children by parent, built once per refresh) and `agents` (pids
+    /// of live agent sessions) find an agent running under the foreground job.
+    pub fn summary(&self, tree: Option<(&ProcessTree, &[u32])>) -> crate::model::PaneSummary {
         use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let bound = |text: String, max: usize| -> String {
+            use unicode_segmentation::UnicodeSegmentation;
+            if text.len() <= max {
+                text
+            } else {
+                text.graphemes(true).take(max).collect()
+            }
+        };
+        let Ok(mut cache) = self.summary.lock() else {
+            return Default::default();
+        };
+        // Never waits on the pane: a busy pane keeps its last known title.
+        if let Ok(state) = self.state.try_lock() {
+            cache.title = bound(state.title.clone(), MAX_SUMMARY_TEXT);
+        }
+        let mut summary = crate::model::PaneSummary {
+            title: cache.title.clone(),
+            ..Default::default()
+        };
+        if !self.alive() {
+            return summary;
+        }
+        // Foreground job and terminal name, only if the PTY master is free;
+        // a miss keeps the cached pid (no flicker to the shell's pid while
+        // a resize holds the master).
+        #[cfg(unix)]
+        let (fresh_pid, tty) = match self.master.try_lock() {
+            Ok(master) => match master.as_ref() {
+                Some(master) => (
+                    Some(master.process_group_leader().map(|pid| pid as u32)),
+                    master.tty_name().map(|p| p.to_string_lossy().into_owned()),
+                ),
+                None => (Some(None), None),
+            },
+            Err(_) => (None, None),
+        };
+        // Windows: the pane's own program; ConPTY has no terminal device name.
+        #[cfg(not(unix))]
+        let (fresh_pid, tty): (Option<Option<u32>>, Option<String>) =
+            (Some(None), Some(String::new()));
+        let cached_pid = cache.process.as_ref().map(|(pid, _, _, _, _)| *pid);
+        let pid = match fresh_pid {
+            Some(Some(pid)) => Some(pid),
+            Some(None) => self
+                .process
+                .child
+                .try_lock()
+                .ok()
+                .and_then(|child| child.as_ref().and_then(|c| c.process_id()))
+                .or(cached_pid),
+            None => cached_pid,
+        };
+        if cache.tty.is_none() {
+            cache.tty = tty;
+        }
+        summary.tty = cache.tty.clone().unwrap_or_default();
+        let Some(pid) = pid else {
+            return summary;
+        };
+        summary.pid = Some(pid);
+        let id = Pid::from_u32(pid);
+        let stale = |cached: u32, at: std::time::Instant| {
+            cached != pid || at.elapsed() >= std::time::Duration::from_secs(2)
+        };
+        if cache
+            .process
+            .as_ref()
+            .is_none_or(|(c, at, _, _, _)| stale(*c, *at))
+        {
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[id]),
+                false,
+                ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+            );
+            let (name, args, agent) = system.process(id).map_or_else(Default::default, |process| {
+                let name = bound(process.name().to_string_lossy().into_owned(), 64);
+                let argv: Vec<String> = process
+                    .cmd()
+                    .iter()
+                    .take(16)
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                // argv stays here: only the safe argument and the
+                // recognized agent CLI leave the daemon.
+                let agent = crate::tab_context::agent_cli(&name, &argv);
+                let args = crate::tab_context::safe_args(&name, argv.get(1..).unwrap_or_default());
+                (name, args, agent)
+            });
+            cache.process = Some((pid, std::time::Instant::now(), name, args, agent));
+        }
+        if let Some((_, _, name, args, agent)) = &cache.process {
+            summary.process = name.clone();
+            summary.args = args.clone();
+            summary.agent = agent.clone();
+        }
+        if cache
+            .cwd
+            .as_ref()
+            .is_none_or(|(c, at, _, _)| stale(*c, *at))
+        {
+            // A process whose directory cannot be read (setuid: sudo) shows
+            // its shell's directory instead.
+            let shell = || {
+                self.process
+                    .child
+                    .try_lock()
+                    .ok()
+                    .and_then(|child| child.as_ref().and_then(|c| c.process_id()))
+                    .filter(|&shell| shell != pid)
+                    .and_then(cwd_of)
+            };
+            let cwd = cwd_of(pid).or_else(shell).map(|cwd| bound(cwd, 1024));
+            // Branch from `.git` files only: no git command, nothing the
+            // repository configures (hooks, filters, fsmonitor) ever runs.
+            let repo = cwd.as_deref().and_then(|cwd| {
+                crate::crow::git_repo(std::path::Path::new(cwd)).map(|(top, branch)| {
+                    let name = top
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    (bound(name, 128), bound(branch, 128))
+                })
+            });
+            cache.cwd = Some((pid, std::time::Instant::now(), cwd, repo));
+        }
+        if let Some((_, _, cwd, repo)) = &cache.cwd {
+            summary.cwd = cwd.clone();
+            summary.repo = repo.clone();
+        }
+        // The first live agent session running in this job (its process or a
+        // descendant): only the match leaves the daemon.
+        if let Some((children, agents)) = tree
+            && !agents.is_empty()
+        {
+            summary.agent_pid = crate::tab_context::job_tree(pid, children, 256)
+                .into_iter()
+                .find(|p| agents.contains(p));
+        }
+        summary
+    }
+    /// Working directory of the pane's foreground process (falling back to its
+    /// shell), without waiting on the pane: the PTY master and the child handle
+    /// are used only if free, else the summary's last known directory.
+    pub fn cwd(&self) -> Option<String> {
         if !self.alive() {
             return None;
         }
         #[cfg(unix)]
-        let foreground = foreground_group(&self.master)
+        let foreground = self
+            .master
+            .try_lock()
             .ok()
-            .flatten()
-            .map(|pid| pid.as_raw_nonzero().get() as u32);
+            .and_then(|m| m.as_ref().and_then(|m| m.process_group_leader()))
+            .map(|pid| pid as u32);
         #[cfg(not(unix))]
         let foreground: Option<u32> = None;
-        let shell = self.process.child.lock().ok()?.as_ref()?.process_id();
-        let mut system = System::new();
-        for raw in [foreground, shell].into_iter().flatten() {
-            let pid = Pid::from_u32(raw);
-            system.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&[pid]),
-                false,
-                ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
-            );
-            if let Some(cwd) = system.process(pid).and_then(|process| process.cwd())
-                && !cwd.as_os_str().is_empty()
-            {
-                return Some(cwd.to_string_lossy().into_owned());
-            }
-        }
-        None
+        let shell = self
+            .process
+            .child
+            .try_lock()
+            .ok()
+            .and_then(|child| child.as_ref().and_then(|c| c.process_id()));
+        [foreground, shell]
+            .into_iter()
+            .flatten()
+            .find_map(cwd_of)
+            .or_else(|| {
+                self.summary
+                    .try_lock()
+                    .ok()
+                    .and_then(|cache| cache.cwd.as_ref().and_then(|(_, _, cwd, _)| cwd.clone()))
+            })
     }
     pub fn kill(&self) -> Result<()> {
         {
@@ -1508,6 +1721,19 @@ mod tests {
         assert_eq!(screen.wrapped, [true, true, false, false, false]);
     }
     #[test]
+    fn huge_titles_are_bounded_where_they_are_stored() {
+        let mut state = State::with_osc52(Size { rows: 2, cols: 20 }, 0, false);
+        let huge = "ab ".repeat(5000) + "é";
+        state.advance(format!("\x1b]2;{huge}\x07").as_bytes());
+        state.events(&mpsc::sync_channel(8).0);
+        assert!(
+            state.title.len() <= MAX_TITLE_BYTES,
+            "{}",
+            state.title.len()
+        );
+        assert!(state.title.starts_with("ab ab"));
+    }
+    #[test]
     fn osc52_copy_is_opt_out_bounded_and_never_readable() {
         let mut state = State::with_osc52(Size { rows: 2, cols: 20 }, 0, true);
         state.advance(format!("\x1b]52;c;{}\x07", base64(b"crow copy")).as_bytes());
@@ -1779,6 +2005,40 @@ mod tests {
             "{} failed kills: {errors:?}",
             errors.len()
         );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_pane_summary_names_its_foreground_program_title_and_directory() {
+        let dir = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let shell = ShellSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf '\\033]2;Crow Title\\007READY'; exec less /etc/hosts".into(),
+            ],
+            cwd: Some(dir.to_string_lossy().into_owned()),
+        };
+        let engine = Engine::new(&shell, Size::default(), 0, Arc::new(|| {})).unwrap();
+        wait_for(&engine, |s| s.title == "Crow Title");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Right after `exec` the OS may report the new name before the new
+        // command line: wait until the summary has settled (the cache is
+        // re-read every 2 s).
+        let summary = loop {
+            let summary = engine.summary(None);
+            let settled = summary.process == "less" && !summary.args.is_empty();
+            if settled || std::time::Instant::now() > deadline {
+                break summary;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(summary.process, "less", "{summary:?}");
+        assert_eq!(summary.args, ["hosts"], "only the file name, never flags");
+        assert_eq!(summary.title, "Crow Title");
+        assert!(summary.tty.starts_with("/dev/"), "{summary:?}");
+        let cwd = summary.cwd.expect("cwd");
+        assert_eq!(std::fs::canonicalize(cwd).unwrap(), dir);
+        engine.kill().unwrap();
     }
     #[test]
     #[cfg(unix)]

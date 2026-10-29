@@ -189,6 +189,30 @@ pub struct SessionInfo {
     pub name: String,
     pub windows: Vec<WindowInfo>,
 }
+/// What a pane runs, for tab labels and the status bar (wire v8).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct PaneSummary {
+    /// The program's title (OSC 0/2), empty when it set none.
+    pub title: String,
+    /// Executable name of the foreground process ("nvim", "-zsh").
+    pub process: String,
+    /// At most one argument, only when it cannot be a secret (see
+    /// `tab_context::safe_args`); filtered by the daemon.
+    pub args: Vec<String>,
+    pub pid: Option<u32>,
+    /// The pane's terminal device (`/dev/ttys004`), empty when unknown.
+    pub tty: String,
+    pub cwd: Option<String>,
+    /// (repository name, branch) of `cwd`, read from `.git` files only.
+    pub repo: Option<(String, String)>,
+    /// The agent CLI in the foreground, recognized by the daemon from the
+    /// program name or the script a runtime runs (argv itself is never sent).
+    pub agent: Option<String>,
+    /// The pid of a live agent session running in this pane's foreground job
+    /// (the job itself or a descendant), matched by the daemon against the
+    /// pids the GUI asked about (`Request::AgentPids`).
+    pub agent_pid: Option<u32>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
     /// Random per daemon process (wire v6): commands carry it so a restarted
@@ -198,6 +222,10 @@ pub struct View {
     pub revision: u64,
     pub sessions: Vec<SessionInfo>,
     pub screens: Vec<(u64, Screen)>,
+    /// Summaries of the watched session's panes (all its windows), sent
+    /// with screens; empty means "unchanged".
+    #[serde(default)]
+    pub panes: Vec<(u64, PaneSummary)>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
@@ -269,6 +297,15 @@ pub enum Request {
     Guarded {
         instance: u64,
         request: Box<Request>,
+    },
+    /// Pids of live agent sessions (crow-skills) the GUI wants matched to
+    /// panes (wire v8): the daemon reports, per pane, which one runs in its
+    /// foreground job. An empty list stops the process-table scan.
+    AgentPids {
+        /// Random per GUI process: each GUI's list counts until it is
+        /// replaced or goes stale (not resent for `AGENT_PIDS_TTL`).
+        client: u64,
+        pids: Vec<u32>,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
