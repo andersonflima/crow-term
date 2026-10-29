@@ -116,7 +116,27 @@ jobs:
           sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev mesa-vulkan-drivers libvulkan1 fonts-noto-color-emoji
       - name: GPU vs software goldens and GPU unit tests
         run: cargo test --locked --lib -- 'render::' 'fixture::' --nocapture
-
+      - name: Renderer A/B benchmark (informative; offscreen, no present)
+        shell: bash
+        run: |
+          cargo build --release --locked
+          bin=target/release/crow-term
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          "$bin" doctor | grep -E '^(renderer|gpu):'
+          for grid in 120x40 300x80; do
+            for backend in software gpu software gpu; do
+              "$bin" bench-render --backend "$backend" --cols "${grid%x*}" --rows "${grid#*x}" --frames 200 \
+                | tee -a bench-render.jsonl || echo "bench-render $backend $grid unavailable"
+            done
+          done
+      - name: Upload benchmark
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-render-${{ matrix.os }}
+          path: bench-render.jsonl
+          if-no-files-found: ignore
+          retention-days: 14
   neovim:
     # Pinned upstream Neovim releases (SHA-256 checked by scripts/fetch_neovim.py)
     # against the real daemon PTY. LazyVim requires Neovim >= 0.11.2.

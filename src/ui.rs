@@ -650,6 +650,10 @@ struct App {
     /// again, and the current backoff.
     retry_due: Option<Instant>,
     retry_delay: Duration,
+    /// `CROW_TERM_FRAME_STATS=1`: draw+present durations, printed on exit.
+    frame_stats: Option<FrameStats>,
+    /// The last `draw` presented a frame (frame stats skip empty draws).
+    presented: bool,
     view: Option<View>,
     scale: f64,
     mods: ModifiersState,
@@ -729,6 +733,8 @@ impl App {
             gpu_failures: 0,
             retry_due: None,
             retry_delay: FRAME_RETRY_MIN,
+            frame_stats: FrameStats::from_env(),
+            presented: false,
             view: None,
             scale: 1.0,
             mods: ModifiersState::empty(),
@@ -1597,6 +1603,24 @@ impl App {
         Ok(())
     }
     fn draw(&mut self) -> Result<()> {
+        let started = Instant::now();
+        self.presented = false;
+        let result = self.draw_frame();
+        if let Some(stats) = &mut self.frame_stats
+            && self.presented
+        {
+            stats.record(
+                started,
+                if self.gpu.is_some() {
+                    "gpu"
+                } else {
+                    "software"
+                },
+            );
+        }
+        result
+    }
+    fn draw_frame(&mut self) -> Result<()> {
         let Some(size) = self.window_size() else {
             return Ok(());
         };
@@ -1626,6 +1650,7 @@ impl App {
                 .map_err(|error| anyhow::anyhow!("present native surface: {error}"))
         })();
         self.surface = Some(surface);
+        self.presented = result.is_ok();
         result
     }
     /// GPU frame. Failures go through [`Self::recover_from_gpu_error`];
@@ -1668,6 +1693,7 @@ impl App {
         }
         match result {
             Ok(presented) => {
+                self.presented = presented;
                 #[cfg(feature = "frame-dump")]
                 if let Some(pixels) = dumped {
                     self.dump_frame(&pixels, size, "gpu");
@@ -1887,6 +1913,68 @@ fn gpu_failure_action(mode: RendererMode, failures: u32) -> GpuFailure {
         RendererMode::Gpu if failures <= 1 => GpuFailure::RecreateDevice,
         RendererMode::Gpu => GpuFailure::Fatal,
         RendererMode::Auto | RendererMode::Software => GpuFailure::SwitchToSoftware,
+    }
+}
+
+/// Opt-in frame timing (`CROW_TERM_FRAME_STATS`): wall time of each
+/// draw+present and the time from GUI start to the first frame. Printed on
+/// exit; when the variable names a file, it is also rewritten every 60 frames
+/// (benchmarks that stop the GUI with a signal).
+struct FrameStats {
+    file: Option<std::path::PathBuf>,
+    started: Instant,
+    first_frame: Option<Duration>,
+    renderer: &'static str,
+    samples: Vec<Duration>,
+}
+impl FrameStats {
+    fn from_env() -> Option<Self> {
+        let value = std::env::var_os("CROW_TERM_FRAME_STATS")?;
+        // Unset, empty or "0": off; "1": stderr on exit; anything else: a file.
+        if value.is_empty() || value == "0" {
+            return None;
+        }
+        Some(Self {
+            file: (value != "1").then(|| value.into()),
+            started: Instant::now(),
+            first_frame: None,
+            renderer: "software",
+            samples: Vec::new(),
+        })
+    }
+    fn record(&mut self, frame_started: Instant, renderer: &'static str) {
+        self.renderer = renderer;
+        self.first_frame
+            .get_or_insert_with(|| self.started.elapsed());
+        // Bounded: a long session keeps the latest 100k frames.
+        if self.samples.len() >= 100_000 {
+            self.samples.drain(..50_000);
+        }
+        self.samples.push(frame_started.elapsed());
+        if let Some(file) = &self.file
+            && (self.samples.len() == 1 || self.samples.len().is_multiple_of(60))
+        {
+            let _ = std::fs::write(file, self.summary() + "\n");
+        }
+    }
+    fn summary(&self) -> String {
+        let mut sorted = self.samples.clone();
+        sorted.sort();
+        let at = |p: f64| {
+            sorted
+                .get(((sorted.len().saturating_sub(1)) as f64 * p).round() as usize)
+                .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+        };
+        format!(
+            "frame stats renderer={} frames={} first_frame_ms={:.1} p50_ms={:.2} p95_ms={:.2} p99_ms={:.2} max_ms={:.2}",
+            self.renderer,
+            sorted.len(),
+            self.first_frame.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+            at(0.5),
+            at(0.95),
+            at(0.99),
+            at(1.0)
+        )
     }
 }
 
@@ -2569,6 +2657,12 @@ impl ApplicationHandler<UiEvent> for App {
     }
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.running.store(false, Ordering::Relaxed);
+        if let Some(stats) = &self.frame_stats {
+            eprintln!("crow-term: {}", stats.summary());
+            if let Some(file) = &stats.file {
+                let _ = std::fs::write(file, stats.summary() + "\n");
+            }
+        }
     }
 }
 
