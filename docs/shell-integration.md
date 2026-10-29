@@ -4,7 +4,8 @@
 
 Without a `shell` in the config, Crow Term runs the login shell recorded for
 your user (`getpwuid`; `chsh` sets it), falling back to `$SHELL`, then
-`/bin/sh`. It is started **as a login shell**, like Terminal, iTerm or Ghostty
+`/bin/sh`. A user-database shell that is a placeholder (`nologin`, `false`) or
+is not listed in `/etc/shells` is skipped. It is started **as a login shell**, like Terminal, iTerm or Ghostty
 do, so profiles, `path_helper`, plugin managers (oh-my-zsh, zinit, p10k,
 Fisher, bash-completion) and PATH load as in your terminal. Each shell gets its
 own login switch: `-l` for sh, bash, zsh, dash, ksh, mksh, fish, nu, xonsh,
@@ -14,10 +15,11 @@ its profiles itself; WSL is unchanged.
 
 When the daemon is started outside a terminal (from Finder or the Dock there
 is no `TERM`), the starting GUI or command first captures your login
-environment once through the same shell — interactive for zsh and bash, so
-`.zshrc`/`.bashrc` PATH edits count — and starts the daemon with it (3 s limit;
-a profile's background jobs cannot hold it longer; `daemon.log` says how many
-variables were adopted). Programs started without a shell (`crow-term start --
+environment once through the same shell — interactive for zsh, bash and fish,
+so `.zshrc`/`.bashrc` and `if status is-interactive` PATH edits count — and
+starts the daemon with it. The capture ends at a marker printed after the
+environment, so a profile's background job never delays it (3 s limit
+otherwise; `daemon.log` says how many variables were adopted). Programs started without a shell (`crow-term start --
 nvim`) then see your PATH too. csh/tcsh panes are login shells, but their
 environment is not captured (their `-l` cannot be combined with `-c`).
 
@@ -27,8 +29,8 @@ shell_args = ["-l"]                # optional: exact arguments; replaces the log
 login_shell = false                # optional: start the shell without its login switch
 ```
 
-`crow-term doctor` prints the shell, where it came from and whether it is a
-login shell.
+`crow-term doctor` prints the shell (`--shell` included), where it came from,
+whether it is a login shell and whether its login environment can be captured.
 
 # Fish and zsh: isolated, explicit integration
 

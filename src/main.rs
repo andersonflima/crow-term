@@ -213,19 +213,48 @@ fn main() -> Result<()> {
                 cli.config.clone().unwrap_or(Config::path()?).display()
             );
             println!("runtime: {}", ipc::runtime_dir()?.display());
-            let (program, source) = crow_term::login::default_shell(config.shell.as_deref());
+            let (program, source) = match &cli.shell {
+                Some(program) => (program.clone(), None),
+                None => {
+                    let (program, source) =
+                        crow_term::login::default_shell(config.shell.as_deref());
+                    (program, Some(source))
+                }
+            };
             let args = config.shell_args_for(&program);
             let login = crow_term::login::is_login(&program, &args);
             println!(
-                "shell: {program} {} ({}; {})",
-                args.join(" "),
-                source.label(),
+                "shell: {}{} ({}; {})",
+                program,
+                if args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", args.join(" "))
+                },
+                source.map_or("--shell", |source| source.label()),
                 if login {
                     "login shell"
                 } else {
                     "not a login shell"
                 }
             );
+            // What a daemon started outside a terminal would adopt.
+            if !config.login_shell {
+                println!("login environment: not captured (login_shell = false)");
+            } else if crow_term::login::env_command(&program).is_none() {
+                println!("login environment: not captured (no capture for this shell)");
+            } else {
+                match crow_term::login::capture_login_env(
+                    &program,
+                    std::time::Duration::from_secs(3),
+                ) {
+                    Ok(env) => println!(
+                        "login environment: captured ({} variables; used when the daemon starts outside a terminal)",
+                        env.len()
+                    ),
+                    Err(error) => println!("login environment: capture failed ({error})"),
+                }
+            }
             for tool in ["fish", "zsh", "tmux", "nvim", "vim", "wsl.exe"] {
                 println!(
                     "{tool}: {}",
