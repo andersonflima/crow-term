@@ -716,7 +716,27 @@ fn cwd_of(pid: u32) -> Option<String> {
 }
 
 /// (pid, read at, name, safe args, agent CLI).
-type CachedProcess = (u32, std::time::Instant, String, Vec<String>, Option<String>);
+#[derive(Debug, Clone)]
+struct CachedProcess {
+    pid: u32,
+    at: std::time::Instant,
+    name: String,
+    args: Vec<String>,
+    agent: Option<String>,
+    /// The command line was readable. Right after `exec` the OS may report
+    /// the new name before the new command line: then it is read again on
+    /// the next refresh instead of being kept for `PROCESS_TTL`.
+    complete: bool,
+}
+
+/// How long a process's name and command line are reused.
+const PROCESS_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl CachedProcess {
+    fn needs_read(&self, pid: u32) -> bool {
+        self.pid != pid || !self.complete || self.at.elapsed() >= PROCESS_TTL
+    }
+}
 /// (pid, read at, cwd, (repository name, branch)).
 type CachedPlace = (
     u32,
@@ -1273,7 +1293,7 @@ impl Engine {
         #[cfg(not(unix))]
         let (fresh_pid, tty): (Option<Option<u32>>, Option<String>) =
             (Some(None), Some(String::new()));
-        let cached_pid = cache.process.as_ref().map(|(pid, _, _, _, _)| *pid);
+        let cached_pid = cache.process.as_ref().map(|process| process.pid);
         let pid = match fresh_pid {
             Some(Some(pid)) => Some(pid),
             Some(None) => self
@@ -1300,7 +1320,7 @@ impl Engine {
         if cache
             .process
             .as_ref()
-            .is_none_or(|(c, at, _, _, _)| stale(*c, *at))
+            .is_none_or(|process| process.needs_read(pid))
         {
             let mut system = System::new();
             system.refresh_processes_specifics(
@@ -1308,26 +1328,35 @@ impl Engine {
                 false,
                 ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
             );
-            let (name, args, agent) = system.process(id).map_or_else(Default::default, |process| {
-                let name = bound(process.name().to_string_lossy().into_owned(), 64);
-                let argv: Vec<String> = process
-                    .cmd()
-                    .iter()
-                    .take(16)
-                    .map(|arg| arg.to_string_lossy().into_owned())
-                    .collect();
-                // argv stays here: only the safe argument and the
-                // recognized agent CLI leave the daemon.
-                let agent = crate::tab_context::agent_cli(&name, &argv);
-                let args = crate::tab_context::safe_args(&name, argv.get(1..).unwrap_or_default());
-                (name, args, agent)
+            let (name, args, agent, complete) =
+                system.process(id).map_or_else(Default::default, |process| {
+                    let name = bound(process.name().to_string_lossy().into_owned(), 64);
+                    let argv: Vec<String> = process
+                        .cmd()
+                        .iter()
+                        .take(16)
+                        .map(|arg| arg.to_string_lossy().into_owned())
+                        .collect();
+                    // argv stays here: only the safe argument and the
+                    // recognized agent CLI leave the daemon.
+                    let agent = crate::tab_context::agent_cli(&name, &argv);
+                    let args =
+                        crate::tab_context::safe_args(&name, argv.get(1..).unwrap_or_default());
+                    (name, args, agent, !argv.is_empty())
+                });
+            cache.process = Some(CachedProcess {
+                pid,
+                at: std::time::Instant::now(),
+                name,
+                args,
+                agent,
+                complete,
             });
-            cache.process = Some((pid, std::time::Instant::now(), name, args, agent));
         }
-        if let Some((_, _, name, args, agent)) = &cache.process {
-            summary.process = name.clone();
-            summary.args = args.clone();
-            summary.agent = agent.clone();
+        if let Some(process) = &cache.process {
+            summary.process = process.name.clone();
+            summary.args = process.args.clone();
+            summary.agent = process.agent.clone();
         }
         if cache
             .cwd
@@ -1719,6 +1748,34 @@ mod tests {
         state.advance(b"https://example.com/x\r\nshort");
         let screen = state.snapshot(true);
         assert_eq!(screen.wrapped, [true, true, false, false, false]);
+    }
+    #[test]
+    fn an_unreadable_command_line_is_read_again_on_the_next_refresh() {
+        let entry = |complete: bool, age: Duration| CachedProcess {
+            pid: 10,
+            at: std::time::Instant::now() - age,
+            name: "less".into(),
+            args: Vec::new(),
+            agent: None,
+            complete,
+        };
+        // Just after exec: the name is new, the command line not yet.
+        assert!(
+            entry(false, Duration::ZERO).needs_read(10),
+            "empty argv is not kept"
+        );
+        assert!(
+            !entry(true, Duration::ZERO).needs_read(10),
+            "a complete read is reused"
+        );
+        assert!(
+            entry(true, PROCESS_TTL).needs_read(10),
+            "and re-read after the TTL"
+        );
+        assert!(
+            entry(true, Duration::ZERO).needs_read(11),
+            "another process"
+        );
     }
     #[test]
     fn huge_titles_are_bounded_where_they_are_stored() {

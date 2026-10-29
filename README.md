@@ -162,7 +162,9 @@ nvim main.rs · ~/w/crow-term                                                   
 - `repo@branch`, read from the `.git` files of the pane's directory. No `git`
   command is ever run for it, so nothing a repository configures (hooks,
   filters, `core.fsmonitor`) can run because a pane entered it; uncommitted
-  and ahead/behind marks are therefore not shown.
+  and ahead/behind marks are therefore not shown. No symlink is followed, and
+  a `gitdir:` pointer (worktree, submodule) is followed only to a local path
+  under your home, the repository itself or the repository that encloses it.
 - The session name only when more than one session exists.
 - On the right, one global part: crow on/off, the number of agent sessions
   working or blocked, memory only under pressure.
