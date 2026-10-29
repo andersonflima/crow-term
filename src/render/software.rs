@@ -1,21 +1,19 @@
 //! Reference CPU backend: draws a [`Scene`] into a `0x00RRGGBB` framebuffer
 //! (softbuffer's layout) with 8-bit, gamma-space alpha blending.
-use super::{GridShaper, Layer, Op, Rect, Scene, ShapedRow};
+use super::{GridShaper, Layer, Op, Rect, RowCache, Scene, ShapedRow};
 use crate::config::Config;
 use crate::model::Cell;
 use cosmic_text::Color;
-use std::collections::HashMap;
 
 struct CachedRow {
-    cells: Vec<Cell>,
     pixels: Vec<u32>,
     width: usize,
 }
 
-/// Row rasters keyed by (pane, row) and the last rasterized cached layer.
+/// Row rasters keyed by content and the last rasterized cached layer.
 #[derive(Default)]
 pub struct SoftwareRenderer {
-    rows: HashMap<(u64, usize), CachedRow>,
+    rows: RowCache<CachedRow>,
     layer: Option<(u64, Vec<u32>)>,
 }
 impl SoftwareRenderer {
@@ -34,7 +32,7 @@ impl SoftwareRenderer {
     ) {
         let fw = scene.width as usize;
         frame.fill(scene.background);
-        self.rows.retain(|(id, _), _| scene.live_panes.contains(id));
+        self.rows.begin_frame();
         for op in &scene.ops {
             match op {
                 Op::Fill { rect, color } => fill(frame, fw, *rect, *color),
@@ -69,6 +67,7 @@ impl SoftwareRenderer {
                 }
             }
         }
+        self.rows.end_frame();
         shaper.trim();
     }
     fn row(
@@ -79,24 +78,13 @@ impl SoftwareRenderer {
         row: usize,
         cells: &[Cell],
     ) -> &CachedRow {
-        let key = (pane, row);
-        let needs_update = self
-            .rows
-            .get(&key)
-            .is_none_or(|cached| cached.cells != cells);
-        if needs_update {
+        self.rows.get_or_insert_with(pane, row, cells, || {
             let shaped = shaper.shape_row(config, cells);
-            let pixels = rasterize_row(&shaped, shaper);
-            self.rows.insert(
-                key,
-                CachedRow {
-                    cells: cells.to_vec(),
-                    pixels,
-                    width: shaped.width,
-                },
-            );
-        }
-        &self.rows[&key]
+            CachedRow {
+                pixels: rasterize_row(&shaped, shaper),
+                width: shaped.width,
+            }
+        })
     }
 }
 
@@ -149,6 +137,13 @@ fn draw_glyphs(
     glyphs: &[super::PlacedGlyph],
     shaper: &mut GridShaper,
 ) {
+    // Never let a clip wider than the frame wrap pixels onto the next row.
+    let clip = clip.intersection(Rect {
+        x: 0,
+        y: 0,
+        w: frame_width as u32,
+        h: frame.len().checked_div(frame_width).unwrap_or(0) as u32,
+    });
     for glyph in glyphs {
         shaper.swash.with_pixels(
             &mut shaper.fonts,

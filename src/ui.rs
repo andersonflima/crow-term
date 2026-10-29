@@ -1,10 +1,12 @@
 //! Native, event-driven software frontend. PTYs live in the mux server, not this window.
 //! The two RPC workers keep long polls and command I/O off the native event thread.
 use crate::config::Config;
+use crate::config::RendererMode;
 use crate::crow::{self, CrowView, Segment, Tone};
 use crate::ipc::rpc;
 use crate::keyboard::{self, KeyAction, KeyInput};
 use crate::model::*;
+use crate::render::gpu::GpuRenderer;
 use crate::render::software::SoftwareRenderer;
 use crate::render::{GridShaper, Layer, Op, Rect, Scene, parse_color};
 use anyhow::{Context as _, Result};
@@ -592,6 +594,37 @@ fn render_panel(
     }
 }
 
+/// Compose the scene of `$app` at `$size`. A macro rather than a method so the
+/// scene can borrow the view while the shaper and backends are borrowed
+/// mutably (disjoint fields).
+macro_rules! scene_of {
+    ($app:ident, $size:expr) => {{
+        let size = $size;
+        let rects = $app.rects();
+        let panel = $app.panel_rect().map(|rect| (rect, $app.panel_layer(rect)));
+        let parts = FrameParts {
+            config: &$app.config,
+            session: &$app.session,
+            window_id: $app.window_id,
+            pane_id: $app.pane_id,
+            scale: $app.scale,
+            view: $app.view.as_ref(),
+            selection: $app.selection.as_ref(),
+            ime: &$app.ime,
+            status: &$app.status,
+            prefix: $app.prefix,
+            bell_flash: $app.bell_flash.as_ref(),
+            crow_status: &$app.crow_view.status,
+            stuck: $app.stuck,
+            rects,
+            tabs: $app.tab_rects(),
+            windows: $app.windows(),
+            panel,
+        };
+        compose(&parts, &mut $app.shaper, size)
+    }};
+}
+
 struct App {
     config: Config,
     session: String,
@@ -607,6 +640,10 @@ struct App {
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
     shaper: GridShaper,
     software: SoftwareRenderer,
+    /// Effective renderer choice (already resolved from CLI/env/config).
+    renderer_mode: RendererMode,
+    /// Present when frames are drawn by the GPU; otherwise `surface` is used.
+    gpu: Option<GpuRenderer>,
     view: Option<View>,
     scale: f64,
     mods: ModifiersState,
@@ -665,6 +702,7 @@ impl App {
     ) -> Self {
         let shaper = GridShaper::new(&config, 1.0);
         let crow_panel = crow.is_some() && config.crow.panel;
+        let renderer_mode = config.renderer;
         Self {
             config,
             session,
@@ -680,6 +718,8 @@ impl App {
             surface: None,
             shaper,
             software: SoftwareRenderer::default(),
+            renderer_mode,
+            gpu: None,
             view: None,
             scale: 1.0,
             mods: ModifiersState::empty(),
@@ -759,7 +799,7 @@ impl App {
         shared.panel.store(self.crow_panel, Ordering::Relaxed);
         shared.wake();
         self.panel_layer = None;
-        self.software.invalidate();
+        self.invalidate_rows();
         self.resize_panes();
         self.redraw();
     }
@@ -943,7 +983,7 @@ impl App {
             self.focus_pane(id);
         }
         self.selection = None;
-        self.software.invalidate();
+        self.invalidate_rows();
         self.resize_panes();
         self.redraw();
     }
@@ -1509,10 +1549,51 @@ impl App {
         }
         Some(self.window.as_ref()?.inner_size())
     }
+    fn invalidate_rows(&mut self) {
+        self.software.invalidate();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.invalidate();
+        }
+    }
+    /// Create the frame backend for `window` according to `renderer_mode`.
+    /// `auto` falls back to software on any GPU error (reason in the status
+    /// line and on stderr); `gpu` reports the error.
+    fn start_renderer(&mut self, window: Arc<Window>) -> Result<()> {
+        if self.renderer_mode != RendererMode::Software {
+            let allow_cpu = self.renderer_mode == RendererMode::Gpu;
+            match GpuRenderer::for_window(window.clone(), allow_cpu) {
+                Ok(gpu) => {
+                    if std::env::var_os("CROW_TERM_RENDERER_LOG").is_some() {
+                        eprintln!("crow-term: GPU renderer on {}", gpu.adapter());
+                    }
+                    self.gpu = Some(gpu);
+                    return Ok(());
+                }
+                Err(error) if self.renderer_mode == RendererMode::Auto => {
+                    self.status = format!("GPU renderer unavailable, using software: {error:#}");
+                    eprintln!("crow-term: {}", self.status);
+                }
+                Err(error) => return Err(error.context("--renderer gpu")),
+            }
+        }
+        self.start_software(window)
+    }
+    fn start_software(&mut self, window: Arc<Window>) -> Result<()> {
+        self.gpu = None;
+        let context = softbuffer::Context::new(window.clone())
+            .map_err(|e| anyhow::anyhow!("native display: {e}"))?;
+        let surface = softbuffer::Surface::new(&context, window)
+            .map_err(|e| anyhow::anyhow!("native surface: {e}"))?;
+        self.surface = Some(surface);
+        Ok(())
+    }
     fn draw(&mut self) -> Result<()> {
         let Some(size) = self.window_size() else {
             return Ok(());
         };
+        if self.gpu.is_some() {
+            return self.draw_gpu(size);
+        }
         let (Some(width), Some(height)) =
             (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
@@ -1530,7 +1611,7 @@ impl App {
                 .map_err(|error| anyhow::anyhow!("native framebuffer: {error}"))?;
             self.paint(&mut frame, size);
             #[cfg(feature = "frame-dump")]
-            self.dump_frame(&frame, size);
+            self.dump_frame(&frame, size, "software");
             frame
                 .present()
                 .map_err(|error| anyhow::anyhow!("present native surface: {error}"))
@@ -1538,32 +1619,89 @@ impl App {
         self.surface = Some(surface);
         result
     }
+    /// GPU frame. A device or surface failure switches `auto` to the
+    /// software framebuffer for the rest of the session; `gpu` tries one new
+    /// device and otherwise ends with the error.
+    fn draw_gpu(&mut self, size: PhysicalSize<u32>) -> Result<()> {
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+        let scene = scene_of!(self, size);
+        let Some(gpu) = self.gpu.as_mut() else {
+            return Ok(());
+        };
+        #[cfg(not(feature = "frame-dump"))]
+        let result = gpu.render(&scene, &mut self.shaper, &self.config);
+        // Dump the presented texture when it can be copied, else an identical
+        // offscreen render of the same scene.
+        #[cfg(feature = "frame-dump")]
+        let (result, dumped) = if self.frame_dump.is_some() {
+            match gpu.render_and_capture(&scene, &mut self.shaper, &self.config) {
+                Ok((true, Some(pixels))) => (Ok(true), Some(pixels)),
+                Ok((true, None)) => (
+                    Ok(true),
+                    // Surface not copyable here: dump the same scene offscreen.
+                    gpu.render_offscreen(&scene, &mut self.shaper, &self.config)
+                        .ok(),
+                ),
+                other => (other.map(|(presented, _)| presented), None),
+            }
+        } else {
+            (gpu.render(&scene, &mut self.shaper, &self.config), None)
+        };
+        drop(scene);
+        self.after_paint();
+        match result {
+            Ok(presented) => {
+                #[cfg(feature = "frame-dump")]
+                if let Some(pixels) = dumped {
+                    self.dump_frame(&pixels, size, "gpu");
+                }
+                if !presented {
+                    // Occluded or timed out: try again on the next event.
+                    return Ok(());
+                }
+                Ok(())
+            }
+            Err(error) => {
+                let Some(window) = self.window.clone() else {
+                    return Err(error);
+                };
+                self.gpu = None;
+                if self.renderer_mode == RendererMode::Gpu {
+                    match GpuRenderer::for_window(window, true) {
+                        Ok(gpu) => {
+                            self.gpu = Some(gpu);
+                            self.status = format!("GPU device recreated after: {error:#}");
+                        }
+                        Err(again) => {
+                            self.fatal_error = Some(format!(
+                                "GPU renderer failed: {error:#}; restart failed: {again:#}"
+                            ));
+                            return Err(again);
+                        }
+                    }
+                } else {
+                    self.start_software(window)?;
+                    self.status = format!("GPU renderer failed, switched to software: {error:#}");
+                    eprintln!("crow-term: {}", self.status);
+                }
+                self.invalidate_rows();
+                self.redraw();
+                Ok(())
+            }
+        }
+    }
     /// Compose the frame and draw it with the software backend.
     fn paint(&mut self, frame: &mut [u32], size: PhysicalSize<u32>) {
-        let rects = self.rects();
-        let panel = self.panel_rect().map(|rect| (rect, self.panel_layer(rect)));
-        let parts = FrameParts {
-            config: &self.config,
-            session: &self.session,
-            window_id: self.window_id,
-            pane_id: self.pane_id,
-            scale: self.scale,
-            view: self.view.as_ref(),
-            selection: self.selection.as_ref(),
-            ime: &self.ime,
-            status: &self.status,
-            prefix: self.prefix,
-            bell_flash: self.bell_flash.as_ref(),
-            crow_status: &self.crow_view.status,
-            stuck: self.stuck,
-            rects,
-            tabs: self.tab_rects(),
-            windows: self.windows(),
-            panel,
-        };
-        let scene = compose(&parts, &mut self.shaper, size);
+        let scene = scene_of!(self, size);
         self.software
             .render(&scene, &mut self.shaper, &self.config, frame);
+        drop(scene);
+        self.after_paint();
+    }
+    /// Effects of having drawn a frame for the focused pane.
+    fn after_paint(&mut self) {
         if let Some(shared) = &self.crow
             && self.crow_pane != self.pane_id
         {
@@ -1610,7 +1748,7 @@ impl App {
         layer
     }
     #[cfg(feature = "frame-dump")]
-    fn dump_frame(&mut self, frame: &[u32], size: PhysicalSize<u32>) {
+    fn dump_frame(&mut self, frame: &[u32], size: PhysicalSize<u32>, renderer: &'static str) {
         if self.frame_dump.is_none() {
             return;
         }
@@ -1646,7 +1784,7 @@ impl App {
         let meta = crate::frame_dump::FrameMeta {
             schema: "crow-frame/1",
             seq: dump.next_seq(),
-            renderer: "software",
+            renderer,
             width: size.width,
             height: size.height,
             scale: self.scale,
@@ -2060,7 +2198,6 @@ fn compose<'a>(
         width: size.width,
         height: size.height,
         background: parse_color(&config.background, 0x111111),
-        live_panes,
         ops,
     }
 }
@@ -2088,13 +2225,9 @@ impl ApplicationHandler<UiEvent> for App {
             window.set_ime_allowed(true);
             self.scale = window.scale_factor();
             self.shaper.rescale(&self.config, self.scale);
-            self.software.invalidate();
-            let context = softbuffer::Context::new(window.clone())
-                .map_err(|e| anyhow::anyhow!("native display: {e}"))?;
-            let surface = softbuffer::Surface::new(&context, window.clone())
-                .map_err(|e| anyhow::anyhow!("native surface: {e}"))?;
-            self.surface = Some(surface);
-            self.window = Some(window);
+            self.invalidate_rows();
+            self.window = Some(window.clone());
+            self.start_renderer(window)?;
             self.resize_panes();
             self.redraw();
             Ok(())
@@ -2106,6 +2239,7 @@ impl ApplicationHandler<UiEvent> for App {
         }
     }
     fn suspended(&mut self, _: &ActiveEventLoop) {
+        self.gpu = None;
         self.surface = None;
         self.window = None;
     }
@@ -2220,7 +2354,7 @@ impl ApplicationHandler<UiEvent> for App {
                 self.pane_id = pane;
                 self.pending_focus_in = None;
                 self.selection = None;
-                self.software.invalidate();
+                self.invalidate_rows();
                 self.status =
                     "Daemon restarted — a new session replaced the one that ended with it".into();
                 self.status_expires = Some(Instant::now() + Duration::from_secs(10));
@@ -2244,6 +2378,9 @@ impl ApplicationHandler<UiEvent> for App {
                     self.status = error.to_string();
                     eprintln!("crow-term: {error:#}");
                 }
+                if self.fatal_error.is_some() {
+                    event_loop.exit();
+                }
             }
             WindowEvent::Resized(_) => {
                 self.resize_panes();
@@ -2252,7 +2389,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
                 self.shaper.rescale(&self.config, self.scale);
-                self.software.invalidate();
+                self.invalidate_rows();
                 self.sent_sizes.clear();
                 self.resize_panes();
                 self.redraw();

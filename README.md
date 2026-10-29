@@ -214,13 +214,33 @@ observed platform coverage and remaining work.
 
 ## Rendering and performance
 
-The initial renderer uses a **native software framebuffer** (`softbuffer`), not
-GPU text rendering. OpenType shaping and fallback use COSMIC Text; rows and glyphs
-are cached, redraws are event-driven, output updates are coalesced to at most
-60 Hz, queues and scrollback are bounded, and release builds use thin LTO.
-“Optimized to the maximum” is a target to measure, not an honest certification
-for a new terminal. GPU rendering and comparative latency/throughput benchmarks
-remain explicit follow-up work.
+Two renderers draw the same frame description (`src/render/`): OpenType shaping
+and fallback use COSMIC Text, every shaped cluster is anchored to its cell, and
+rows are cached by content, so scrolled rows are not shaped again.
+
+| `renderer` | What it does |
+| --- | --- |
+| `software` (default) | Native CPU framebuffer (`softbuffer`). |
+| `gpu` | wgpu: Metal on macOS, DX12 on Windows, Vulkan or GL on Linux. Failing to start is an error. |
+| `auto` | GPU when a hardware adapter works; otherwise the software renderer, with the reason in the status line and on stderr. CPU rasterizers (llvmpipe, lavapipe, WARP) are not used by `auto`. A GPU device lost at runtime switches to software. |
+
+Choose with `--renderer auto|gpu|software`, then `CROW_TERM_RENDERER`, then
+`renderer = "..."` in the config (invalid values are rejected). `software`
+stays the default until the GPU path has been validated by hand on real drivers,
+Wayland compositors and HiDPI displays; `auto` will become the default only
+after that. `crow-term doctor` prints the effective renderer and where it
+came from.
+
+The GPU renderer uses a non-sRGB surface so blending matches the software
+framebuffer: in CI, offscreen GPU frames of the real UI composition must match
+the software frames within 2 per channel on at most 0.1% of the pixels
+(`tests/goldens/render/` pins the software output). Frames are only drawn on
+request (no idle frames), the surface is configured only on resize/DPI changes,
+and presentation is vsync (FIFO).
+
+Redraws are event-driven, output updates are coalesced to at most 60 Hz, queues
+and scrollback are bounded, and release builds use thin LTO. “Optimized to the
+maximum” is a target to measure, not a certification.
 
 ## Licensing and upstream components
 
