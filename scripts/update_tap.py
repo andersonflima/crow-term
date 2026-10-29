@@ -6,10 +6,11 @@ Stdlib only, Python 3.9+. Never commits or pushes: it prints the git commands.
     python3 scripts/update_tap.py --version 0.1.0-alpha.1 \\
         --tap "$(brew --repository andersonflima/tap)" \\
         --sha256sums https://github.com/andersonflima/crow-term/releases/download/v0.1.0-alpha.1/SHA256SUMS \\
-        [--notarized] [--dry-run]
+        [--notarized] [--dry-run] [--cask-only]
 
 ``--assets-dir DIR`` computes digests from local release archives instead.
 Without ``--notarized`` the cask gets a caveat about the unsigned/unnotarized app.
+``--cask-only`` requires only macOS app archives and leaves the formula untouched.
 """
 import argparse
 import difflib
@@ -132,6 +133,7 @@ def run(argv=None, out=sys.stdout):
     source.add_argument("--sha256sums", help="SHA256SUMS file path or https URL")
     parser.add_argument("--notarized", action="store_true", help="macOS app is signed and notarized (drops the cask caveat)")
     parser.add_argument("--dry-run", action="store_true", help="print a diff, write nothing")
+    parser.add_argument("--cask-only", action="store_true", help="update only the cask; preserve the existing formula")
     parser.add_argument("--templates", type=Path, default=TEMPLATES, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
@@ -142,13 +144,17 @@ def run(argv=None, out=sys.stdout):
     if not tap.is_dir():
         raise TapError(f"Tap directory not found: {tap}")
     names = asset_names(version)
+    outputs = OUTPUTS
+    if args.cask_only:
+        names = {token: name for token, name in names.items() if token.endswith("_APP")}
+        outputs = {"cask/crow-term.rb": OUTPUTS["cask/crow-term.rb"]}
     if args.assets_dir:
         digests = digests_from_dir(args.assets_dir, names)
     else:
         digests = digests_from_sums(read_sums(args.sha256sums), names)
 
     changed = []
-    for template_name, relative in OUTPUTS.items():
+    for template_name, relative in outputs.items():
         template = (args.templates / template_name).read_text(encoding="utf-8")
         rendered = render(template, version, digests, args.notarized)
         target = tap / relative
@@ -169,7 +175,8 @@ def run(argv=None, out=sys.stdout):
         quoted = shlex.quote(str(tap))
         files = " ".join(changed)
         print("\nReview, audit and publish the tap yourself:", file=out)
-        print(f"  ruby -c {quoted}/Formula/crow-term.rb {quoted}/Casks/crow-term.rb", file=out)
+        ruby_files = " ".join(f"{quoted}/{relative}" for relative in outputs.values())
+        print(f"  ruby -c {ruby_files}", file=out)
         print("  brew style andersonflima/tap", file=out)
         print(f"  git -C {quoted} add {files}", file=out)
         print(f"  git -C {quoted} commit -m 'feat(crow-term): {version}'", file=out)

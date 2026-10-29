@@ -36,6 +36,7 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
       prerelease: ${{ steps.version.outputs.prerelease }}
       publish: ${{ steps.version.outputs.publish }}
+      macos_only: ${{ steps.version.outputs.macos_only }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -63,6 +64,7 @@ jobs:
             echo "tag=v${version}"
             echo "prerelease=${prerelease}"
             echo "publish=${publish}"
+            echo "macos_only=${{ vars.CROW_MACOS_ONLY == 'true' }}"
           } >> "${GITHUB_OUTPUT}"
 
   build:
@@ -71,15 +73,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { os: macos-15, target: macos-arm64 }
-          # Intel macOS: macos-13 is retired; macos-15-intel is the supported x86_64 label.
-          - { os: macos-15-intel, target: macos-x86_64 }
-          # Linux builds on the oldest supported runner: the binary needs the glibc
-          # it was linked against (2.35 here) or newer; 24.04 would require 2.39.
-          - { os: ubuntu-22.04, target: linux-x86_64 }
-          - { os: ubuntu-22.04-arm, target: linux-arm64 }
-          - { os: windows-2025, target: windows-x86_64 }
+        # CROW_MACOS_ONLY pauses non-macOS builds without removing their definitions.
+        # Linux keeps the glibc 2.35 baseline when the full matrix is restored.
+        include: ${{ fromJSON(needs.prepare.outputs.macos_only == 'true' && '[{"os":"macos-15","target":"macos-arm64"},{"os":"macos-15-intel","target":"macos-x86_64"}]' || '[{"os":"macos-15","target":"macos-arm64"},{"os":"macos-15-intel","target":"macos-x86_64"},{"os":"ubuntu-22.04","target":"linux-x86_64"},{"os":"ubuntu-22.04-arm","target":"linux-arm64"},{"os":"windows-2025","target":"windows-x86_64"}]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     env:
@@ -272,6 +268,7 @@ jobs:
     timeout-minutes: 10
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
+      MACOS_ONLY: ${{ needs.prepare.outputs.macos_only }}
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -286,9 +283,11 @@ jobs:
           (( ${#sums[@]} )) || { echo "::error::No archives"; exit 1; }
           sha256sum -c "${sums[@]}"
           cat "${sums[@]}" | sort -k2 > SHA256SUMS
-          for asset in \
-            "macos-arm64.tar.gz" "macos-arm64.app.zip" "macos-x86_64.tar.gz" "macos-x86_64.app.zip" \
-            "linux-x86_64.tar.gz" "linux-arm64.tar.gz" "windows-x86_64.zip"; do
+          expected=("macos-arm64.tar.gz" "macos-arm64.app.zip" "macos-x86_64.tar.gz" "macos-x86_64.app.zip")
+          if [[ "${MACOS_ONLY}" != "true" ]]; then
+            expected+=("linux-x86_64.tar.gz" "linux-arm64.tar.gz" "windows-x86_64.zip")
+          fi
+          for asset in "${expected[@]}"; do
             grep -qF "  crow-term-${VERSION}-${asset}" SHA256SUMS || { echo "::error::missing ${asset}"; exit 1; }
           done
           cat SHA256SUMS
@@ -300,9 +299,14 @@ jobs:
           done
           flag=""
           [[ "${notarized}" == "true" ]] && flag=" --notarized"
+          [[ "${MACOS_ONLY}" == "true" ]] && flag+=" --cask-only"
           {
             echo "## Crow Term ${VERSION}"
             echo
+            if [[ "${MACOS_ONLY}" == "true" ]]; then
+              echo "macOS-only release: Linux/Windows builds and npm packages are paused. Update only the Homebrew cask; the formula remains on the last complete release."
+              echo
+            fi
             echo "| target | signed | notarized |"
             echo "|---|---|---|"
             for f in dist/status/*.json; do
@@ -390,7 +394,9 @@ jobs:
     # After the GitHub Release on a tag (publishes); after collect on a dry run
     # (builds, packs and smoke-tests, publishes nothing).
     needs: [prepare, collect, publish]
-    if: always() && needs.collect.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    # The npm launcher needs every platform archive and its Linux smoke binary.
+    # Keep the previous packages untouched while only macOS archives are built.
+    if: always() && needs.prepare.outputs.macos_only != 'true' && needs.collect.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:

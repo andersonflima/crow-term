@@ -15,7 +15,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2025]
+        # Temporary repository toggle; unset/false restores all platforms.
+        os: ${{ fromJSON(vars.CROW_MACOS_ONLY == 'true' && '["macos-15"]' || '["ubuntu-24.04","macos-15","windows-2025"]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -91,17 +92,10 @@ jobs:
     # runner's Metal device when one is exposed and logs the reason when not.
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            require: '1'
-            backend: vulkan
-          - os: windows-2025
-            require: '1'
-            backend: dx12
-          - os: macos-15
-            require: '0'
-            backend: metal
+      matrix: >-
+        ${{ fromJSON(vars.CROW_MACOS_ONLY == 'true'
+          && '{"include":[{"os":"macos-15","require":"0","backend":"metal"}]}'
+          || '{"include":[{"os":"ubuntu-24.04","require":"1","backend":"vulkan"},{"os":"windows-2025","require":"1","backend":"dx12"},{"os":"macos-15","require":"0","backend":"metal"}]}') }}
     name: gpu (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
@@ -145,7 +139,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15]
+        os: ${{ fromJSON(vars.CROW_MACOS_ONLY == 'true' && '["macos-15"]' || '["ubuntu-24.04","macos-15"]') }}
         nvim: ['0.11.7', '0.12.6']
     name: neovim ${{ matrix.nvim }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

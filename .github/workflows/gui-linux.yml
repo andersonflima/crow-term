@@ -20,6 +20,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   journeys:
+    if: vars.CROW_MACOS_ONLY != 'true'
     strategy:
       fail-fast: false
       matrix:

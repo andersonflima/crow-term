@@ -24,6 +24,22 @@ Dry run: **Actions → Release → Run workflow** on any branch builds, signs an
 notarizes (if configured) and keeps the results as workflow artifacts only. It
 creates no release and no attestation.
 
+## Temporary macOS-only builds
+
+Set the repository Actions variable `CROW_MACOS_ONLY=true` to pause Windows and
+Linux build/test runners in Native CI, their GUI journeys, and release builds.
+macOS CI and both Apple Silicon and Intel release builds remain enabled. Small
+release orchestration jobs still run on Ubuntu; they do not build Linux binaries.
+Set the variable to `false` or delete it to restore the full platform matrices.
+Already scheduled runs retain the matrix selected when they started.
+
+In this mode the release verifies and publishes only the four macOS archives.
+The all-platform npm packaging job is skipped (it requires the Linux/Windows
+archives), and existing npm packages remain untouched. Update Homebrew with
+`scripts/update_tap.py --cask-only` and the usual version/checksum/notarized
+arguments: only the macOS cask advances; the cross-platform formula remains on
+the last complete release. Do not repoint Linux URLs to missing archives.
+
 ## Assets
 
 `crow-term-<version>-<os>-<arch>.<ext>`, `os` = `macos` | `linux` | `windows`,
