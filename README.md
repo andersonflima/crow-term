@@ -170,18 +170,28 @@ background. `minimum_contrast` (default `4.5`, WCAG contrast ratio; `1.0`
 turns it off, up to `21.0`) darkens or lightens such text, keeping its hue,
 until it reaches the ratio against its cell background (after reverse video,
 dim and selection). Text that already meets it is drawn unchanged, and so are
-color emoji, box drawing, block elements and Powerline separators. Both
+color emoji, box drawing, block elements, legacy-computing shapes and Powerline
+separators (U+E0B0–E0D7; Powerline's branch/line/padlock icons are adjusted
+like text). Both
 renderers apply it identically. `4.5` is WCAG AA for normal-size text, which
 terminal text is. Deliberately quiet colors (comments, autosuggestions) of
 some themes come out a little darker or lighter; set `minimum_contrast = 3.0`
 (the WCAG minimum for large text) for a subtler look, or `1.0` to turn it off.
+On a mid-grey background, where neither black nor white reaches 4.5 by much,
+the adjustment can move text all the way to the other end: white on `#777777`
+becomes near-black (`#060606`). That is by design (it is the readable choice);
+`3.0` avoids it for such themes.
 
 Programs can also ask instead of guessing: OSC 10/11 queries answer with the
 configured foreground/background, `CSI ? 996 n` answers `CSI ? 997 ; 2 n`
-(light) or `; 1 n` (dark), and mode 2031 (`CSI ? 2031 h`, queryable with
-DECRQM) reports later theme flips. fish 4.x uses these to set
-`$fish_terminal_color_theme`; themes saved with light and dark variants then
-follow the terminal. Colors fixed in universal variables (`set -U
+(light) or `; 1 n` (dark), and mode 2031 (`CSI ? 2031 h`) can be enabled and
+queried with DECRQM. Light means black text contrasts more with the
+background than white text does; the window chrome uses the same rule. Flip
+notifications under mode 2031 are only sent when a pane's theme changes, and
+crow-term does not change themes of running panes yet (the theme is applied
+when a pane starts), so in practice none are sent today. fish 4.x uses the
+queries to set `$fish_terminal_color_theme`; themes saved with light and dark
+variants then pick the right one when fish starts. Colors fixed in universal variables (`set -U
 fish_color_normal ...`) do not change, which is what `minimum_contrast` covers.
 
 ### Clipboard from programs (OSC 52)

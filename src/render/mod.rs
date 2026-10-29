@@ -208,6 +208,12 @@ pub fn relative_luminance(color: u32) -> f64 {
     };
     0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
 }
+/// Whether `background` is a light background: dark (black) text contrasts
+/// more with it than light (white) text does. The single rule shared by the
+/// UI chrome, the light/dark scheme report and `ensure_contrast`.
+pub fn is_light(background: u32) -> bool {
+    contrast_ratio(0x000000, background) >= contrast_ratio(0xffffff, background)
+}
 /// WCAG 2.x contrast ratio of two colors, from 1.0 (equal) to 21.0.
 pub fn contrast_ratio(a: u32, b: u32) -> f64 {
     let (la, lb) = (relative_luminance(a), relative_luminance(b));
@@ -230,11 +236,7 @@ pub fn ensure_contrast(fg: u32, bg: u32, minimum: f32) -> u32 {
     if minimum <= 1.0 || contrast_ratio(fg, bg) >= minimum {
         return fg;
     }
-    let target = if contrast_ratio(0xffffff, bg) >= contrast_ratio(0x000000, bg) {
-        0xffffff
-    } else {
-        0x000000
-    };
+    let target = if is_light(bg) { 0x000000 } else { 0xffffff };
     if contrast_ratio(target, bg) < minimum {
         return target;
     }
@@ -305,6 +307,31 @@ mod tests {
         );
     }
     #[test]
+    fn light_background_boundary_is_pinned() {
+        // Black and white text are equally readable at L = sqrt(1.05 * 0.05) - 0.05.
+        assert!(is_light(0xffffff) && is_light(0x767676) && is_light(0x808080));
+        assert!(!is_light(0x757575) && !is_light(0x111111) && !is_light(0x000000));
+        assert!(is_light(0xbbbbbb) && is_light(0x818181));
+    }
+    #[test]
+    fn exemptions_cover_shapes_but_not_text_like_symbols() {
+        use crate::render::shaper::contrast_exempt;
+        for shape in ["\u{2500}", "\u{2588}", "\u{1FB00}", "\u{E0B0}", "\u{E0D7}"] {
+            assert!(contrast_exempt(shape), "{shape:?}");
+        }
+        for text in [
+            "a",
+            "\u{E0A0}",
+            "\u{E0A3}",
+            "\u{1FBF0}",
+            "\u{1FBF9}",
+            "\u{1CC00}",
+            "😀",
+        ] {
+            assert!(!contrast_exempt(text), "{text:?}");
+        }
+    }
+    #[test]
     fn ensure_contrast_reaches_the_minimum_with_the_least_change() {
         // Catppuccin Macchiato text on a white background (the reported bug).
         for fg in [0xcad3f5, 0x8aadf4, 0xf0c6c6, 0x6e738d] {
@@ -338,6 +365,8 @@ mod tests {
         let light = ensure_contrast(0x303446, 0x24273a, 3.0);
         assert!(contrast_ratio(light, 0x24273a) >= 3.0);
         assert!(relative_luminance(light) > relative_luminance(0x303446));
+        // Mid-grey background: white text flips to near-black (documented).
+        assert_eq!(ensure_contrast(0xffffff, 0x777777, 4.5), 0x060606);
         // Off (1.0) never changes anything; unreachable minimums give the extreme.
         assert_eq!(ensure_contrast(0xfefefe, 0xffffff, 1.0), 0xfefefe);
         assert_eq!(ensure_contrast(0x777777, 0x777777, 21.0), 0x000000);

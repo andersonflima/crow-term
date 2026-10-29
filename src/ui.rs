@@ -489,8 +489,7 @@ fn mix_rgb(a: u32, b: u32, amount: u32) -> u32 {
     channel(16) << 16 | channel(8) << 8 | channel(0)
 }
 fn light_background(config: &Config) -> bool {
-    let bg = parse_color(&config.background, 0xffffff);
-    ((bg >> 16) & 255) * 299 + ((bg >> 8) & 255) * 587 + (bg & 255) * 114 > 128_000
+    crate::render::is_light(parse_color(&config.background, 0xffffff))
 }
 struct Chrome {
     surface: u32,
