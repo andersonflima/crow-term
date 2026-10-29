@@ -715,6 +715,9 @@ struct App {
     drawn: Drawn,
     /// A debounced tab label is due to change then.
     label_due: Option<Instant>,
+    /// Shortened tab labels by (index and full label, room in px, scale):
+    /// shaping runs only when one of them changes.
+    label_fit: HashMap<(String, u32, u64), String>,
     crow_panel: bool,
     crow_pane: u64,
     panel_layer: Option<Arc<Layer>>,
@@ -796,6 +799,7 @@ impl App {
             tab_context: Default::default(),
             drawn: Drawn::default(),
             label_due: None,
+            label_fit: HashMap::new(),
             crow_panel,
             crow_pane: pane_id,
             panel_layer: None,
@@ -2035,15 +2039,33 @@ impl App {
             };
             let index = windows.iter().position(|w| w.id == id).unwrap_or(0) + 1;
             let room = rect.w as f32 - 20.0 * self.scale as f32;
-            let (config, shaper) = (&self.config, &mut self.shaper);
-            let label =
-                crate::tab_context::shorten(&full, crate::tab_context::Shorten::Middle, |text| {
-                    shaper
-                        .shape_text(config, 0, 0, &format!("{index}  {text}"), 0, tab_size)
-                        .1
-                        <= room
-                })
-                .unwrap_or_default();
+            let key = (
+                format!("{index}\0{full}"),
+                room.max(0.0) as u32,
+                self.scale.to_bits(),
+            );
+            let label = match self.label_fit.get(&key) {
+                Some(label) => label.clone(),
+                None => {
+                    let (config, shaper) = (&self.config, &mut self.shaper);
+                    let label = crate::tab_context::shorten(
+                        &full,
+                        crate::tab_context::Shorten::Middle,
+                        |text| {
+                            shaper
+                                .shape_text(config, 0, 0, &format!("{index}  {text}"), 0, tab_size)
+                                .1
+                                <= room
+                        },
+                    )
+                    .unwrap_or_default();
+                    if self.label_fit.len() >= 256 {
+                        self.label_fit.clear();
+                    }
+                    self.label_fit.insert(key, label.clone());
+                    label
+                }
+            };
             if label != full {
                 tab_full.push((id, full));
             }
@@ -2879,6 +2901,15 @@ impl ApplicationHandler<UiEvent> for App {
                 self.redraw();
             }
             UiEvent::Crow(view) => {
+                // Ask the daemon which pane runs each live agent session
+                // (it scans processes only while there are any).
+                let pids = |view: &CrowView| -> Vec<u32> {
+                    view.context.agents.iter().filter_map(|a| a.pid).collect()
+                };
+                let asked = pids(&view);
+                if asked != pids(&self.crow_view) {
+                    self.send(Request::AgentPids { pids: asked }, false);
+                }
                 self.crow_view = *view;
                 self.redraw();
             }

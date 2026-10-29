@@ -99,11 +99,45 @@ pub fn is_shell(name: &str) -> bool {
 /// Text from programs and agents as it may be painted: no control, bidi or
 /// zero-width characters (they could reorder or hide what is shown).
 pub fn sanitize(text: &str) -> String {
-    text.chars()
-        .filter(|&c| !c.is_control() && !crate::hyperlinks::invisible(c))
-        .collect::<String>()
-        .trim()
-        .to_owned()
+    let clean: String = text
+        .chars()
+        .filter(|&c| !c.is_control() && !ignorable(c))
+        .take(MAX_TEXT * 8)
+        .collect();
+    let clean = clean.trim();
+    // Bounded: a hostile title or task cannot make shaping expensive.
+    if clean.len() <= MAX_TEXT {
+        clean.to_owned()
+    } else {
+        clean.graphemes(true).take(MAX_TEXT).collect()
+    }
+}
+
+/// Longest shown text (grapheme clusters) of any title, task or name.
+pub const MAX_TEXT: usize = 256;
+
+/// Characters that draw nothing yet change or hide what is shown: bidi
+/// controls, zero-width characters (Unicode Default_Ignorable_Code_Point,
+/// except the variation selectors emoji need), tags, Hangul fillers.
+pub fn ignorable(c: char) -> bool {
+    crate::hyperlinks::invisible(c)
+        || matches!(
+            c,
+            '\u{034f}'
+                | '\u{115f}'
+                | '\u{1160}'
+                | '\u{17b4}'
+                | '\u{17b5}'
+                | '\u{3164}'
+                | '\u{ffa0}'
+                | '\u{2065}'
+                | '\u{fff0}'..='\u{fff8}'
+                | '\u{1bca0}'..='\u{1bca3}'
+                | '\u{1d173}'..='\u{1d17a}'
+                | '\u{e0000}'..='\u{e007f}'
+                | '\u{e0080}'..='\u{e00ff}'
+                | '\u{e01f0}'..='\u{e0fff}'
+        )
 }
 
 /// The arguments worth showing for `program` (daemon side, before anything
@@ -154,32 +188,41 @@ pub fn shorten(text: &str, style: Shorten, mut fits: impl FnMut(&str) -> bool) -
         return Some(text.to_owned());
     }
     let graphemes: Vec<&str> = text.graphemes(true).collect();
-    for keep in (1..graphemes.len()).rev() {
-        let candidate = match style {
-            Shorten::Middle => {
-                let tail = keep / 2 + keep % 2;
-                let head = keep - tail;
-                format!(
-                    "{}…{}",
-                    graphemes[..head].concat(),
-                    graphemes[graphemes.len() - tail..].concat()
-                )
-            }
-            Shorten::Words => {
-                let cut = graphemes[..keep].concat();
-                match cut.rfind(' ') {
-                    Some(at) if cut[..at].graphemes(true).count() >= keep / 2 => {
-                        format!("{}…", cut[..at].trim_end())
-                    }
-                    _ => format!("{cut}…"),
+    let candidate = |keep: usize| match style {
+        Shorten::Middle => {
+            let tail = keep / 2 + keep % 2;
+            let head = keep - tail;
+            format!(
+                "{}…{}",
+                graphemes[..head].concat(),
+                graphemes[graphemes.len() - tail..].concat()
+            )
+        }
+        Shorten::Words => {
+            let cut = graphemes[..keep].concat();
+            match cut.rfind(' ') {
+                Some(at) if cut[..at].graphemes(true).count() >= keep / 2 => {
+                    format!("{}…", cut[..at].trim_end())
                 }
+                _ => format!("{cut}…"),
             }
-        };
-        if fits(&candidate) {
-            return Some(candidate);
+        }
+    };
+    // Binary search for the most graphemes that fit: O(log n) measurements
+    // (widths grow with `keep`).
+    let (mut low, mut high) = (0usize, graphemes.len().saturating_sub(1));
+    let mut best = None;
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let text = candidate(mid);
+        if fits(&text) {
+            best = Some(text);
+            low = mid;
+        } else {
+            high = mid - 1;
         }
     }
-    fits("…").then(|| "…".to_owned())
+    best.or_else(|| fits("…").then(|| "…".to_owned()))
 }
 
 /// Display width in terminal cells (wide characters count two).
@@ -235,7 +278,7 @@ fn repo_label(pane: &PaneSummary) -> Option<String> {
 pub fn agent_for<'a>(pane: &PaneSummary, agents: &'a [Agent]) -> Option<&'a Agent> {
     if let Some(agent) = agents.iter().find(|a| {
         a.pid
-            .is_some_and(|pid| pane.pid == Some(pid) || pane.pids.contains(&pid))
+            .is_some_and(|pid| pane.pid == Some(pid) || pane.agent_pid == Some(pid))
     }) {
         return Some(agent);
     }
@@ -347,16 +390,16 @@ pub fn tab_label(input: &LabelInput<'_>) -> String {
     }
     if let Some(pane) = input.pane {
         if let Some(agent) = input.agent {
-            return match agent.task.as_deref().or(agent.tool.as_deref()) {
+            return sanitize(&match agent.task.as_deref().or(agent.tool.as_deref()) {
                 Some(task) => format!("{} · {task}", agent.host),
                 None => agent.host.clone(),
-            };
+            });
         }
         if let Some(title) = useful_title(pane) {
             return title;
         }
         if !pane.process.is_empty() && !is_shell(&pane.process) {
-            let mut label = program_name(&pane.process);
+            let mut label = sanitize(&program_name(&pane.process));
             for arg in &pane.args {
                 label.push(' ');
                 label.push_str(&sanitize(arg));
@@ -367,10 +410,10 @@ pub fn tab_label(input: &LabelInput<'_>) -> String {
             return repo;
         }
         if !pane.process.is_empty() {
-            return program_name(&pane.process);
+            return sanitize(&program_name(&pane.process));
         }
     }
-    program_name(input.shell)
+    sanitize(&program_name(input.shell))
 }
 
 /// How a segment is painted (the UI maps it to theme colours).
@@ -743,7 +786,7 @@ mod tests {
             agent: AGENTS
                 .contains(&program_name(process).as_str())
                 .then(|| program_name(process)),
-            pids: vec![4242],
+            agent_pid: None,
         }
     }
 
@@ -903,7 +946,7 @@ mod tests {
         // counts (an agent that exited leaves the shell in front).
         let mut shell = pane("zsh", "", Some("/w/crow-term"));
         shell.pid = Some(77);
-        shell.pids = vec![77];
+        shell.agent_pid = None;
         assert!(agent_for(&shell, &[by_pid.clone(), by_tty.clone()]).is_none());
         // By directory only when exactly one session there reports no pid/tty.
         let one = agent("claude", "/w/crow-term/", 2);
@@ -979,7 +1022,8 @@ mod tests {
         let mut gemini_pane = pane("node", "", Some("/w/app"));
         gemini_pane.agent = agent_cli("node", &argv(&["node", "/opt/homebrew/bin/gemini"]));
         gemini_pane.pid = Some(500);
-        gemini_pane.pids = vec![500, 501, 502];
+        // The daemon found session pid 502 in this pane's job.
+        gemini_pane.agent_pid = Some(502);
         let session = agent("gemini", "/w/app", 2);
         assert_eq!(
             agent_for(&gemini_pane, std::slice::from_ref(&session))
@@ -999,7 +1043,7 @@ mod tests {
         // A plain node program is not an agent.
         let mut server = pane("node", "", Some("/w/app"));
         server.agent = None;
-        server.pids = vec![900];
+        server.agent_pid = None;
         assert!(agent_for(&server, std::slice::from_ref(&session)).is_none());
         // The job tree is bounded and follows parents (cycles stop).
         let mut children = std::collections::HashMap::new();
@@ -1008,6 +1052,49 @@ mod tests {
         children.insert(503, vec![500]);
         assert_eq!(job_tree(500, &children, 64), [500, 501, 502, 503]);
         assert_eq!(job_tree(500, &children, 2), [500, 501]);
+    }
+
+    #[test]
+    fn shortening_a_huge_title_measures_only_a_few_times() {
+        let title = "ab ".repeat(3400);
+        assert!(title.len() > 10_000);
+        let calls = std::cell::Cell::new(0);
+        let short = shorten(&title, Shorten::Middle, |t| {
+            calls.set(calls.get() + 1);
+            cells(t) <= 30
+        })
+        .unwrap();
+        assert!(cells(&short) <= 30, "{short}");
+        assert!(
+            calls.get() <= 20,
+            "{} measurements for {} graphemes",
+            calls.get(),
+            title.len()
+        );
+        // Words style too, and the result is the longest that fits.
+        let calls = std::cell::Cell::new(0);
+        let words = shorten(&title, Shorten::Words, |t| {
+            calls.set(calls.get() + 1);
+            cells(t) <= 30
+        })
+        .unwrap();
+        assert!(cells(&words) <= 30 && cells(&words) >= 25, "{words}");
+        assert!(calls.get() <= 20);
+    }
+
+    #[test]
+    fn every_invisible_kind_is_removed_from_shown_text() {
+        let hostile = "a\u{e0041}\u{e007f}b\u{115f}\u{1160}\u{3164}\u{ffa0}c\u{200b}\u{202e}\u{2066}d\u{034f}\u{feff}e\u{1bca0}";
+        assert_eq!(sanitize(hostile), "abcde");
+        // Emoji keep their variation selector.
+        assert_eq!(sanitize("\u{2764}\u{fe0f}"), "\u{2764}\u{fe0f}");
+        let label = tab_label(&LabelInput {
+            rename: None,
+            pane: Some(&pane("\u{202e}evil\u{3164}", "", None)),
+            agent: None,
+            shell: "zsh",
+        });
+        assert_eq!(label, "evil");
     }
 
     fn sample() -> Vec<Segment> {

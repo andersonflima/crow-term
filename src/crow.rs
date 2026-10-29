@@ -734,20 +734,40 @@ pub fn aged(state: &CrowState, elapsed: Duration) -> CrowState {
 // ---------------------------------------------------------------------------
 // Git branch without a subprocess
 
+/// A path on another machine: UNC (`\\host\share`, `//host/share`,
+/// `\\?\UNC\host\share`) or under an automount root (`/net`, `/Volumes`,
+/// `/Network`, `/afs`, `/smb`).
+pub fn remote_path(path: &Path) -> bool {
+    let lower = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    // `\\?\C:\…` is a local drive in verbatim form.
+    if let Some(rest) = lower.strip_prefix("//?/") {
+        return rest.starts_with("unc/");
+    }
+    lower.starts_with("//")
+        || ["/net/", "/volumes/", "/network/", "/afs/", "/smb/"]
+            .iter()
+            .any(|root| lower.starts_with(root))
+}
+
 /// Branch (or short detached SHA) of the repository containing `cwd`, reading
 /// `.git/HEAD` (directory or `gitdir:` file, as in worktrees) walking upwards.
 pub fn git_branch(cwd: &Path) -> Option<String> {
     fn read_small(path: &Path) -> Option<String> {
-        // Regular files only: opening a FIFO named HEAD would block the worker.
-        if !std::fs::metadata(path).ok()?.is_file() {
+        // Opened without blocking and checked after opening: a FIFO named
+        // HEAD (or swapped in after a check) can never block the caller.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+        let file = options.open(path).ok()?;
+        if !file.metadata().ok()?.is_file() {
             return None;
         }
         let mut text = String::new();
-        std::fs::File::open(path)
-            .ok()?
-            .take(4096)
-            .read_to_string(&mut text)
-            .ok()?;
+        file.take(4096).read_to_string(&mut text).ok()?;
         Some(text)
     }
     for dir in cwd.ancestors().take(64) {
@@ -758,11 +778,17 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
             let pointer = read_small(&dot_git)?;
             let target = pointer.trim().strip_prefix("gitdir:")?.trim();
             let target = Path::new(target);
-            if target.is_absolute() {
+            let target = if target.is_absolute() {
                 target.to_path_buf()
             } else {
                 dir.join(target)
+            };
+            // A `gitdir:` pointing at the network is never followed: reading
+            // an SMB path would hand the user's credentials (NTLM) to it.
+            if remote_path(&target) {
+                return None;
             }
+            target
         } else {
             continue;
         };

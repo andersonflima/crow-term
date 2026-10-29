@@ -135,6 +135,8 @@ pub struct Server {
     /// When a GUI last watched (ms since start): summaries are refreshed only
     /// while one is attached.
     last_watch: std::sync::atomic::AtomicU64,
+    /// Pids of live agent sessions the GUIs asked about (`AgentPids`).
+    agent_pids: Mutex<Vec<u32>>,
     started: std::time::Instant,
     config: Config,
 }
@@ -156,6 +158,7 @@ impl Server {
             stopped: AtomicBool::new(false),
             summaries: Mutex::default(),
             last_watch: std::sync::atomic::AtomicU64::new(0),
+            agent_pids: Mutex::default(),
             started: std::time::Instant::now(),
             config: config.clone(),
         }
@@ -413,6 +416,13 @@ impl Server {
                 validate_size(size)?;
                 self.pane(pane)?.resize_with_cell(size, cell)?;
             }
+            Request::AgentPids { mut pids } => {
+                pids.truncate(256);
+                if let Ok(mut current) = self.agent_pids.lock() {
+                    *current = pids;
+                }
+                return Ok(Response::Ok);
+            }
             Request::PaneCwd { pane } => return Ok(Response::Cwd(self.pane(pane)?.cwd())),
             Request::Clipboard { pane } => {
                 return Ok(Response::Clipboard(self.pane(pane)?.clipboard()?));
@@ -550,9 +560,15 @@ impl Server {
                 .collect(),
             Err(_) => return,
         };
-        // One process table per refresh: who is whose child (agents under a
-        // runtime or wrapper belong to the pane whose job started them).
-        let children = {
+        // A process table only while agent sessions are live: who is whose
+        // child, so an agent under a runtime or wrapper is found in the job
+        // of the pane that started it.
+        let agents = self
+            .agent_pids
+            .lock()
+            .map(|pids| pids.clone())
+            .unwrap_or_default();
+        let children = (!agents.is_empty()).then(|| {
             use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
             let mut system = System::new();
             system.refresh_processes_specifics(
@@ -570,10 +586,13 @@ impl Server {
                 }
             }
             children
-        };
+        });
         let fresh: HashMap<u64, crate::model::PaneSummary> = engines
             .into_iter()
-            .map(|(id, engine)| (id, engine.summary(Some(&children))))
+            .map(|(id, engine)| {
+                let tree = children.as_ref().map(|c| (c, agents.as_slice()));
+                (id, engine.summary(tree))
+            })
             .collect();
         let changed = match self.summaries.lock() {
             Ok(mut cache) if *cache != fresh => {
@@ -732,18 +751,16 @@ mod tests {
             let view = server.view(Some("s"), window, Some(0)).unwrap();
             if let Some((_, summary)) = view.panes.iter().find(|(id, _)| *id == pane)
                 && summary.process == "sleep"
-                && summary.pids.len() >= 2
             {
                 break summary.clone();
             }
             assert!(std::time::Instant::now() < deadline, "no summary");
             std::thread::sleep(Duration::from_millis(50));
         };
-        assert!(summary.pid.is_some());
+        let leader = summary.pid.unwrap();
         assert_eq!(
-            summary.pids[0],
-            summary.pid.unwrap(),
-            "the job leader first"
+            summary.agent_pid, None,
+            "no agent pids asked about: no process scan"
         );
         assert!(
             server.signals.revision() > revision,
@@ -753,6 +770,38 @@ mod tests {
         let settled = server.signals.revision();
         server.refresh_summaries();
         assert_eq!(server.signals.revision(), settled);
+        // An agent session whose process is a child of the pane's job (here
+        // the background `sleep 29`) is matched by the daemon.
+        let child = {
+            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            system
+                .processes()
+                .iter()
+                .find(|(_, p)| p.parent().map(|p| p.as_u32()) == Some(leader))
+                .map(|(pid, _)| pid.as_u32())
+                .expect("the background child")
+        };
+        server
+            .handle(Request::AgentPids {
+                pids: vec![999_999_999, child],
+            })
+            .unwrap();
+        server.refresh_summaries();
+        let view = server.view(Some("s"), window, Some(0)).unwrap();
+        let matched = view
+            .panes
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .unwrap()
+            .1
+            .agent_pid;
+        assert_eq!(matched, Some(child));
         server
             .handle(Request::KillSession {
                 session: "s".into(),

@@ -658,7 +658,7 @@ fn shortened_tab_and_footer_text_open_whole_on_click_and_hover() {
         cwd: Some("/a/very/deep/directory/that/does/not/fit/in/the/footer/at/all".into()),
         repo: None,
         agent: None,
-        pids: vec![1],
+        agent_pid: None,
     }
     };
     app.tab_context

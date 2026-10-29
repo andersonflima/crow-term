@@ -952,10 +952,10 @@ print(json.dumps({"schema_version": 1, "ok": True, "command": "events", "data": 
 """
 
 
-def agent_stand_in(work):
+def agent_stand_in(work, folder="agent-bin"):
     """A real program named like an agent CLI (built from C, or a copy of
     PING.EXE on Windows): the pane's own process, matched by its pid."""
-    bin_dir = work / "agent-bin"
+    bin_dir = work / folder
     bin_dir.mkdir(exist_ok=True)
     if os.name == "nt":
         source = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE"
@@ -1021,10 +1021,24 @@ def j19_tab_context(ctx):
     if created.returncode:
         raise AssertionError(f"new-session: {created.stderr}")
     pid = eventually(lambda: pid_of(program), 20, what="the agent stand-in's process")
+    # Second pane: the agent is a child of the shell, as when typed at a
+    # prompt (Unix: under a `sh -c` job; Windows: under PowerShell, the pane's
+    # own program). Matched through the daemon's process tree.
+    child_program, child_args = agent_stand_in(work, "agent-bin-child")
+    ctx.run.rpc("--cwd", real, "new-session", "agentchild")
+    child_pane = first_pane(ctx, "agentchild")
+    quiet_screen(ctx, child_pane)
+    if os.name == "nt":
+        ctx.run.send_keys(child_pane, f"& '{child_program}' {' '.join(child_args)}\r")
+    else:
+        ctx.run.send_keys(child_pane, f"sh -c \"'{child_program}'; true\"\r")
+    child_pid = eventually(lambda: pid_of(child_program), 20, what="the child agent stand-in's process")
+    session = lambda agent_pid, age: {"schema": "crow-session/1", "host": "claude", "state": "working",
+                                      "blocked": False, "cwd": real, "model": "claude-opus-5-5",
+                                      "currentTool": "Bash", "pid": agent_pid,
+                                      "usage": {"used_percentage": 57}, "ageSeconds": age}
     snapshot = {
-        "sessions": [{"schema": "crow-session/1", "host": "claude", "state": "working", "blocked": False,
-                      "cwd": real, "model": "claude-opus-5-5", "currentTool": "Bash", "pid": pid,
-                      "usage": {"used_percentage": 57}, "ageSeconds": 1}],
+        "sessions": [session(pid, 1), session(child_pid, 2)],
         "runs": [{"id": "r1", "title": "Fixture task", "cwd": real, "status": "running",
                   "done": 3, "failed": 0, "total": 8, "running": 1, "agents": []}],
     }
@@ -1037,11 +1051,22 @@ def j19_tab_context(ctx):
         frame = gui.wait_frame(lambda m, i: m["footer"][:4] == want and m["tabs"][:1] == ["claude · Fixture task"],
                                timeout=30, what=f"footer {want} and tab 'claude · Fixture task'")
         footer, tab = frame[1]["footer"], frame[1]["tabs"][0]
-        if footer[-1] != "crow on · 1 active":
+        if footer[-1] != "crow on · 2 active":
             raise AssertionError(f"global segment: {footer}")
     finally:
         gui.kill()
-    return f"agent pid {pid}: footer {footer}; tab {tab!r}", [ctx.save_frame("j19-tab-context", frame)]
+    child_gui = ctx.run.launch("agentchild", attach=True, name="agentchild", config=config)
+    try:
+        child_gui.wait_frame(lambda m, i: m["revision"] > 0, what="agentchild frame")
+        ctx.driver.attach(child_gui)
+        child_frame = child_gui.wait_frame(
+            lambda m, i: m["footer"][:2] == want[:2] and m["tabs"][:1] == ["claude · Fixture task"],
+            timeout=30, what="the shell's child agent in the footer and the tab")
+    finally:
+        child_gui.kill()
+    return (f"agent pid {pid}: footer {footer}; tab {tab!r}; agent under the shell (pid {child_pid}): "
+            f"footer {child_frame[1]['footer']}"), \
+        [ctx.save_frame("j19-tab-context", frame), ctx.save_frame("j19-child-agent", child_frame)]
 
 
 @journey("J11", "a daemon that keeps stalling is waited for, never reported as disconnected")
