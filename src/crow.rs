@@ -1693,6 +1693,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn network_gitdirs_and_fifos_are_never_read() {
+        for remote in [
+            "\\\\host\\share\\repo.git",
+            "//host/share/repo.git",
+            "\\\\?\\UNC\\host\\share",
+            "/net/host/repo",
+            "/Volumes/share/repo",
+            "/Network/Servers/x",
+            "/afs/cell/repo",
+        ] {
+            assert!(remote_path(Path::new(remote)), "{remote}");
+        }
+        for local in [
+            "/home/u/repo/.git/worktrees/x",
+            "C:\\Users\\u\\repo",
+            "\\\\?\\C:\\Users\\u\\repo",
+        ] {
+            assert!(!remote_path(Path::new(local)), "{local}");
+        }
+        let dir = tempfile_dir();
+        std::fs::write(dir.join(".git"), "gitdir: //attacker.example/share/x\n").unwrap();
+        assert_eq!(git_branch(&dir), None, "a network gitdir is not followed");
+        #[cfg(unix)]
+        {
+            // A FIFO named HEAD: reading it must not block.
+            std::fs::remove_file(dir.join(".git")).unwrap();
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            let fifo = dir.join(".git/HEAD");
+            let name = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+            // SAFETY: valid NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = dir.clone();
+            thread::spawn(move || tx.send(git_branch(&path)).unwrap());
+            assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), None);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tempfile_dir() -> PathBuf {
         let dir = std::fs::canonicalize(std::env::temp_dir())
             .unwrap()
