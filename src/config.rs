@@ -10,7 +10,7 @@ pub struct Config {
     pub line_height: f32,
     pub ligatures: bool,
     /// Lowest WCAG contrast ratio between text and its cell background
-    /// (1.0 = off, up to 21.0). Text below it is darkened or lightened,
+    /// (default 4.5, WCAG AA for normal text; 1.0 = off, up to 21.0). Text below it is darkened or lightened,
     /// keeping its hue: programs that hard-code colors for a dark background
     /// stay readable on a light one.
     pub minimum_contrast: f32,
@@ -154,7 +154,7 @@ impl Default for Config {
             font_size: 18.0,
             line_height: 1.25,
             ligatures: true,
-            minimum_contrast: 3.0,
+            minimum_contrast: 4.5,
             scrollback: 10000,
             background: "#FFFFFF".into(),
             foreground: "#444444".into(),
