@@ -466,7 +466,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
       - name: Publish (platform packages first, then the launcher)
-        if: env.PUBLISH == 'true'
+        # Off until the npm packages are bootstrapped and Trusted Publishing is
+        # set up on npmjs.com (docs/release.md); set the repository variable
+        # NPM_PUBLISH=true to turn it on. The packages are still built, smoke
+        # tested and uploaded as the npm-packages artifact.
+        if: env.PUBLISH == 'true' && vars.NPM_PUBLISH == 'true'
         run: |
           # Alpha-only project: prereleases also take the `latest` tag so that
           # `npm i -g @andespindola/crow-term` installs them (npm 11 requires an
