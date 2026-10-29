@@ -109,7 +109,67 @@ brew install andersonflima/tap/crow-term          # CLI + app in libexec (macOS/
 brew install --cask andersonflima/tap/crow-term   # Crow Term.app + crow-term on PATH (macOS)
 ```
 
-Both provide a `crow-term` command; install one of them, not both.
+The formula, the cask and the npm package (below) each provide a `crow-term`
+command: install one of them, not several. They would also share one daemon:
+every `crow-term` of the same user talks to the same runtime socket, so two
+installed versions would drive each other's daemon (and `stop --force` from one
+ends the sessions of the other).
+
+## npm
+
+On a tag, after the GitHub Release, the `npm` job of `release.yml` builds six
+packages from the release archives with `scripts/npm_package.py` (version from
+Cargo.toml) and publishes them with npm Trusted Publishing (OIDC, no token):
+
+| Package | Contents |
+|---|---|
+| `@andespindola/crow-term` | `bin/crow-term.js` launcher; every platform package as an exact-version `optionalDependency` |
+| `@andespindola/crow-term-darwin-arm64`, `-darwin-x64` | the signed (and notarized, when the release is) `Crow Term.app` |
+| `@andespindola/crow-term-linux-x64`, `-linux-arm64` | `crow-term` and `shell/`; `"libc": ["glibc"]` |
+| `@andespindola/crow-term-win32-x64` | `crow-term.exe` and `shell/` |
+
+npm installs only the platform package whose `os`/`cpu` (and, on Linux, `libc`)
+match; there are no install scripts and nothing is downloaded at install or run
+time. Every package carries `LICENSE`, `NOTICE.md` and the font and theme
+licenses NOTICE.md points to (`assets/fonts/OFL.txt`, `assets/theme-license.txt`);
+the third-party texts are in `THIRD_PARTY_LICENSES.txt`, or inside the bundle
+(`Crow Term.app/Contents/Resources/`) for macOS.
+
+Linux binaries are built on Ubuntu 22.04 and need glibc 2.35 or newer; the
+build records the exact minimum (newest `GLIBC_` symbol version) in
+`dist/status/<target>.json`, the package README states it, and the launcher
+refuses to start with a clear message on an older glibc or on musl (Alpine).
+
+On a tag the job refuses to publish when a macOS build is only ad-hoc signed
+(`dist/status/macos-*.json` must say `"signed": true`; not notarized is a
+warning). npm itself is pinned to an exact version in that job, which holds
+`id-token: write`. Platform
+packages are published first, the launcher last. Prereleases also take the
+`latest` dist-tag while the project is alpha-only, so `npm i -g
+@andespindola/crow-term` installs them. A `workflow_dispatch` run builds, packs
+and smoke-tests the linux-x64 layout (`crow-term --version` through the
+launcher) without publishing.
+
+One-time setup by the npm account owner, per package (six times): the package
+must exist before a trusted publisher can be attached. Create it with a
+**placeholder version, never a real release version** (npm versions can never be
+replaced, and a real version published by hand would not be the CI build):
+
+```sh
+mkdir bootstrap && cd bootstrap
+printf '{"name":"@andespindola/crow-term-linux-x64","version":"0.0.0-bootstrap.1","description":"Placeholder; install @andespindola/crow-term","license":"MIT"}\n' > package.json
+npm publish --access public --tag bootstrap
+npm deprecate @andespindola/crow-term-linux-x64@0.0.0-bootstrap.1 "placeholder, not a release"
+```
+
+(repeat with each of the six names; increment `N` in `0.0.0-bootstrap.N` if a
+name needs a second attempt), then on npmjs.com → package → Settings → Trusted
+Publisher add GitHub Actions `andersonflima/crow-term`, workflow `release.yml`
+(or `npm trust github`). Until that is done for a package, its publish fails and
+the job stops before the launcher is published. A version already on the
+registry is skipped only when its `dist.integrity` equals the tarball the job
+just packed (a re-run after a partial failure); any other tarball under that
+version fails the job instead of being accepted.
 
 ## Verify a release
 

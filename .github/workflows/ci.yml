@@ -61,6 +61,8 @@ jobs:
         run: python tests/shell_setup.py
       - name: Homebrew tap renderer
         run: python tests/update_tap_test.py
+      - name: npm packages and launcher
+        run: python tests/npm_package_test.py
       - name: GUI journey tooling (codecs, diff, grid lookup)
         run: python tests/gui_tools_test.py
       - run: cargo clippy --locked --all-targets -- -D warnings

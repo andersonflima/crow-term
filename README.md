@@ -25,6 +25,13 @@ brew install andersonflima/tap/crow-term          # command-line install, macOS 
 brew install --cask andersonflima/tap/crow-term   # Crow Term.app in /Applications, macOS
 ```
 
+With npm (Node 18+; installs the launcher plus only your platform's binary,
+no install scripts):
+
+```sh
+npm i -g @andespindola/crow-term
+```
+
 The macOS app is signed and notarized only when the release says so; Windows
 builds are not code-signed yet. See [docs/release.md](docs/release.md).
 
