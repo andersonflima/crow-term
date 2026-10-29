@@ -19,7 +19,7 @@ engineering alpha, not a certification of complete terminal compatibility.
 | Terminal queries and events | XTVERSION, XTGETTCAP (Tc/RGB/Smulx/Setulc/Ss/Se, Ms only with OSC 52 copy), DECRQSS (SGR, DECSCUSR), DA2 with the crow-term version, CSI 14t/16t from the GUI's real cell metrics (also TIOCSWINSZ pixels), DEC 1004 focus on pane switch, OSC 8 links kept in the snapshot (not clickable yet), visual bell, DEC 1007 alternate scroll, window title from OSC 0/2 | `src/intercept.rs`, `src/engine.rs` unit tests; GUI behaviours are covered by unit tests of their pure parts; DEC 1004 focus reports are also exercised with native focus changes in GUI journey J8 (see Graphical validation), the other GUI-side behaviours are not. Pixel reports are withheld until a GUI reported cell metrics; OSC 52 strings over the cap are discarded before decoding; OSC 8 targets are bounded (64 KiB per snapshot) |
 | Ligatures, icons, emojis | Advanced shaping, cell anchoring, fallback, raster cache; Private Use Area icons from an installed Symbols Nerd Font when the configured font lacks them | UI unit tests verify substitutions and grid alignment; GUI journey J2 checks `->`, accents, CJK width, colour emoji and Nerd icons in the renderer's frames against reviewed goldens on Linux (X11, Wayland), Windows and macOS (see Graphical validation) |
 | Crow agent status (owner request) | Footer status line + toggleable agent panel from `crow-skills events snapshot --json`; focused-pane cwd via `PaneCwd` IPC, git branch from `.git/HEAD` | `src/crow.rs` parsing/format/throttle unit tests, `src/engine.rs` cwd test; versioned, tolerant parser; read-only, no prompt content |
-| Lightweight / fast | Native renderers, no WebView; content-keyed row caches (scrolling reuses shaped rows), glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented; **no claim of maximum performance or comparative superiority** |
+| Lightweight / fast | Native renderers, no WebView; content-keyed row caches (scrolling reuses shaped rows), glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented and measured with `bench-render`; **no claim of maximum performance or comparative superiority** |
 | GPU renderer | wgpu backend (Metal / DX12 / Vulkan+GL) behind `renderer = "gpu"` or `"auto"` (`--renderer`, `CROW_TERM_RENDERER`); default stays `software`. Same `Scene` and shaping as software, R8 + RGBA glyph atlases, instanced quads, non-sRGB blending, block-cursor inversion by blend state, FIFO, no idle frames, runtime fallback to software in `auto` | `src/render/gpu.rs` unit tests; CI `gpu` jobs compare offscreen GPU frames with the software renderer (Linux lavapipe, Windows WARP, macOS Metal when exposed); a real macOS window matched the software frame byte for byte. Not validated by hand on discrete GPUs, Wayland compositors, Windows hardware drivers or mixed-DPI setups |
 
 The owner explicitly chose a **new engine**, rejecting the fork alternative, and
@@ -172,8 +172,8 @@ wire-size observations, not rendering/latency benchmarks.
   beyond daemon lifetime.
 - Manual GPU validation on real drivers (discrete/integrated GPUs on Windows and
   Linux, Wayland compositors, HiDPI and mixed-DPI moves) before `auto` becomes
-  the default; controlled startup/RSS/throughput and present-time
-  comparisons between the renderers.
+  the default; end-to-end input latency and present-time comparisons on a
+  visible window (`CROW_TERM_FRAME_STATS`).
 - Release pipeline exists (`.github/workflows/release.yml`, [release](release.md)):
   macOS Developer ID signing and notarization run only when the signing/notary
   secrets are configured, otherwise builds are explicitly unsigned; Linux

@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod bench;
 #[cfg(test)]
 pub(crate) mod golden;
 pub mod gpu;
