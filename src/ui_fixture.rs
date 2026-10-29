@@ -444,3 +444,117 @@ fn gpu_atlas_overflow_draws_the_rest_of_the_frame_and_recovers() {
     assert!(diff.within(tolerance), "{diff:?}");
     assert_eq!(gpu.take_dropped_glyphs(), 0);
 }
+
+#[test]
+fn gpu_failure_policy_recreates_once_then_ends() {
+    use crate::config::RendererMode;
+    assert_eq!(
+        gpu_failure_action(RendererMode::Gpu, 1),
+        GpuFailure::RecreateDevice
+    );
+    assert_eq!(gpu_failure_action(RendererMode::Gpu, 2), GpuFailure::Fatal);
+    assert_eq!(gpu_failure_action(RendererMode::Gpu, 9), GpuFailure::Fatal);
+    for failures in [1, 2, 9] {
+        assert_eq!(
+            gpu_failure_action(RendererMode::Auto, failures),
+            GpuFailure::SwitchToSoftware
+        );
+    }
+}
+
+#[test]
+fn skipped_gpu_frames_retry_with_capped_backoff_and_presenting_resets() {
+    let mut app = app(Config::default(), 1.0, PhysicalSize::new(400, 300));
+    let mut delays = Vec::new();
+    for _ in 0..8 {
+        let before = Instant::now();
+        app.note_gpu_frame(false);
+        let due = app.retry_due.expect("retry scheduled");
+        delays.push((due - before).as_millis());
+    }
+    // 50, 100, 200, 400, 800, then capped at one second: never a busy loop.
+    assert!(delays[0] >= 50 && delays[0] < 80, "{delays:?}");
+    assert!(
+        delays.windows(2).all(|pair| pair[1] >= pair[0]),
+        "{delays:?}"
+    );
+    assert!(delays[7] >= 1000 && delays[7] < 1100, "{delays:?}");
+    app.gpu_failures = 1;
+    app.note_gpu_frame(true);
+    assert_eq!((app.gpu_failures, app.retry_due), (0, None));
+    assert_eq!(app.retry_delay, FRAME_RETRY_MIN);
+}
+
+#[test]
+fn auto_falls_back_to_software_and_a_failed_fallback_ends_the_session() {
+    use crate::config::RendererMode;
+    let mut app = app(Config::default(), 1.0, PhysicalSize::new(400, 300));
+    app.renderer_mode = RendererMode::Auto;
+    let result = app.recover_from_gpu_error(
+        anyhow::anyhow!("device lost"),
+        || panic!("auto never recreates the GPU device"),
+        |_| Ok(()),
+    );
+    assert!(result.is_ok());
+    assert!(app.fatal_error.is_none());
+    assert!(
+        app.status.contains("switched to software"),
+        "{}",
+        app.status
+    );
+    // The software backend cannot start either: no frozen window, the
+    // session ends with both errors.
+    let result = app.recover_from_gpu_error(
+        anyhow::anyhow!("device lost"),
+        || panic!("auto never recreates the GPU device"),
+        |_| Err(anyhow::anyhow!("no native surface")),
+    );
+    assert!(result.is_err());
+    let fatal = app.fatal_error.clone().expect("fatal error set");
+    assert!(
+        fatal.contains("device lost") && fatal.contains("no native surface"),
+        "{fatal}"
+    );
+}
+
+#[test]
+fn gpu_mode_recreates_the_device_once_per_presented_frame() {
+    use crate::config::RendererMode;
+    let mut app = app(Config::default(), 1.0, PhysicalSize::new(400, 300));
+    app.renderer_mode = RendererMode::Gpu;
+    // Recreation itself failing ends the session.
+    let result = app.recover_from_gpu_error(
+        anyhow::anyhow!("device lost"),
+        || Err(anyhow::anyhow!("no adapter")),
+        |_| panic!("gpu mode never switches to software"),
+    );
+    assert!(result.is_err());
+    assert!(
+        app.fatal_error
+            .take()
+            .is_some_and(|f| f.contains("no adapter"))
+    );
+    let Some(gpu) = gpu_or_skip("gpu_mode_recreates_the_device_once_per_presented_frame") else {
+        return;
+    };
+    app.gpu_failures = 0;
+    let result = app.recover_from_gpu_error(
+        anyhow::anyhow!("device lost"),
+        move || Ok(gpu),
+        |_| panic!("gpu mode never switches to software"),
+    );
+    assert!(result.is_ok() && app.gpu.is_some() && app.fatal_error.is_none());
+    // A second failure before any frame was presented must not loop on new
+    // devices: it ends with the error.
+    let result = app.recover_from_gpu_error(
+        anyhow::anyhow!("device lost again"),
+        || panic!("no second device without a presented frame"),
+        |_| panic!("gpu mode never switches to software"),
+    );
+    assert!(result.is_err());
+    assert!(
+        app.fatal_error
+            .as_deref()
+            .is_some_and(|f| f.contains("device lost again"))
+    );
+}
