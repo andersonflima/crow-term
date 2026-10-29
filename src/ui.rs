@@ -2242,6 +2242,7 @@ impl App {
             stuck_pane: self.stuck.map(|(pane, _)| pane),
             footer: self.drawn.footer.clone(),
             tabs: self.drawn.tabs.clone(),
+            labels_settled: self.label_due.is_none(),
             hover_link: self.hover_link.as_ref().map(|(_, hit)| hit.url.clone()),
         };
         if let Err(error) = dump.write(frame, size.width, size.height, &meta) {

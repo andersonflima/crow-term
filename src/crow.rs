@@ -820,7 +820,8 @@ fn no_symlinks_below(path: &Path, root: &Path) -> bool {
 /// Branch (or short detached SHA) of the repository containing `cwd`, reading
 /// `.git/HEAD` (directory or `gitdir:` file, as in worktrees) walking upwards.
 /// Nothing is executed and no symlink is followed; a `gitdir:` pointer is
-/// followed only to a local path under the user's home or the repository.
+/// followed only to a local path under the user's home, the repository or
+/// the enclosing repository (a superproject's `.git/modules`).
 pub fn git_branch(cwd: &Path) -> Option<String> {
     let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     git_branch_with_home(cwd, home.as_deref())
@@ -861,7 +862,13 @@ fn git_branch_with_home(cwd: &Path, home: Option<&Path>) -> Option<String> {
             let pointer = read_regular(&dot_git)?;
             let raw = pointer.trim().strip_prefix("gitdir:")?.trim();
             let target = normalize(dir, Path::new(raw));
-            let roots: Vec<&Path> = [Some(dir), home].into_iter().flatten().collect();
+            // Also the enclosing repository (a real `.git` directory above):
+            // a submodule's gitdir lives in its superproject's `.git/modules`.
+            let enclosing = dir.ancestors().skip(1).take(64).find(|above| {
+                std::fs::symlink_metadata(above.join(".git"))
+                    .is_ok_and(|meta| meta.file_type().is_dir())
+            });
+            let roots: Vec<&Path> = [Some(dir), home, enclosing].into_iter().flatten().collect();
             if !allowed_gitdir(raw, &target, &roots) {
                 return None;
             }
@@ -1107,6 +1114,18 @@ impl Shared {
     }
 }
 
+/// A view is published at least this often even when unchanged: the GUI
+/// resends its agent pids to the daemon on each view, and the daemon drops
+/// a list not resent within `server::AGENT_PIDS_TTL`.
+pub const KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// How long the worker sleeps between ticks: its schedule's tick, but never
+/// longer than the keepalive (slow intervals and unfocused windows tick
+/// every minute or more).
+pub fn wake_interval(tick: Duration) -> Duration {
+    tick.min(KEEPALIVE)
+}
+
 /// Start the worker. `publish` returns false once the UI is gone. `cwd_of` asks
 /// the daemon for a pane's working directory; `Err` means the request itself
 /// failed (e.g. an older daemon that does not know it), and after a few in a row
@@ -1139,9 +1158,6 @@ pub fn spawn(
             let mut source = Source::Pending;
             let mut fetched_at = Instant::now();
             let mut last_sent: Option<CrowView> = None;
-            // Published at least this often even when unchanged: the GUI
-            // resends its agent pids to the daemon on each view.
-            const KEEPALIVE: Duration = Duration::from_secs(15);
             let mut sent_at = Instant::now();
             let mut cwd_cache: Option<(u64, Option<String>)> = None;
             let mut first = true;
@@ -1150,7 +1166,7 @@ pub fn spawn(
             while shared.running.load(Ordering::Relaxed) {
                 if !first {
                     let focused = shared.focused.load(Ordering::Relaxed);
-                    match wakes.recv_timeout(schedule.tick(focused)) {
+                    match wakes.recv_timeout(wake_interval(schedule.tick(focused))) {
                         Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => break,
                     }
@@ -1824,6 +1840,36 @@ mod tests {
                 .as_deref(),
             Some("main")
         );
+        // A submodule outside the home: its gitdir is in the superproject's
+        // `.git/modules`, under the nearest real `.git` directory above it.
+        let outside = Some(Path::new("/nonexistent-home"));
+        let superproject = home.join("super");
+        std::fs::create_dir_all(superproject.join(".git/modules/sub")).unwrap();
+        std::fs::write(
+            superproject.join(".git/modules/sub/HEAD"),
+            "ref: refs/heads/sub-main\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(superproject.join("sub/src")).unwrap();
+        std::fs::write(
+            superproject.join("sub/.git"),
+            "gitdir: ../.git/modules/sub\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_branch_with_home(&superproject.join("sub/src"), outside).as_deref(),
+            Some("sub-main")
+        );
+        // A pointer out of the enclosing repository is still refused.
+        std::fs::write(
+            superproject.join("sub/.git"),
+            "gitdir: ../../repo/real.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            git_branch_with_home(&superproject.join("sub"), outside),
+            None
+        );
         // Every reviewer bypass is refused before anything is opened.
         let depth = "../".repeat(repo.components().count() + 2);
         for hostile in [
@@ -1872,6 +1918,23 @@ mod tests {
             assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), None);
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_keepalive_outruns_the_daemon_ttl_at_any_interval_focused_or_not() {
+        for interval in [1_000u64, 2_000, 11_250, 30_000, 60_000] {
+            let schedule = Schedule::new(Duration::from_millis(interval));
+            for focused in [true, false] {
+                let wake = wake_interval(schedule.tick(focused));
+                assert!(
+                    wake <= KEEPALIVE,
+                    "{interval} ms, focused {focused}: {wake:?}"
+                );
+            }
+        }
+        // A list is resent (keepalive plus one worker pass) well before the
+        // daemon forgets it.
+        assert!(crate::server::AGENT_PIDS_TTL >= KEEPALIVE * 2 + KEEPALIVE / 2);
     }
 
     fn tempfile_dir() -> PathBuf {
