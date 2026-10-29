@@ -550,9 +550,30 @@ impl Server {
                 .collect(),
             Err(_) => return,
         };
+        // One process table per refresh: who is whose child (agents under a
+        // runtime or wrapper belong to the pane whose job started them).
+        let children = {
+            use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing(),
+            );
+            let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+            for (pid, process) in system.processes() {
+                if let Some(parent) = process.parent() {
+                    children
+                        .entry(parent.as_u32())
+                        .or_default()
+                        .push(pid.as_u32());
+                }
+            }
+            children
+        };
         let fresh: HashMap<u64, crate::model::PaneSummary> = engines
             .into_iter()
-            .map(|(id, engine)| (id, engine.summary()))
+            .map(|(id, engine)| (id, engine.summary(Some(&children))))
             .collect();
         let changed = match self.summaries.lock() {
             Ok(mut cache) if *cache != fresh => {
@@ -682,7 +703,8 @@ mod tests {
                 session: "s".into(),
                 shell: ShellSpec {
                     program: "/bin/sh".into(),
-                    args: vec!["-c".into(), "exec sleep 30".into()],
+                    // A background child of the foreground job: in its tree.
+                    args: vec!["-c".into(), "sleep 29 & exec sleep 30".into()],
                     cwd: None,
                 },
                 size: Size::default(),
@@ -710,6 +732,7 @@ mod tests {
             let view = server.view(Some("s"), window, Some(0)).unwrap();
             if let Some((_, summary)) = view.panes.iter().find(|(id, _)| *id == pane)
                 && summary.process == "sleep"
+                && summary.pids.len() >= 2
             {
                 break summary.clone();
             }
@@ -717,6 +740,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(summary.pid.is_some());
+        assert_eq!(summary.pids[0], summary.pid.unwrap(), "the job leader first");
         assert!(
             server.signals.revision() > revision,
             "a changed summary wakes watchers"

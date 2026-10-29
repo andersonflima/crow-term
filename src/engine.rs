@@ -679,6 +679,8 @@ pub struct Engine {
     summary: Mutex<SummaryCache>,
 }
 
+/// (pid, read at, name, safe args, agent CLI).
+type CachedProcess = (u32, std::time::Instant, String, Vec<String>, Option<String>);
 /// (pid, read at, cwd, (repository name, branch)).
 type CachedPlace = (
     u32,
@@ -689,7 +691,8 @@ type CachedPlace = (
 
 #[derive(Default)]
 struct SummaryCache {
-    process: Option<(u32, std::time::Instant, String, Vec<String>)>,
+    /// (pid, read at, name, safe args, agent CLI).
+    process: Option<CachedProcess>,
     cwd: Option<CachedPlace>,
     tty: Option<String>,
     title: String,
@@ -1186,7 +1189,12 @@ impl Engine {
     /// daemon's summary thread, never on a request: the foreground job is one
     /// syscall; its name and arguments are read once per job, its cwd at most
     /// every 2 s; the title is read only if the pane's state is free.
-    pub fn summary(&self) -> crate::model::PaneSummary {
+    /// `children` lists processes by parent (built once per refresh by the
+    /// caller) to find the foreground job's descendants.
+    pub fn summary(
+        &self,
+        children: Option<&std::collections::HashMap<u32, Vec<u32>>>,
+    ) -> crate::model::PaneSummary {
         use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
         // Never waits on the pane: a busy pane keeps its last known title.
         let title = match self.state.try_lock() {
@@ -1235,7 +1243,7 @@ impl Engine {
         };
         let pid = foreground
             .or_else(child)
-            .or(cache.process.as_ref().map(|(pid, _, _, _)| *pid));
+            .or(cache.process.as_ref().map(|(pid, _, _, _, _)| *pid));
         if cache.tty.is_none() {
             cache.tty = tty;
         }
@@ -1247,7 +1255,7 @@ impl Engine {
         let id = Pid::from_u32(pid);
         // Re-read every 2 s even for the same pid: `exec` keeps the pid and
         // changes the program.
-        if cache.process.as_ref().is_none_or(|(cached, at, _, _)| {
+        if cache.process.as_ref().is_none_or(|(cached, at, _, _, _)| {
             *cached != pid || at.elapsed() >= std::time::Duration::from_secs(2)
         }) {
             let mut system = System::new();
@@ -1256,23 +1264,30 @@ impl Engine {
                 false,
                 ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
             );
-            let (name, args) = system.process(id).map_or_else(Default::default, |process| {
+            let (name, args, agent) = system.process(id).map_or_else(Default::default, |process| {
                 let name = process.name().to_string_lossy().into_owned();
-                let args: Vec<String> = process
+                let argv: Vec<String> = process
                     .cmd()
                     .iter()
-                    .skip(1)
                     .map(|arg| arg.to_string_lossy().into_owned())
                     .collect();
-                let args = crate::tab_context::safe_args(&name, &args);
-                (name, args)
+                // argv stays here: only the safe argument and the
+                // recognized agent CLI leave the daemon.
+                let agent = crate::tab_context::agent_cli(&name, &argv);
+                let args = crate::tab_context::safe_args(&name, argv.get(1..).unwrap_or_default());
+                (name, args, agent)
             });
-            cache.process = Some((pid, std::time::Instant::now(), name, args));
+            cache.process = Some((pid, std::time::Instant::now(), name, args, agent));
         }
-        if let Some((_, _, name, args)) = &cache.process {
+        if let Some((_, _, name, args, agent)) = &cache.process {
             summary.process = name.clone();
             summary.args = args.clone();
+            summary.agent = agent.clone();
         }
+        summary.pids = match children {
+            Some(children) => crate::tab_context::job_tree(pid, children, 64),
+            None => vec![pid],
+        };
         let fresh = cache.cwd.as_ref().is_some_and(|(cached, at, _, _)| {
             *cached == pid && at.elapsed() < std::time::Duration::from_secs(2)
         });
@@ -1938,7 +1953,7 @@ mod tests {
         wait_for(&engine, |s| s.title == "Crow Title");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let summary = loop {
-            let summary = engine.summary();
+            let summary = engine.summary(None);
             if summary.process == "less" || std::time::Instant::now() > deadline {
                 break summary;
             }

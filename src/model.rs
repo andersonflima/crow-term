@@ -205,6 +205,11 @@ pub struct PaneSummary {
     pub cwd: Option<String>,
     /// (repository name, branch) of `cwd`, read from `.git` files only.
     pub repo: Option<(String, String)>,
+    /// The agent CLI in the foreground, recognized by the daemon from the
+    /// program name or the script a runtime runs (argv itself is never sent).
+    pub agent: Option<String>,
+    /// Process ids of the foreground job and its descendants (bounded).
+    pub pids: Vec<u32>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {

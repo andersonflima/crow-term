@@ -141,10 +141,15 @@ nvim main.rs · ~/w/crow-term                                                   
 
 - With an agent CLI (claude, codex, gemini, agy, devin) in the foreground of
   the pane: the agent and its state, its task (the crow-behaviour run of its
-  directory) or tool, the run's progress, model and context use. The crow
-  session must be that CLI's: matched by process id, then terminal, else the
-  only session of that CLI in the pane's directory (two there: nothing is
-  guessed). Sessions whose process is gone are ignored.
+  directory) or tool, the run's progress, model and context use. A crow
+  session belongs to the pane when its process is the pane's foreground job
+  or one of its descendants (whatever it is called: `node`, `bun`, a
+  wrapper). Otherwise the foreground must be that agent CLI, by name or by
+  the script a runtime runs (`node …/bin/gemini`, `@anthropic-ai/claude-code`;
+  the command line is read by the daemon and never sent to the GUI), and the
+  session is the one on the pane's terminal, else the only one of that CLI in
+  the pane's directory (two there: nothing is guessed). Sessions whose process
+  is gone are ignored.
 - Otherwise: the foreground program (with one argument only for editors and
   build tools, and only if it cannot be a secret) and the directory.
 - `repo@branch`, read from the `.git` files of the pane's directory. No `git`

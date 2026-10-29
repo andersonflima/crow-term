@@ -37,6 +37,44 @@ pub const SHELLS: [&str; 15] = [
 ];
 /// Agent CLIs matched to crow sessions.
 pub const AGENTS: [&str; 5] = ["claude", "codex", "gemini", "agy", "devin"];
+/// Script runtimes an agent CLI may run under (`node …/bin/gemini`).
+pub const RUNTIMES: [&str; 6] = ["node", "nodejs", "bun", "deno", "npx", "tsx"];
+
+/// The agent CLI a process is, from its name or, under a script runtime,
+/// from the script it runs (daemon side: argv never leaves the daemon).
+pub fn agent_cli(name: &str, argv: &[String]) -> Option<String> {
+    let program = program_name(name);
+    if AGENTS.contains(&program.as_str()) {
+        return Some(program);
+    }
+    if !RUNTIMES.contains(&program.as_str()) {
+        return None;
+    }
+    const PACKAGES: [(&str, &str); 5] = [
+        ("@google/gemini-cli", "gemini"),
+        ("gemini-cli", "gemini"),
+        ("@anthropic-ai/claude-code", "claude"),
+        ("@openai/codex", "codex"),
+        ("devin-cli", "devin"),
+    ];
+    // The script is among the first words (`node [flags] script`, `npx pkg`).
+    for arg in argv.iter().skip(1).take(4) {
+        let lower = arg.to_ascii_lowercase().replace('\\', "/");
+        if let Some((_, cli)) = PACKAGES.iter().find(|(package, _)| lower.contains(package)) {
+            return Some((*cli).to_owned());
+        }
+        let base = lower.rsplit('/').next().unwrap_or(&lower);
+        let base = ["js", "mjs", "cjs", "ts"]
+            .iter()
+            .find_map(|ext| base.strip_suffix(&format!(".{ext}")))
+            .unwrap_or(base);
+        if AGENTS.contains(&base) {
+            return Some(base.to_owned());
+        }
+    }
+    None
+}
+
 /// Programs whose first plain argument may be shown (a file, a subcommand).
 const SHOW_ARGUMENT: [&str; 20] = [
     "nvim", "vim", "vi", "nano", "hx", "helix", "emacs", "less", "more", "man", "cargo", "npm",
@@ -187,22 +225,26 @@ fn repo_label(pane: &PaneSummary) -> Option<String> {
         .map(|(name, branch)| format!("{}@{}", sanitize(name), sanitize(branch)))
 }
 
-/// The agent session running in `pane`. The pane's foreground program must
-/// be that agent CLI; then the session with the pane's process id, else with
-/// its terminal, else the only session of that CLI in the pane's directory
-/// that reports neither (two of them there: no guess).
+/// The agent session running in `pane`:
+/// * its process is the pane's foreground job or one of its descendants
+///   (whatever the program is called: `node`, `bun`, a wrapper);
+/// * else, with an agent CLI in the foreground (by name, or by the script a
+///   runtime runs), that CLI's session on the pane's terminal, else the only
+///   session of that CLI in the pane's directory that reports no process or
+///   terminal (two there: no guess).
 pub fn agent_for<'a>(pane: &PaneSummary, agents: &'a [Agent]) -> Option<&'a Agent> {
-    let process = program_name(&pane.process);
-    if !AGENTS.contains(&process.as_str()) {
-        return None;
-    }
-    let same_cli: Vec<&Agent> = agents.iter().filter(|a| a.host == process).collect();
-    if let Some(agent) = same_cli
-        .iter()
-        .find(|a| a.pid.is_some() && a.pid == pane.pid)
-    {
+    if let Some(agent) = agents.iter().find(|a| {
+        a.pid
+            .is_some_and(|pid| pane.pid == Some(pid) || pane.pids.contains(&pid))
+    }) {
         return Some(agent);
     }
+    let process = program_name(&pane.process);
+    let cli = pane
+        .agent
+        .clone()
+        .or_else(|| AGENTS.contains(&process.as_str()).then_some(process))?;
+    let same_cli: Vec<&Agent> = agents.iter().filter(|a| a.host == cli).collect();
     if !pane.tty.is_empty()
         && let Some(agent) = same_cli
             .iter()
@@ -216,6 +258,31 @@ pub fn agent_for<'a>(pane: &PaneSummary, agents: &'a [Agent]) -> Option<&'a Agen
         .filter(|a| a.pid.is_none() && a.tty.is_none() && same_dir(&a.cwd, cwd));
     let first = here.next()?;
     here.next().is_none().then_some(first)
+}
+
+/// The process ids of the job led by `leader` and its descendants (at most
+/// `limit`), from a child list by parent.
+pub fn job_tree(
+    leader: u32,
+    children: &std::collections::HashMap<u32, Vec<u32>>,
+    limit: usize,
+) -> Vec<u32> {
+    let mut out = vec![leader];
+    let mut next = 0;
+    while next < out.len() && out.len() < limit {
+        if let Some(kids) = children.get(&out[next]) {
+            for &kid in kids {
+                if out.len() >= limit {
+                    break;
+                }
+                if !out.contains(&kid) {
+                    out.push(kid);
+                }
+            }
+        }
+        next += 1;
+    }
+    out
 }
 
 fn same_dir(a: &str, b: &str) -> bool {
@@ -673,6 +740,10 @@ mod tests {
             tty: "/dev/ttys004".into(),
             cwd: cwd.map(str::to_owned),
             repo: None,
+            agent: AGENTS
+                .contains(&program_name(process).as_str())
+                .then(|| program_name(process)),
+            pids: vec![4242],
         }
     }
 
@@ -800,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_are_matched_only_to_a_pane_running_that_cli() {
+    fn agents_are_matched_to_the_pane_running_them() {
         let mut by_pid = agent("claude", "/elsewhere", 50);
         by_pid.pid = Some(4242);
         let mut codex_pid = agent("codex", "/elsewhere", 50);
@@ -814,9 +885,12 @@ mod tests {
                 .pid,
             Some(4242)
         );
-        assert!(
-            agent_for(&p, &[codex_pid.clone()]).is_none(),
-            "same pid, another CLI"
+        // The process is the pane's own: a match whatever the CLI calls itself.
+        assert_eq!(
+            agent_for(&p, std::slice::from_ref(&codex_pid))
+                .unwrap()
+                .host,
+            "codex"
         );
         assert_eq!(
             agent_for(&p, std::slice::from_ref(&by_tty))
@@ -825,8 +899,11 @@ mod tests {
                 .as_deref(),
             Some("/dev/ttys004")
         );
-        // A shell (or anything else) in front is never an agent, whatever the pid says.
-        let shell = pane("zsh", "", Some("/w/crow-term"));
+        // A shell in front: only a session whose process is in the pane's job
+        // counts (an agent that exited leaves the shell in front).
+        let mut shell = pane("zsh", "", Some("/w/crow-term"));
+        shell.pid = Some(77);
+        shell.pids = vec![77];
         assert!(agent_for(&shell, &[by_pid.clone(), by_tty.clone()]).is_none());
         // By directory only when exactly one session there reports no pid/tty.
         let one = agent("claude", "/w/crow-term/", 2);
@@ -851,6 +928,86 @@ mod tests {
             "its pid says it is another pane"
         );
         assert!(agent_for(&p, &[agent("claude", "/w/api", 1)]).is_none());
+    }
+
+    #[test]
+    fn agents_running_under_node_are_recognized_by_script_and_by_process_tree() {
+        let argv = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            agent_cli("node", &argv(&["node", "/opt/homebrew/bin/gemini"])).as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            agent_cli(
+                "node",
+                &argv(&[
+                    "node",
+                    "--no-warnings",
+                    "/usr/lib/node_modules/@google/gemini-cli/dist/index.js"
+                ])
+            )
+            .as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            agent_cli(
+                "node.exe",
+                &argv(&[
+                    "node",
+                    "C:\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js"
+                ])
+            )
+            .as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            agent_cli("bun", &argv(&["bun", "/home/u/.bun/bin/codex.js"])).as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            agent_cli("claude", &argv(&["claude"])).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(agent_cli("node", &argv(&["node", "server.js"])), None);
+        assert_eq!(
+            agent_cli("python3", &argv(&["python3", "gemini.py"])),
+            None,
+            "not a JS runtime"
+        );
+        // A pane whose foreground is `node` running gemini: matched through
+        // the script it runs, and through its process tree.
+        let mut gemini_pane = pane("node", "", Some("/w/app"));
+        gemini_pane.agent = agent_cli("node", &argv(&["node", "/opt/homebrew/bin/gemini"]));
+        gemini_pane.pid = Some(500);
+        gemini_pane.pids = vec![500, 501, 502];
+        let session = agent("gemini", "/w/app", 2);
+        assert_eq!(
+            agent_for(&gemini_pane, std::slice::from_ref(&session))
+                .unwrap()
+                .host,
+            "gemini"
+        );
+        let mut child = agent("gemini", "/elsewhere", 2);
+        child.pid = Some(502);
+        assert_eq!(
+            agent_for(&gemini_pane, std::slice::from_ref(&child))
+                .unwrap()
+                .pid,
+            Some(502),
+            "a descendant"
+        );
+        // A plain node program is not an agent.
+        let mut server = pane("node", "", Some("/w/app"));
+        server.agent = None;
+        server.pids = vec![900];
+        assert!(agent_for(&server, std::slice::from_ref(&session)).is_none());
+        // The job tree is bounded and follows parents (cycles stop).
+        let mut children = std::collections::HashMap::new();
+        children.insert(500, vec![501, 502]);
+        children.insert(502, vec![503]);
+        children.insert(503, vec![500]);
+        assert_eq!(job_tree(500, &children, 64), [500, 501, 502, 503]);
+        assert_eq!(job_tree(500, &children, 2), [500, 501]);
     }
 
     fn sample() -> Vec<Segment> {
