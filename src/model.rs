@@ -302,6 +302,9 @@ pub enum Request {
     /// panes (wire v8): the daemon reports, per pane, which one runs in its
     /// foreground job. An empty list stops the process-table scan.
     AgentPids {
+        /// Random per GUI process: each GUI's list counts until it is
+        /// replaced or goes stale (not resent for `AGENT_PIDS_TTL`).
+        client: u64,
         pids: Vec<u32>,
     },
 }

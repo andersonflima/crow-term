@@ -135,8 +135,9 @@ pub struct Server {
     /// When a GUI last watched (ms since start): summaries are refreshed only
     /// while one is attached.
     last_watch: std::sync::atomic::AtomicU64,
-    /// Pids of live agent sessions the GUIs asked about (`AgentPids`).
-    agent_pids: Mutex<Vec<u32>>,
+    /// Pids of live agent sessions each GUI asked about (`AgentPids`), with
+    /// when it last did; the union of fresh lists is matched.
+    agent_pids: Mutex<HashMap<u64, (Vec<u32>, std::time::Instant)>>,
     started: std::time::Instant,
     config: Config,
 }
@@ -416,10 +417,12 @@ impl Server {
                 validate_size(size)?;
                 self.pane(pane)?.resize_with_cell(size, cell)?;
             }
-            Request::AgentPids { mut pids } => {
+            Request::AgentPids { client, mut pids } => {
                 pids.truncate(256);
-                if let Ok(mut current) = self.agent_pids.lock() {
-                    *current = pids;
+                if let Ok(mut lists) = self.agent_pids.lock() {
+                    lists.retain(|_, (_, at)| at.elapsed() < AGENT_PIDS_TTL);
+                    lists.truncate_to(64);
+                    lists.insert(client, (pids, std::time::Instant::now()));
                 }
                 return Ok(Response::Ok);
             }
@@ -541,7 +544,40 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A GUI resends its agent pids at least this often (crow keepalive); a
+/// list older than this belongs to a GUI that is gone.
+pub const AGENT_PIDS_TTL: Duration = Duration::from_secs(45);
+
+trait TruncateTo {
+    fn truncate_to(&mut self, max: usize);
+}
+impl<K: Copy + Eq + std::hash::Hash, V> TruncateTo for HashMap<K, (V, std::time::Instant)> {
+    /// Keep at most `max` entries, dropping the oldest.
+    fn truncate_to(&mut self, max: usize) {
+        while self.len() >= max {
+            let Some(oldest) = self.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+    }
+}
+
 impl Server {
+    /// The union of the fresh agent pid lists of every GUI.
+    fn agent_pids(&self) -> Vec<u32> {
+        let Ok(lists) = self.agent_pids.lock() else {
+            return Vec::new();
+        };
+        let mut pids: Vec<u32> = lists
+            .values()
+            .filter(|(_, at)| at.elapsed() < AGENT_PIDS_TTL)
+            .flat_map(|(pids, _)| pids.iter().copied())
+            .collect();
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    }
     /// Summaries serve tab labels and the status bar of attached GUIs: none
     /// when both are off, or when no GUI watched in the last 5 s.
     fn summaries_wanted(&self) -> bool {
@@ -563,11 +599,7 @@ impl Server {
         // A process table only while agent sessions are live: who is whose
         // child, so an agent under a runtime or wrapper is found in the job
         // of the pane that started it.
-        let agents = self
-            .agent_pids
-            .lock()
-            .map(|pids| pids.clone())
-            .unwrap_or_default();
+        let agents = self.agent_pids();
         let children = (!agents.is_empty()).then(|| {
             use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
             let mut system = System::new();
@@ -787,21 +819,35 @@ mod tests {
                 .map(|(pid, _)| pid.as_u32())
                 .expect("the background child")
         };
-        server
-            .handle(Request::AgentPids {
-                pids: vec![999_999_999, child],
-            })
-            .unwrap();
-        server.refresh_summaries();
-        let view = server.view(Some("s"), window, Some(0)).unwrap();
-        let matched = view
-            .panes
-            .iter()
-            .find(|(id, _)| *id == pane)
-            .unwrap()
-            .1
-            .agent_pid;
-        assert_eq!(matched, Some(child));
+        let matched = |server: &Server| {
+            server.refresh_summaries();
+            let view = server.view(Some("s"), window, Some(0)).unwrap();
+            view.panes
+                .iter()
+                .find(|(id, _)| *id == pane)
+                .unwrap()
+                .1
+                .agent_pid
+        };
+        let ask = |client: u64, pids: Vec<u32>| {
+            server.handle(Request::AgentPids { client, pids }).unwrap();
+        };
+        ask(1, vec![999_999_999, child]);
+        assert_eq!(matched(&server), Some(child));
+        // Another GUI with no agents does not erase the first one's list.
+        ask(2, vec![]);
+        assert_eq!(matched(&server), Some(child), "union of the GUIs' lists");
+        ask(1, vec![]);
+        assert_eq!(matched(&server), None, "the list was replaced");
+        // A GUI that stopped resending (gone) no longer counts.
+        ask(3, vec![child]);
+        assert_eq!(matched(&server), Some(child));
+        if let Ok(mut lists) = server.agent_pids.lock()
+            && let Some((_, at)) = lists.get_mut(&3)
+        {
+            *at -= AGENT_PIDS_TTL;
+        }
+        assert_eq!(matched(&server), None, "stale list expired");
         server
             .handle(Request::KillSession {
                 session: "s".into(),

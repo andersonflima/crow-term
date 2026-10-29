@@ -444,7 +444,7 @@ pub fn pid_alive(pid: u32) -> bool {
 /// The repository containing `cwd` and its branch, from `.git` files only.
 pub fn git_repo(cwd: &Path) -> Option<(PathBuf, String)> {
     for dir in cwd.ancestors().take(64) {
-        if dir.join(".git").exists() {
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
             return git_branch(dir).map(|branch| (dir.to_path_buf(), branch));
         }
     }
@@ -734,65 +734,130 @@ pub fn aged(state: &CrowState, elapsed: Duration) -> CrowState {
 // ---------------------------------------------------------------------------
 // Git branch without a subprocess
 
-/// A path on another machine: UNC (`\\host\share`, `//host/share`,
-/// `\\?\UNC\host\share`) or under an automount root (`/net`, `/Volumes`,
-/// `/Network`, `/afs`, `/smb`).
-pub fn remote_path(path: &Path) -> bool {
-    let lower = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    // `\\?\C:\…` is a local drive in verbatim form.
-    if let Some(rest) = lower.strip_prefix("//?/") {
-        return rest.starts_with("unc/");
+/// `base.join(target)` with `.` and `..` resolved lexically (the filesystem
+/// is not touched, so no symlink or automount is followed to do it).
+pub fn normalize(base: &Path, target: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in base.join(target).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
     }
-    lower.starts_with("//")
-        || ["/net/", "/volumes/", "/network/", "/afs/", "/smb/"]
-            .iter()
-            .any(|root| lower.starts_with(root))
+    out
+}
+
+/// Device and UNC forms: never a local repository (`\\host\share`,
+/// `//host`, `\\?\UNC\`, `\??\`, `\\.\`).
+fn device_or_unc(text: &str) -> bool {
+    let text = text.replace('\\', "/");
+    text.starts_with("//") || text.starts_with("/??/")
+}
+
+/// Where a `gitdir:` pointer may lead: under the user's home or the
+/// repository's own directory, as a plain local path. On Windows only a
+/// drive path (`X:\…`) under the user profile or the repository.
+fn allowed_gitdir(raw: &str, target: &Path, roots: &[&Path]) -> bool {
+    if device_or_unc(raw) || device_or_unc(&target.to_string_lossy()) {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let text = target.to_string_lossy();
+        let bytes = text.as_bytes();
+        if !(bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':') {
+            return false;
+        }
+    }
+    roots.iter().any(|root| target.starts_with(root))
+}
+
+/// The contents (first 4 KiB) of a regular file that is not a symlink;
+/// opened without following a symlink or blocking on a FIFO, the type
+/// checked again on the open file.
+fn read_regular(path: &Path) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(
+        &mut options,
+        libc::O_NOFOLLOW | libc::O_NONBLOCK,
+    );
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut text = String::new();
+    file.take(4096).read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+/// No component of `path` below `root` is a symlink (nothing is followed).
+fn no_symlinks_below(path: &Path, root: &Path) -> bool {
+    let Ok(rest) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in rest.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Branch (or short detached SHA) of the repository containing `cwd`, reading
 /// `.git/HEAD` (directory or `gitdir:` file, as in worktrees) walking upwards.
+/// Nothing is executed and no symlink is followed; a `gitdir:` pointer is
+/// followed only to a local path under the user's home or the repository.
 pub fn git_branch(cwd: &Path) -> Option<String> {
-    fn read_small(path: &Path) -> Option<String> {
-        // Opened without blocking and checked after opening: a FIFO named
-        // HEAD (or swapped in after a check) can never block the caller.
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-        let file = options.open(path).ok()?;
-        if !file.metadata().ok()?.is_file() {
-            return None;
-        }
-        let mut text = String::new();
-        file.take(4096).read_to_string(&mut text).ok()?;
-        Some(text)
-    }
+    let home = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    git_branch_with_home(cwd, home.as_deref())
+}
+
+fn git_branch_with_home(cwd: &Path, home: Option<&Path>) -> Option<String> {
     for dir in cwd.ancestors().take(64) {
         let dot_git = dir.join(".git");
-        let git_dir = if dot_git.is_dir() {
-            dot_git
-        } else if dot_git.is_file() {
-            let pointer = read_small(&dot_git)?;
-            let target = pointer.trim().strip_prefix("gitdir:")?.trim();
-            let target = Path::new(target);
-            let target = if target.is_absolute() {
-                target.to_path_buf()
-            } else {
-                dir.join(target)
-            };
-            // A `gitdir:` pointing at the network is never followed: reading
-            // an SMB path would hand the user's credentials (NTLM) to it.
-            if remote_path(&target) {
-                return None;
-            }
-            target
-        } else {
+        let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
             continue;
         };
-        let head = read_small(&git_dir.join("HEAD"))?;
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            return None;
+        }
+        let (git_dir, root) = if kind.is_dir() {
+            (dot_git, dir.to_path_buf())
+        } else if kind.is_file() {
+            let pointer = read_regular(&dot_git)?;
+            let raw = pointer.trim().strip_prefix("gitdir:")?.trim();
+            let target = normalize(dir, Path::new(raw));
+            let roots: Vec<&Path> = [Some(dir), home].into_iter().flatten().collect();
+            if !allowed_gitdir(raw, &target, &roots) {
+                return None;
+            }
+            let root = roots
+                .iter()
+                .find(|root| target.starts_with(root))?
+                .to_path_buf();
+            (target, root)
+        } else {
+            return None;
+        };
+        if !no_symlinks_below(&git_dir, &root) {
+            return None;
+        }
+        let head = read_regular(&git_dir.join("HEAD"))?;
         let head = head.trim();
         if let Some(reference) = head.strip_prefix("ref:") {
             let reference = reference.trim();
@@ -1055,6 +1120,10 @@ pub fn spawn(
             let mut source = Source::Pending;
             let mut fetched_at = Instant::now();
             let mut last_sent: Option<CrowView> = None;
+            // Published at least this often even when unchanged: the GUI
+            // resends its agent pids to the daemon on each view.
+            const KEEPALIVE: Duration = Duration::from_secs(15);
+            let mut sent_at = Instant::now();
             let mut cwd_cache: Option<(u64, Option<String>)> = None;
             let mut first = true;
             let mut cwd_failures = 0u32;
@@ -1160,11 +1229,12 @@ pub fn spawn(
                         Vec::new()
                     },
                 };
-                if last_sent.as_ref() != Some(&view) {
+                if last_sent.as_ref() != Some(&view) || sent_at.elapsed() >= KEEPALIVE {
                     if !publish(view.clone()) {
                         break;
                     }
                     last_sent = Some(view);
+                    sent_at = Instant::now();
                 }
             }
         })?;
@@ -1474,7 +1544,15 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: ../repo/.git/worktrees/wt\n").unwrap();
-        assert_eq!(git_branch(&worktree).as_deref(), Some("0123456"));
+        // A pointer outside the worktree is followed only under the home.
+        assert_eq!(
+            git_branch_with_home(&worktree, Some(root.path())).as_deref(),
+            Some("0123456")
+        );
+        assert_eq!(
+            git_branch_with_home(&worktree, Some(Path::new("/nonexistent-home"))),
+            None
+        );
         assert_eq!(git_branch(&root.path().join("nowhere")), None);
         std::fs::write(repo.join(".git/HEAD"), "garbage").unwrap();
         assert_eq!(git_branch(&repo), None);
@@ -1694,43 +1772,69 @@ mod tests {
     }
 
     #[test]
-    fn network_gitdirs_and_fifos_are_never_read() {
-        for remote in [
-            "\\\\host\\share\\repo.git",
-            "//host/share/repo.git",
-            "\\\\?\\UNC\\host\\share",
-            "/net/host/repo",
-            "/Volumes/share/repo",
-            "/Network/Servers/x",
-            "/afs/cell/repo",
+    fn gitdir_pointers_never_leave_home_or_the_repository_and_no_symlink_is_followed() {
+        let home = tempfile_dir();
+        let repo = home.join("repo");
+        let branch = |dir: &Path| git_branch_with_home(dir, Some(&home));
+        std::fs::create_dir_all(repo.join("real.git")).unwrap();
+        std::fs::write(repo.join("real.git/HEAD"), "ref: refs/heads/ok\n").unwrap();
+        let point = |target: &str| {
+            std::fs::write(repo.join(".git"), format!("gitdir: {target}\n")).unwrap()
+        };
+        point("real.git");
+        assert_eq!(
+            branch(&repo).as_deref(),
+            Some("ok"),
+            "a pointer inside the repository"
+        );
+        // Every reviewer bypass is refused before anything is opened.
+        let depth = "../".repeat(repo.components().count() + 2);
+        for hostile in [
+            "/net/host/repo".to_owned(),
+            "/./net/host/repo".to_owned(),
+            format!("{depth}net/host/repo"),
+            "\\\\host\\share\\repo".to_owned(),
+            "//host/share/repo".to_owned(),
+            "\\\\?\\UNC\\host\\share".to_owned(),
+            "\\??\\UNC\\host\\share".to_owned(),
+            "\\\\.\\pipe\\x".to_owned(),
+            "/Volumes/share/repo".to_owned(),
         ] {
-            assert!(remote_path(Path::new(remote)), "{remote}");
+            point(&hostile);
+            assert_eq!(branch(&repo), None, "{hostile}");
         }
-        for local in [
-            "/home/u/repo/.git/worktrees/x",
-            "C:\\Users\\u\\repo",
-            "\\\\?\\C:\\Users\\u\\repo",
-        ] {
-            assert!(!remote_path(Path::new(local)), "{local}");
-        }
-        let dir = tempfile_dir();
-        std::fs::write(dir.join(".git"), "gitdir: //attacker.example/share/x\n").unwrap();
-        assert_eq!(git_branch(&dir), None, "a network gitdir is not followed");
+        assert_eq!(
+            normalize(Path::new("/a/b"), Path::new("./../../../net/x")),
+            PathBuf::from("/net/x")
+        );
         #[cfg(unix)]
         {
+            // A symlinked `.git`, `HEAD` or directory on the way: no branch.
+            std::fs::remove_file(repo.join(".git")).unwrap();
+            std::os::unix::fs::symlink(repo.join("real.git"), repo.join(".git")).unwrap();
+            assert_eq!(branch(&repo), None, "symlinked .git");
+            std::fs::remove_file(repo.join(".git")).unwrap();
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            std::os::unix::fs::symlink(repo.join("real.git/HEAD"), repo.join(".git/HEAD")).unwrap();
+            assert_eq!(branch(&repo), None, "symlinked HEAD");
+            std::fs::remove_dir_all(repo.join(".git")).unwrap();
+            std::os::unix::fs::symlink(repo.join("real.git"), repo.join("link.git")).unwrap();
+            point("link.git");
+            assert_eq!(branch(&repo), None, "symlinked gitdir");
             // A FIFO named HEAD: reading it must not block.
-            std::fs::remove_file(dir.join(".git")).unwrap();
-            std::fs::create_dir_all(dir.join(".git")).unwrap();
-            let fifo = dir.join(".git/HEAD");
-            let name = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+            point("real.git");
+            std::fs::remove_file(repo.join("real.git/HEAD")).unwrap();
+            let name =
+                std::ffi::CString::new(repo.join("real.git/HEAD").to_string_lossy().as_bytes())
+                    .unwrap();
             // SAFETY: valid NUL-terminated path.
             assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
             let (tx, rx) = std::sync::mpsc::channel();
-            let path = dir.clone();
-            thread::spawn(move || tx.send(git_branch(&path)).unwrap());
+            let (dir, root) = (repo.clone(), home.clone());
+            thread::spawn(move || tx.send(git_branch_with_home(&dir, Some(&root))).unwrap());
             assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), None);
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     fn tempfile_dir() -> PathBuf {

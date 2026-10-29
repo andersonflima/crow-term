@@ -718,6 +718,8 @@ struct App {
     /// Shortened tab labels by (index and full label, room in px, scale):
     /// shaping runs only when one of them changes.
     label_fit: HashMap<(String, u32, u64), String>,
+    /// Random per GUI process: names this GUI's agent pid list to the daemon.
+    client_id: u64,
     crow_panel: bool,
     crow_pane: u64,
     panel_layer: Option<Arc<Layer>>,
@@ -800,6 +802,12 @@ impl App {
             drawn: Drawn::default(),
             label_due: None,
             label_fit: HashMap::new(),
+            client_id: {
+                use std::hash::{BuildHasher, Hasher};
+                let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+                hasher.write_u32(std::process::id());
+                hasher.finish()
+            },
             crow_panel,
             crow_pane: pane_id,
             panel_layer: None,
@@ -1320,6 +1328,48 @@ impl App {
             self.status_expires = None;
             self.redraw();
         }
+    }
+    /// The daemon was replaced: switch to the new session's ids and tell the
+    /// new daemon this GUI's agent pids again.
+    fn reattached_to(&mut self, window: u64, pane: u64) {
+        eprintln!(
+            "crow-term: reattached to window {window}, pane {pane} (was window {}, pane {})",
+            self.window_id, self.pane_id
+        );
+        self.dispatcher.reattached();
+        self.send_agent_pids();
+        // Switch ids directly: the old ones belong to the replaced
+        // daemon and must not be resized or focused in the new one.
+        self.view = None;
+        self.sent_sizes.clear();
+        self.window_id = window;
+        self.shared_window.store(window, Ordering::Relaxed);
+        self.pane_id = pane;
+        self.pending_focus_in = None;
+        self.selection = None;
+        self.invalidate_rows();
+        self.status = "Daemon restarted — a new session replaced the one that ended with it".into();
+        self.status_expires = Some(Instant::now() + Duration::from_secs(10));
+        self.resize_panes();
+        self.redraw();
+    }
+    /// Tell the daemon which agent sessions are live, so it can say which
+    /// pane runs each (it scans processes only while any GUI listed some).
+    fn send_agent_pids(&self) {
+        let pids = self
+            .crow_view
+            .context
+            .agents
+            .iter()
+            .filter_map(|agent| agent.pid)
+            .collect();
+        self.send(
+            Request::AgentPids {
+                client: self.client_id,
+                pids,
+            },
+            false,
+        );
     }
     /// Cmd (macOS) or Ctrl (Linux, Windows) held: clicks open links.
     fn link_modifier(&self) -> bool {
@@ -2878,39 +2928,12 @@ impl ApplicationHandler<UiEvent> for App {
                 self.status_expires = expires.then(|| Instant::now() + Duration::from_secs(3));
                 self.redraw();
             }
-            UiEvent::Reattached { window, pane } => {
-                eprintln!(
-                    "crow-term: reattached to window {window}, pane {pane} (was window {}, pane {})",
-                    self.window_id, self.pane_id
-                );
-                self.dispatcher.reattached();
-                // Switch ids directly: the old ones belong to the replaced
-                // daemon and must not be resized or focused in the new one.
-                self.view = None;
-                self.sent_sizes.clear();
-                self.window_id = window;
-                self.shared_window.store(window, Ordering::Relaxed);
-                self.pane_id = pane;
-                self.pending_focus_in = None;
-                self.selection = None;
-                self.invalidate_rows();
-                self.status =
-                    "Daemon restarted — a new session replaced the one that ended with it".into();
-                self.status_expires = Some(Instant::now() + Duration::from_secs(10));
-                self.resize_panes();
-                self.redraw();
-            }
+            UiEvent::Reattached { window, pane } => self.reattached_to(window, pane),
             UiEvent::Crow(view) => {
-                // Ask the daemon which pane runs each live agent session
-                // (it scans processes only while there are any).
-                let pids = |view: &CrowView| -> Vec<u32> {
-                    view.context.agents.iter().filter_map(|a| a.pid).collect()
-                };
-                let asked = pids(&view);
-                if asked != pids(&self.crow_view) {
-                    self.send(Request::AgentPids { pids: asked }, false);
-                }
                 self.crow_view = *view;
+                // On every crow view (at least every 15 s): a restarted daemon
+                // learns the list again, a stale one expires.
+                self.send_agent_pids();
                 self.redraw();
             }
         }

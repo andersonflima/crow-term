@@ -200,7 +200,16 @@ impl State {
     fn events(&mut self, writer: &mpsc::SyncSender<WriteMessage>) {
         for event in self.pending_events.try_iter() {
             let response = match event {
-                Event::Title(title) => {
+                Event::Title(mut title) => {
+                    // Bounded where it is stored: a huge OSC title is never
+                    // cloned into snapshots or summaries.
+                    if title.len() > MAX_TITLE_BYTES {
+                        let mut end = MAX_TITLE_BYTES;
+                        while !title.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        title.truncate(end);
+                    }
                     self.title = title;
                     None
                 }
@@ -681,6 +690,9 @@ pub struct Engine {
 
 /// Children by parent pid (one process table per summary refresh).
 pub type ProcessTree = std::collections::HashMap<u32, Vec<u32>>;
+
+/// Longest OSC title the engine keeps (bytes).
+pub const MAX_TITLE_BYTES: usize = 4096;
 
 /// Longest title (in grapheme clusters) a pane summary carries.
 pub const MAX_SUMMARY_TEXT: usize = 256;
@@ -1322,7 +1334,18 @@ impl Engine {
             .as_ref()
             .is_none_or(|(c, at, _, _)| stale(*c, *at))
         {
-            let cwd = cwd_of(pid).map(|cwd| bound(cwd, 1024));
+            // A process whose directory cannot be read (setuid: sudo) shows
+            // its shell's directory instead.
+            let shell = || {
+                self.process
+                    .child
+                    .try_lock()
+                    .ok()
+                    .and_then(|child| child.as_ref().and_then(|c| c.process_id()))
+                    .filter(|&shell| shell != pid)
+                    .and_then(cwd_of)
+            };
+            let cwd = cwd_of(pid).or_else(shell).map(|cwd| bound(cwd, 1024));
             // Branch from `.git` files only: no git command, nothing the
             // repository configures (hooks, filters, fsmonitor) ever runs.
             let repo = cwd.as_deref().and_then(|cwd| {
@@ -1696,6 +1719,19 @@ mod tests {
         state.advance(b"https://example.com/x\r\nshort");
         let screen = state.snapshot(true);
         assert_eq!(screen.wrapped, [true, true, false, false, false]);
+    }
+    #[test]
+    fn huge_titles_are_bounded_where_they_are_stored() {
+        let mut state = State::with_osc52(Size { rows: 2, cols: 20 }, 0, false);
+        let huge = "ab ".repeat(5000) + "é";
+        state.advance(format!("\x1b]2;{huge}\x07").as_bytes());
+        state.events(&mpsc::sync_channel(8).0);
+        assert!(
+            state.title.len() <= MAX_TITLE_BYTES,
+            "{}",
+            state.title.len()
+        );
+        assert!(state.title.starts_with("ab ab"));
     }
     #[test]
     fn osc52_copy_is_opt_out_bounded_and_never_readable() {

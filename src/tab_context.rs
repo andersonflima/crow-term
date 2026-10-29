@@ -99,9 +99,16 @@ pub fn is_shell(name: &str) -> bool {
 /// Text from programs and agents as it may be painted: no control, bidi or
 /// zero-width characters (they could reorder or hide what is shown).
 pub fn sanitize(text: &str) -> String {
+    // Tabs and other spacing become a plain space; line and paragraph
+    // separators, controls and ignorable characters go.
     let clean: String = text
         .chars()
-        .filter(|&c| !c.is_control() && !ignorable(c))
+        .filter_map(|c| match c {
+            '\u{2028}' | '\u{2029}' => None,
+            c if c.is_control() || ignorable(c) => (c == '\t').then_some(' '),
+            c if c.is_whitespace() && c != ' ' => Some(' '),
+            c => Some(c),
+        })
         .take(MAX_TEXT * 8)
         .collect();
     let clean = clean.trim();
@@ -118,7 +125,7 @@ pub const MAX_TEXT: usize = 256;
 
 /// Characters that draw nothing yet change or hide what is shown: bidi
 /// controls, zero-width characters (Unicode Default_Ignorable_Code_Point,
-/// except the variation selectors emoji need), tags, Hangul fillers.
+/// except VS16, which emoji need), tags, Hangul fillers.
 pub fn ignorable(c: char) -> bool {
     crate::hyperlinks::invisible(c)
         || matches!(
@@ -135,8 +142,11 @@ pub fn ignorable(c: char) -> bool {
                 | '\u{1bca0}'..='\u{1bca3}'
                 | '\u{1d173}'..='\u{1d17a}'
                 | '\u{e0000}'..='\u{e007f}'
-                | '\u{e0080}'..='\u{e00ff}'
-                | '\u{e01f0}'..='\u{e0fff}'
+                | '\u{e0080}'..='\u{e0fff}'
+                // Variation selectors other than VS16 (emoji presentation)
+                // and the Mongolian ones.
+                | '\u{fe00}'..='\u{fe0e}'
+                | '\u{180b}'..='\u{180f}'
         )
 }
 
@@ -1086,6 +1096,14 @@ mod tests {
     fn every_invisible_kind_is_removed_from_shown_text() {
         let hostile = "a\u{e0041}\u{e007f}b\u{115f}\u{1160}\u{3164}\u{ffa0}c\u{200b}\u{202e}\u{2066}d\u{034f}\u{feff}e\u{1bca0}";
         assert_eq!(sanitize(hostile), "abcde");
+        assert_eq!(
+            sanitize("a\u{2028}b\u{2029}c\td\u{3000}e\u{a0}f"),
+            "abc d e f"
+        );
+        assert_eq!(
+            sanitize("x\u{fe00}\u{fe0e}\u{e0100}\u{180b}\u{180f}y"),
+            "xy"
+        );
         // Emoji keep their variation selector.
         assert_eq!(sanitize("\u{2764}\u{fe0f}"), "\u{2764}\u{fe0f}");
         let label = tab_label(&LabelInput {

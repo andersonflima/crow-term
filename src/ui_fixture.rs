@@ -696,3 +696,40 @@ fn shortened_tab_and_footer_text_open_whole_on_click_and_hover() {
     app.mouse_click(ElementState::Pressed, MouseButton::Left);
     assert_eq!(app.status, full);
 }
+
+/// After the daemon is replaced the GUI tells the new one its agent pids
+/// again (and on every crow view), so pane matching survives a restart.
+#[test]
+fn agent_pids_are_sent_again_after_a_reattach() {
+    use std::sync::mpsc;
+    let mut app = app(Config::default(), 1.0, PhysicalSize::new(400, 200));
+    let (sent, seen) = mpsc::channel::<(u64, Vec<u32>)>();
+    let sent = std::sync::Mutex::new(sent);
+    let running = Arc::new(AtomicBool::new(true));
+    app.dispatcher = Arc::new(crate::lanes::Dispatcher::new(
+        running.clone(),
+        move |request, _| {
+            if let Request::Guarded { request, .. } = request
+                && let Request::AgentPids { client, pids } = &**request
+            {
+                let _ = sent.lock().unwrap().send((*client, pids.clone()));
+            }
+            Ok(Response::Ok)
+        },
+        |_| crate::lanes::Outcome::Failed,
+        |_| true,
+    ));
+    app.dispatcher.set_instance(1);
+    app.crow_view.context.agents = vec![crate::tab_context::Agent {
+        host: "gemini".into(),
+        pid: Some(4321),
+        ..Default::default()
+    }];
+    app.reattached_to(5, 50);
+    // Held until the new daemon's instance is known, then sent to it.
+    app.dispatcher.set_instance(2);
+    let (client, pids) = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!((client, pids), (app.client_id, vec![4321]));
+    running.store(false, Ordering::Release);
+    app.dispatcher.shutdown();
+}
