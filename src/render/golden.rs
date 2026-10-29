@@ -25,9 +25,10 @@ pub const RENDERER: Tolerance = Tolerance {
     ignore_lsb: false,
 };
 /// CPU rasterizer adapters (Mesa lavapipe/llvmpipe) round fixed-function
-/// blending differently from the software formula by one step on ~0.6% of the
-/// pixels of text-heavy frames. Those one-step differences are tolerated there;
-/// every other bound is the same as [`RENDERER`].
+/// blending differently from the software formula by one step, on 0.2-2.1% of
+/// the pixels of the fixture frames (lavapipe in CI; the tiny dark frame is the
+/// worst). Those one-step differences are not counted towards `max_fraction`
+/// there; every other bound is the same as [`RENDERER`].
 pub const CPU_ADAPTER: Tolerance = Tolerance {
     ignore_lsb: true,
     ..RENDERER
