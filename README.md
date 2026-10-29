@@ -166,15 +166,15 @@ to reload if you want to keep those processes.
 
 Programs that hard-code colors for one kind of background (a dark fish or
 Neovim theme in truecolor, say) would draw pale text on the light Crowquill Ink
-background. `minimum_contrast` (default `3.0`, WCAG contrast ratio; `1.0`
+background. `minimum_contrast` (default `4.5`, WCAG contrast ratio; `1.0`
 turns it off, up to `21.0`) darkens or lightens such text, keeping its hue,
 until it reaches the ratio against its cell background (after reverse video,
 dim and selection). Text that already meets it is drawn unchanged, and so are
 color emoji, box drawing, block elements and Powerline separators. Both
-renderers apply it identically. `3.0` is the WCAG minimum for large text and UI
-components: it rescues unreadable text without touching the deliberately
-quieter colors (comments, autosuggestions) of well-designed themes; `4.5` is the
-WCAG level for body text.
+renderers apply it identically. `4.5` is WCAG AA for normal-size text, which
+terminal text is. Deliberately quiet colors (comments, autosuggestions) of
+some themes come out a little darker or lighter; set `minimum_contrast = 3.0`
+(the WCAG minimum for large text) for a subtler look, or `1.0` to turn it off.
 
 Programs can also ask instead of guessing: OSC 10/11 queries answer with the
 configured foreground/background, `CSI ? 996 n` answers `CSI ? 997 ; 2 n`

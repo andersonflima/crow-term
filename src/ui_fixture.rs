@@ -272,7 +272,7 @@ pub(crate) fn cases() -> Vec<(&'static str, App)> {
         view.screens[0].1.cursor.row = 1;
     }
     out.push(("dark-tiny-hollow-noligatures", tiny));
-    // Default config (minimum_contrast 3.0) with a dark truecolor theme on the
+    // Default config (minimum_contrast 4.5) with a dark truecolor theme on the
     // light background: the reported "typed text is unreadable" case.
     let mut contrast = app(Config::default(), 1.0, PhysicalSize::new(800, 420));
     if let Some(view) = &mut contrast.view {
@@ -318,7 +318,7 @@ pub(crate) fn dark_theme_rows(cols: usize) -> Vec<Vec<Cell>> {
 #[test]
 fn minimum_contrast_makes_dark_theme_text_readable_and_keeps_default_text() {
     let config = Config::default();
-    assert_eq!(config.minimum_contrast, 3.0);
+    assert_eq!(config.minimum_contrast, 4.5);
     let mut shaper = GridShaper::new(&config, 1.0);
     let rows = dark_theme_rows(48);
     let shaped = shaper.shape_row(&config, &rows[0]);
@@ -326,7 +326,7 @@ fn minimum_contrast_makes_dark_theme_text_readable_and_keeps_default_text() {
     for glyph in &shaped.glyphs {
         let ratio = crate::render::contrast_ratio(glyph.color.0 & 0xff_ffff, 0xffffff);
         assert!(
-            ratio >= 3.0,
+            ratio >= 4.5,
             "{:06x}: {ratio:.2}",
             glyph.color.0 & 0xff_ffff
         );
