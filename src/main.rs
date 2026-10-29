@@ -200,10 +200,13 @@ fn main() -> Result<()> {
     if matches!(cli.command, Some(Action::Daemon)) {
         return server::run(config);
     }
+    // Only the GUI needs a valid renderer; other commands (and doctor, which
+    // reports the problem) keep working with an invalid CROW_TERM_RENDERER.
     let env_renderer = std::env::var(RendererMode::ENV).ok();
-    let (renderer, renderer_source) =
-        RendererMode::resolve(cli.renderer, env_renderer.as_deref(), config.renderer)?;
-    config.renderer = renderer;
+    let resolved = RendererMode::resolve(cli.renderer, env_renderer.as_deref(), config.renderer);
+    if let Ok((renderer, _)) = &resolved {
+        config.renderer = *renderer;
+    }
     match cli.command.as_ref() {
         Some(Action::Daemon) => return server::run(config),
         Some(Action::Config { path }) => {
@@ -287,10 +290,13 @@ fn main() -> Result<()> {
                     "not connected"
                 }
             );
-            println!(
-                "renderer: {} (from {renderer_source}); OpenType shaping; no WebView",
-                renderer.as_str()
-            );
+            match &resolved {
+                Ok((renderer, source)) => println!(
+                    "renderer: {} (from {source}); OpenType shaping; no WebView",
+                    renderer.as_str()
+                ),
+                Err(error) => println!("renderer: invalid: {error:#}"),
+            }
             println!(
                 "osc52: {} (terminal output may {}; reading the clipboard is never allowed)",
                 match config.terminal.osc52 {
@@ -356,6 +362,14 @@ fn main() -> Result<()> {
         let bytes = ui::encode_named_key(key, state, *release, &modes);
         std::io::stdout().write_all(&bytes)?;
         return Ok(());
+    }
+    // A GUI needs a valid renderer; report it before starting a daemon.
+    if matches!(
+        cli.command,
+        None | Some(Action::Start { .. }) | Some(Action::Attach { .. })
+    ) && let Err(error) = resolved
+    {
+        return Err(error);
     }
     ipc::ensure_daemon(cli.config.as_deref())?;
     match cli.command.as_ref() {

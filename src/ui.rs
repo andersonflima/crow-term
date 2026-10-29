@@ -1651,6 +1651,13 @@ impl App {
         };
         drop(scene);
         self.after_paint();
+        if let Some(gpu) = &mut self.gpu {
+            let dropped = gpu.take_dropped_glyphs();
+            if dropped > 0 {
+                self.status =
+                    format!("GPU glyph atlas full: {dropped} glyphs not drawn in this frame");
+            }
+        }
         match result {
             Ok(presented) => {
                 #[cfg(feature = "frame-dump")]

@@ -183,6 +183,10 @@ pub(crate) fn fill(frame: &mut [u32], width: usize, rect: Rect, color: u32) {
         h: (frame.len() / width) as u32,
     };
     let rect = rect.intersection(bounds);
+    // An empty intersection may keep an origin outside the frame.
+    if rect.is_empty() {
+        return;
+    }
     for y in rect.y..rect.y + rect.h as i32 {
         let start = y as usize * width + rect.x as usize;
         frame[start..start + rect.w as usize].fill(color);
