@@ -30,6 +30,11 @@ pub enum Query {
     Termcap(Vec<String>),
     /// `DCS $ q Pt ST`: DECRQSS for the setting named by `Pt`.
     StatusString(Vec<u8>),
+    /// `CSI ? 996 n`: light/dark color scheme report (answered `CSI ? 997 ; 1|2 n`).
+    ColorScheme,
+    /// `CSI ? 2031 $ p`: DECRQM for color scheme update notifications
+    /// (current state attached).
+    ColorSchemeUpdatesMode(bool),
 }
 
 /// Longest DCS query payload examined; longer strings are forwarded as-is.
@@ -85,6 +90,8 @@ pub struct Interceptor {
     /// Parameter + subparameter separators; at 32 the parser ignores the CSI.
     separators: usize,
     intermediates: usize,
+    /// Last intermediate byte of the CSI in progress (`$` of DECRQM).
+    intermediate: Option<u8>,
     ignored: bool,
     /// DCS payload after `ESC P` while it may still be a query.
     payload: Vec<u8>,
@@ -92,6 +99,9 @@ pub struct Interceptor {
     kitty_depth: [u16; 2],
     /// xterm modifyOtherKeys level (0, 1 or 2), not tracked by the VT parser.
     pub modify_other_keys: u8,
+    /// Mode 2031: the application wants `CSI ? 997 ; 1|2 n` whenever the
+    /// light/dark color scheme changes.
+    pub color_scheme_updates: bool,
 }
 
 impl Default for Interceptor {
@@ -107,11 +117,13 @@ impl Default for Interceptor {
             field_done: false,
             separators: 0,
             intermediates: 0,
+            intermediate: None,
             ignored: false,
             payload: Vec::new(),
             alt_screen: false,
             kitty_depth: [0; 2],
             modify_other_keys: 0,
+            color_scheme_updates: false,
         }
     }
 }
@@ -186,6 +198,7 @@ impl Interceptor {
         self.field_done = false;
         self.separators = 0;
         self.intermediates = 0;
+        self.intermediate = None;
         self.ignored = false;
         self.payload.clear();
     }
@@ -376,6 +389,7 @@ impl Interceptor {
                     self.alt_screen = false;
                     self.kitty_depth = [0; 2];
                     self.modify_other_keys = 0;
+                    self.color_scheme_updates = false;
                     self.pass(sink);
                 }
                 _ => {
@@ -414,7 +428,10 @@ impl Interceptor {
                         self.end_field();
                         self.field_done = false;
                     }
-                    0x20..=0x2f => self.intermediates += 1,
+                    0x20..=0x2f => {
+                        self.intermediates += 1;
+                        self.intermediate = Some(byte);
+                    }
                     0x40..=0x7e => {
                         self.end_field();
                         self.dispatch(byte, sink);
@@ -455,6 +472,21 @@ impl Interceptor {
             sink(Out::Query(Query::SecondaryAttributes));
             return;
         }
+        // DECRQM for mode 2031, which the parser does not know (it would
+        // answer "not recognized").
+        if !self.ignored
+            && self.marker == Some(b'?')
+            && self.intermediates == 1
+            && self.intermediate == Some(b'$')
+            && final_byte == b'p'
+            && self.values.as_slice() == [2031]
+        {
+            self.drop_sequence();
+            sink(Out::Query(Query::ColorSchemeUpdatesMode(
+                self.color_scheme_updates,
+            )));
+            return;
+        }
         if self.ignored || self.intermediates > 0 || self.separators >= MAX_PARAMS {
             self.pass(sink);
             return;
@@ -474,8 +506,18 @@ impl Interceptor {
                 let count = if first == 0 { 1 } else { first };
                 self.kitty_depth[screen] = self.kitty_depth[screen].saturating_sub(count);
             }
-            (Some(b'?'), b'h' | b'l') if params.contains(&1049) => {
-                self.alt_screen = final_byte == b'h';
+            (Some(b'?'), b'h' | b'l') if params.contains(&1049) || params.contains(&2031) => {
+                if params.contains(&1049) {
+                    self.alt_screen = final_byte == b'h';
+                }
+                if params.contains(&2031) {
+                    self.color_scheme_updates = final_byte == b'h';
+                }
+            }
+            (Some(b'?'), b'n') if first == 996 && params.len() == 1 => {
+                self.drop_sequence();
+                sink(Out::Query(Query::ColorScheme));
+                return;
             }
             (Some(b'>'), b'm') if first == 4 => {
                 if let level @ 0..=2 = params.get(1).copied().unwrap_or(0) {
@@ -566,6 +608,39 @@ mod tests {
         assert_eq!(interceptor.modify_other_keys, 1);
         run(&mut interceptor, &[b"\x1bc"]);
         assert_eq!(interceptor.modify_other_keys, 0);
+    }
+
+    #[test]
+    fn color_scheme_query_and_mode_2031_are_tracked_across_splits() {
+        let input: &[u8] =
+            b"\x1b[?2031$p\x1b[?996n\x1b[?2031h\x1b[?2031$p\x1b[?2031l\x1b[?2031$pdone";
+        for split in 0..input.len() {
+            let mut interceptor = Interceptor::default();
+            let (fed, queries) = run(&mut interceptor, &[&input[..split], &input[split..]]);
+            assert_eq!(
+                queries,
+                vec![
+                    Query::ColorSchemeUpdatesMode(false),
+                    Query::ColorScheme,
+                    Query::ColorSchemeUpdatesMode(true),
+                    Query::ColorSchemeUpdatesMode(false),
+                ],
+                "split at {split}"
+            );
+            // Queries are answered here, never by the parser; the mode
+            // switches still reach it.
+            assert_eq!(fed, b"\x1b[?2031h\x1b[?2031ldone", "split at {split}");
+        }
+        let mut interceptor = Interceptor::default();
+        run(&mut interceptor, &[b"\x1b[?1049;2031h"]);
+        assert!(interceptor.color_scheme_updates);
+        // RIS resets the mode like the parser resets its own.
+        run(&mut interceptor, &[b"\x1bc"]);
+        assert!(!interceptor.color_scheme_updates);
+        // Other DECRQM and DSR queries are left to the parser.
+        let (fed, queries) = run(&mut Interceptor::default(), &[b"\x1b[?25$p\x1b[?6n"]);
+        assert!(queries.is_empty());
+        assert_eq!(fed, b"\x1b[?25$p\x1b[?6n");
     }
 
     #[test]

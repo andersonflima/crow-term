@@ -145,6 +145,7 @@ impl State {
             parser,
             intercept,
             replies,
+            default_colors,
             ..
         } = self;
         intercept.scan(bytes, &mut |out| match out {
@@ -159,7 +160,8 @@ impl State {
                     // until the application's own end marker (or timeout).
                     parser.advance(term, b"\x1b[?2026h");
                 }
-                if let Some(text) = answer(query, term, cell, osc52_copy) {
+                let light = light_scheme(term, default_colors);
+                if let Some(text) = answer(query, term, cell, osc52_copy, light) {
                     let _ = replies.send(Event::PtyWrite(text));
                 }
             }
@@ -501,8 +503,29 @@ fn osc52_copy_enabled(config: Option<&crate::config::Config>) -> bool {
     config.is_some_and(|config| config.terminal.osc52 == crate::config::Osc52Mode::Copy)
 }
 
-fn answer(query: Query, term: &Term<Events>, cell: CellPixels, osc52_copy: bool) -> Option<String> {
+/// Whether the effective default background (OSC 11 override or the theme)
+/// is light: WCAG relative luminance above the midpoint.
+fn light_scheme(term: &Term<Events>, defaults: &[Rgb]) -> bool {
+    let index = NamedColor::Background as usize;
+    let bg = term.colors()[index].unwrap_or(defaults[index]);
+    let rgb = u32::from(bg.r) << 16 | u32::from(bg.g) << 8 | u32::from(bg.b);
+    crate::render::relative_luminance(rgb) > 0.5
+}
+/// `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light), as in contour,
+/// kitty and Ghostty.
+fn color_scheme_report(light: bool) -> String {
+    format!("\x1b[?997;{}n", if light { 2 } else { 1 })
+}
+fn answer(
+    query: Query,
+    term: &Term<Events>,
+    cell: CellPixels,
+    osc52_copy: bool,
+    light: bool,
+) -> Option<String> {
     Some(match query {
+        Query::ColorScheme => color_scheme_report(light),
+        Query::ColorSchemeUpdatesMode(on) => format!("\x1b[?2031;{}$y", if on { 1 } else { 2 }),
         Query::ModifyOtherKeys(level) => format!("\x1b[>4;{level}m"),
         Query::Version => format!("\x1bP>|crow-term({})\x1b\\", env!("CARGO_PKG_VERSION")),
         Query::SecondaryAttributes => format!("\x1b[>0;{};1c", version_number()),
@@ -1014,6 +1037,7 @@ impl Engine {
                 b: rgb.b / 2,
             };
         }
+        let was_light = light_scheme(&state.term, &state.default_colors);
         state.default_colors[256] = fg;
         state.default_colors[257] = bg;
         state.default_colors[258] = fg;
@@ -1023,7 +1047,16 @@ impl Engine {
             g: fg.g / 2,
             b: fg.b / 2,
         };
+        // Mode 2031: tell the application when the scheme flipped.
+        let light = light_scheme(&state.term, &state.default_colors);
+        let report = (state.intercept.color_scheme_updates && light != was_light)
+            .then(|| color_scheme_report(light));
         drop(state);
+        if let Some(report) = report {
+            let _ = self
+                .writer
+                .try_send(WriteMessage::Bytes(report.into_bytes()));
+        }
         (self.notify)();
         Ok(())
     }
@@ -1251,6 +1284,90 @@ mod tests {
         assert!(!screen.cursor.visible);
         assert_eq!(screen.cells[0][0].text, "2");
     }
+    fn replies_to(state: &mut State, input: &[u8]) -> Vec<String> {
+        let (writer, writes) = mpsc::sync_channel(32);
+        state.advance(input);
+        state.events(&writer);
+        writes
+            .try_iter()
+            .filter_map(|message| match message {
+                WriteMessage::Bytes(bytes) => Some(String::from_utf8(bytes).unwrap()),
+                _ => None,
+            })
+            .collect()
+    }
+    #[test]
+    fn osc_10_11_and_color_scheme_answer_with_the_configured_theme() {
+        let mut state = State::new(Size { rows: 5, cols: 40 }, 0);
+        // Crowquill Ink Light, as set_colors applies it.
+        state.default_colors[256] = Rgb {
+            r: 0x44,
+            g: 0x44,
+            b: 0x44,
+        };
+        state.default_colors[257] = Rgb {
+            r: 0xff,
+            g: 0xff,
+            b: 0xff,
+        };
+        let replies = replies_to(&mut state, b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b[?996n");
+        assert_eq!(
+            replies,
+            [
+                "\x1b]10;rgb:4444/4444/4444\x07",
+                "\x1b]11;rgb:ffff/ffff/ffff\x1b\\",
+                "\x1b[?997;2n",
+            ],
+            "{replies:?}"
+        );
+        // DECRQM 2031 follows the application's own setting.
+        assert_eq!(replies_to(&mut state, b"\x1b[?2031$p"), ["\x1b[?2031;2$y"]);
+        assert!(replies_to(&mut state, b"\x1b[?2031h").is_empty());
+        assert_eq!(replies_to(&mut state, b"\x1b[?2031$p"), ["\x1b[?2031;1$y"]);
+        // An application that sets a dark background itself gets "dark".
+        assert!(replies_to(&mut state, b"\x1b]11;#101010\x07").is_empty());
+        assert_eq!(replies_to(&mut state, b"\x1b[?996n"), ["\x1b[?997;1n"]);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn theme_change_notifies_mode_2031_listeners() {
+        // The child reads exactly the bytes the terminal sends it and prints
+        // them in hex: only a light->dark flip of the theme is reported.
+        let shell = ShellSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "stty raw -echo; printf 'READY\\r\\n'; dd bs=1 count=9 2>/dev/null | od -An -tx1; printf 'DONE\\r\\n'; sleep 5".into(),
+            ],
+            cwd: None,
+        };
+        let engine = Engine::new(&shell, Size { rows: 6, cols: 60 }, 10, Arc::new(|| {})).unwrap();
+        wait_for(&engine, |screen| screen_text(screen).contains("READY"));
+        let palette = vec!["#777777".to_owned(); 16];
+        engine.set_colors(&palette, "#444444", "#ffffff").unwrap();
+        engine.state.lock().unwrap().intercept.color_scheme_updates = true;
+        // Light -> light: nothing; light -> dark: one report.
+        engine.set_colors(&palette, "#444444", "#fefefe").unwrap();
+        engine.set_colors(&palette, "#eaeaea", "#111111").unwrap();
+        let screen = wait_for(&engine, |screen| screen_text(screen).contains("DONE"));
+        let hex: String = screen_text(&screen).split_whitespace().collect();
+        assert!(hex.contains("1b5b3f3939373b316eDONE"), "{hex}");
+        engine.kill().unwrap();
+    }
+    #[cfg(unix)]
+    fn screen_text(screen: &Screen) -> String {
+        screen
+            .cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn vt_answers_queries_without_reentrant_locking() {
         let (writer, writes) = mpsc::sync_channel(32);
