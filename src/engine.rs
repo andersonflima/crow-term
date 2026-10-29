@@ -2021,9 +2021,13 @@ mod tests {
         let engine = Engine::new(&shell, Size::default(), 0, Arc::new(|| {})).unwrap();
         wait_for(&engine, |s| s.title == "Crow Title");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        // Right after `exec` the OS may report the new name before the new
+        // command line: wait until the summary has settled (the cache is
+        // re-read every 2 s).
         let summary = loop {
             let summary = engine.summary(None);
-            if summary.process == "less" || std::time::Instant::now() > deadline {
+            let settled = summary.process == "less" && !summary.args.is_empty();
+            if settled || std::time::Instant::now() > deadline {
                 break summary;
             }
             std::thread::sleep(Duration::from_millis(50));
