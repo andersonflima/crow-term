@@ -46,14 +46,19 @@ function main() {
     process.exitCode = 1;
     return;
   }
-  const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
   // A signal sent to the launcher alone (a supervisor, `timeout`, an IDE) must
-  // reach the native process instead of orphaning it.
+  // reach the native process instead of orphaning it. Ctrl-C and a terminal
+  // hangup already reach the whole foreground group, so on a TTY they are not
+  // forwarded a second time. Handlers go in before spawning: no window in
+  // which a signal kills the launcher and orphans the child.
+  let child = null;
   const forward = (signal) => {
-    if (child.exitCode === null && child.signalCode === null) child.kill(signal);
+    if (signal !== "SIGTERM" && process.stdin.isTTY) return;
+    if (child && child.exitCode === null && child.signalCode === null) child.kill(signal);
   };
   const signals = process.platform === "win32" ? ["SIGINT", "SIGTERM"] : ["SIGINT", "SIGTERM", "SIGHUP"];
   for (const signal of signals) process.on(signal, forward);
+  child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
   child.on("error", (error) => {
     process.stderr.write(`crow-term: cannot run ${binary}: ${error.message}\n`);
     process.exitCode = 1;

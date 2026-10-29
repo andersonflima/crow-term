@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -111,15 +112,23 @@ class NpmPackages(unittest.TestCase):
         binary = modules / f"crow-term-{host[0]}-{host[1]}" / (
             f"bin/{npm_package.APP}/Contents/MacOS/crow-term" if host[0] == "darwin" else "bin/crow-term")
         marker = self.temp / "got-term"
+        # Bounded loop: a regressed launcher must fail the test, not hang it.
         binary.write_text(
             "#!/bin/sh\ntrap 'echo term > \"$CROW_MARK\"; exit 9' TERM\necho ready\n"
-            "while :; do sleep 0.05; done\n")
-        child = subprocess.Popen([node, str(launcher)], stdout=subprocess.PIPE, text=True,
-                                 env=dict(os.environ, CROW_MARK=str(marker)))
+            "i=0; while [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n")
+        child = subprocess.Popen([node, str(launcher)], stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                 text=True, start_new_session=True, env=dict(os.environ, CROW_MARK=str(marker)))
+        def reap():
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            child.wait()
+            child.stdout.close()
+        self.addCleanup(reap)
         self.assertEqual(child.stdout.readline().strip(), "ready")
-        child.send_signal(15)
+        child.send_signal(signal.SIGTERM)
         self.assertEqual(child.wait(timeout=10), 9)
-        child.stdout.close()
         self.assertEqual(marker.read_text().strip(), "term")
         # Without the platform package the launcher explains instead of crashing.
         shutil.rmtree(modules / f"crow-term-{host[0]}-{host[1]}")
