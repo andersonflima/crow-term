@@ -233,8 +233,12 @@ came from.
 
 The GPU renderer uses a non-sRGB surface so blending matches the software
 framebuffer: in CI, offscreen GPU frames of the real UI composition must match
-the software frames within 2 per channel on at most 0.1% of the pixels
-(`tests/goldens/render/` pins the software output). Frames are only drawn on
+the software frames within 2 per channel on at most 0.1% of the pixels (Metal
+and Windows WARP match exactly). On CPU rasterizer adapters (Mesa lavapipe in
+the Linux job) fixed-function blending rounds one step differently on 0.2–2.1%
+of the pixels of the fixture frames; those one-step differences are not counted
+there, while the 2-per-channel bound still applies. The software renderer itself
+must match its goldens in `tests/goldens/render/` exactly. Frames are only drawn on
 request (no idle frames), the surface is configured only on resize/DPI changes,
 and presentation is vsync (FIFO).
 

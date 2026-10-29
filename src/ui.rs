@@ -644,6 +644,12 @@ struct App {
     renderer_mode: RendererMode,
     /// Present when frames are drawn by the GPU; otherwise `surface` is used.
     gpu: Option<GpuRenderer>,
+    /// GPU frame failures since the last presented frame.
+    gpu_failures: u32,
+    /// Skipped GPU frame (occluded, timeout, surface lost): when to draw
+    /// again, and the current backoff.
+    retry_due: Option<Instant>,
+    retry_delay: Duration,
     view: Option<View>,
     scale: f64,
     mods: ModifiersState,
@@ -720,6 +726,9 @@ impl App {
             software: SoftwareRenderer::default(),
             renderer_mode,
             gpu: None,
+            gpu_failures: 0,
+            retry_due: None,
+            retry_delay: FRAME_RETRY_MIN,
             view: None,
             scale: 1.0,
             mods: ModifiersState::empty(),
@@ -1619,9 +1628,8 @@ impl App {
         self.surface = Some(surface);
         result
     }
-    /// GPU frame. A device or surface failure switches `auto` to the
-    /// software framebuffer for the rest of the session; `gpu` tries one new
-    /// device and otherwise ends with the error.
+    /// GPU frame. Failures go through [`Self::recover_from_gpu_error`];
+    /// skipped frames through [`Self::note_gpu_frame`].
     fn draw_gpu(&mut self, size: PhysicalSize<u32>) -> Result<()> {
         if size.width == 0 || size.height == 0 {
             return Ok(());
@@ -1664,40 +1672,84 @@ impl App {
                 if let Some(pixels) = dumped {
                     self.dump_frame(&pixels, size, "gpu");
                 }
-                if !presented {
-                    // Occluded or timed out: try again on the next event.
-                    return Ok(());
-                }
+                self.note_gpu_frame(presented);
                 Ok(())
             }
             Err(error) => {
                 let Some(window) = self.window.clone() else {
                     return Err(error);
                 };
-                self.gpu = None;
-                if self.renderer_mode == RendererMode::Gpu {
-                    match GpuRenderer::for_window(window, true) {
-                        Ok(gpu) => {
-                            self.gpu = Some(gpu);
-                            self.status = format!("GPU device recreated after: {error:#}");
-                        }
-                        Err(again) => {
-                            self.fatal_error = Some(format!(
-                                "GPU renderer failed: {error:#}; restart failed: {again:#}"
-                            ));
-                            return Err(again);
-                        }
-                    }
-                } else {
-                    self.start_software(window)?;
-                    self.status = format!("GPU renderer failed, switched to software: {error:#}");
-                    eprintln!("crow-term: {}", self.status);
-                }
-                self.invalidate_rows();
-                self.redraw();
-                Ok(())
+                let gpu_window = window.clone();
+                self.recover_from_gpu_error(
+                    error,
+                    move || GpuRenderer::for_window(gpu_window, true),
+                    move |app| app.start_software(window),
+                )
             }
         }
+    }
+    /// Bookkeeping after a GPU frame that did not fail: a presented frame
+    /// clears the failure count and the retry backoff; a skipped one
+    /// (occluded, timeout, surface lost twice) schedules another attempt with
+    /// a growing delay (50 ms up to 1 s), so stale content is replaced
+    /// without busy-looping while the window stays hidden.
+    fn note_gpu_frame(&mut self, presented: bool) {
+        if presented {
+            self.gpu_failures = 0;
+            self.retry_due = None;
+            self.retry_delay = FRAME_RETRY_MIN;
+        } else {
+            self.retry_due = Some(Instant::now() + self.retry_delay);
+            self.retry_delay = (self.retry_delay * 2).min(FRAME_RETRY_MAX);
+        }
+    }
+    /// A GPU frame failed. `auto` switches to the software framebuffer;
+    /// `gpu` gets one new device and, if frames fail again before one is
+    /// presented, ends with the error (no device-recreation loop). If the
+    /// replacement backend cannot start, the session ends with the error
+    /// instead of a frozen window.
+    fn recover_from_gpu_error(
+        &mut self,
+        error: anyhow::Error,
+        new_gpu: impl FnOnce() -> Result<GpuRenderer>,
+        new_software: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        self.gpu = None;
+        self.gpu_failures += 1;
+        match gpu_failure_action(self.renderer_mode, self.gpu_failures) {
+            GpuFailure::RecreateDevice => match new_gpu() {
+                Ok(gpu) => {
+                    self.gpu = Some(gpu);
+                    self.status = format!("GPU device recreated after: {error:#}");
+                    eprintln!("crow-term: {}", self.status);
+                }
+                Err(again) => {
+                    self.fatal_error = Some(format!(
+                        "GPU renderer failed: {error:#}; restart failed: {again:#}"
+                    ));
+                    return Err(again);
+                }
+            },
+            GpuFailure::Fatal => {
+                self.fatal_error = Some(format!(
+                    "GPU renderer failed again after a new device: {error:#}"
+                ));
+                return Err(error);
+            }
+            GpuFailure::SwitchToSoftware => {
+                if let Err(software) = new_software(self) {
+                    self.fatal_error = Some(format!(
+                        "GPU renderer failed ({error:#}) and the software renderer could not start: {software:#}"
+                    ));
+                    return Err(software);
+                }
+                self.status = format!("GPU renderer failed, switched to software: {error:#}");
+                eprintln!("crow-term: {}", self.status);
+            }
+        }
+        self.invalidate_rows();
+        self.redraw();
+        Ok(())
     }
     /// Compose the frame and draw it with the software backend.
     fn paint(&mut self, frame: &mut [u32], size: PhysicalSize<u32>) {
@@ -1815,6 +1867,26 @@ impl App {
                 dump.dir().display()
             );
         }
+    }
+}
+
+/// First and longest delay before retrying a skipped GPU frame.
+const FRAME_RETRY_MIN: Duration = Duration::from_millis(50);
+const FRAME_RETRY_MAX: Duration = Duration::from_secs(1);
+
+/// What to do after a GPU frame failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuFailure {
+    RecreateDevice,
+    SwitchToSoftware,
+    Fatal,
+}
+/// `failures` counts failed frames since the last presented one (>= 1).
+fn gpu_failure_action(mode: RendererMode, failures: u32) -> GpuFailure {
+    match mode {
+        RendererMode::Gpu if failures <= 1 => GpuFailure::RecreateDevice,
+        RendererMode::Gpu => GpuFailure::Fatal,
+        RendererMode::Auto | RendererMode::Software => GpuFailure::SwitchToSoftware,
     }
 }
 
@@ -2463,26 +2535,37 @@ impl ApplicationHandler<UiEvent> for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(until) = self.status_expires {
-            if Instant::now() >= until {
-                self.status_expires = None;
-                self.status.clear();
-                self.redraw();
-            } else if self.bell_flash.is_none() {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(until));
-                return;
-            }
+        // Timed redraws: transient status notes, the visual bell and retries
+        // of skipped GPU frames; otherwise stay event-driven.
+        let now = Instant::now();
+        if let Some(until) = self.status_expires
+            && now >= until
+        {
+            self.status_expires = None;
+            self.status.clear();
+            self.redraw();
         }
-        // The visual bell is the only other timed redraw; otherwise stay event-driven.
-        match &self.bell_flash {
-            Some((until, _)) if Instant::now() >= *until => {
-                self.bell_flash = None;
-                self.redraw();
-                event_loop.set_control_flow(ControlFlow::Wait);
-            }
-            Some((until, _)) => event_loop.set_control_flow(ControlFlow::WaitUntil(*until)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+        if let Some((until, _)) = &self.bell_flash
+            && now >= *until
+        {
+            self.bell_flash = None;
+            self.redraw();
         }
+        if let Some(due) = self.retry_due
+            && now >= due
+        {
+            self.retry_due = None;
+            self.redraw();
+        }
+        let next = [
+            self.status_expires,
+            self.bell_flash.as_ref().map(|(until, _)| *until),
+            self.retry_due,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        event_loop.set_control_flow(next.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
     fn exiting(&mut self, _: &ActiveEventLoop) {
         self.running.store(false, Ordering::Relaxed);
