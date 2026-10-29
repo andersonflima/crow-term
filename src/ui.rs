@@ -5,11 +5,10 @@ use crate::crow::{self, CrowView, Segment, Tone};
 use crate::ipc::rpc;
 use crate::keyboard::{self, KeyAction, KeyInput};
 use crate::model::*;
+use crate::render::software::SoftwareRenderer;
+use crate::render::{GridShaper, Layer, Op, Rect, Scene, parse_color};
 use anyhow::{Context as _, Result};
-use cosmic_text::{
-    Attrs, Buffer, Color, Family, FeatureTag, FontFeatures, FontSystem, Metrics, Shaping, Style,
-    SwashCache, Weight, Wrap,
-};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::{
@@ -28,10 +27,6 @@ use winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Theme, Window, WindowId};
 
-const REGULAR: &[u8] = include_bytes!("../assets/fonts/CrowquillMono-Regular.ttf");
-const BOLD: &[u8] = include_bytes!("../assets/fonts/CrowquillMono-Bold.ttf");
-const ITALIC: &[u8] = include_bytes!("../assets/fonts/CrowquillMono-Italic.ttf");
-const BOLD_ITALIC: &[u8] = include_bytes!("../assets/fonts/CrowquillMono-BoldItalic.ttf");
 const HEADER: f32 = 48.0;
 const FOOTER: f32 = 25.0;
 const PADDING: f32 = 10.0;
@@ -427,33 +422,6 @@ pub fn run(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Rect {
-    x: i32,
-    y: i32,
-    w: u32,
-    h: u32,
-}
-impl Rect {
-    fn contains(self, x: f64, y: f64) -> bool {
-        x >= self.x as f64
-            && y >= self.y as f64
-            && x < self.x as f64 + self.w as f64
-            && y < self.y as f64 + self.h as f64
-    }
-    fn intersection(self, other: Self) -> Self {
-        let x = self.x.max(other.x);
-        let y = self.y.max(other.y);
-        let right = (self.x as i64 + self.w as i64).min(other.x as i64 + other.w as i64);
-        let bottom = (self.y as i64 + self.h as i64).min(other.y as i64 + other.h as i64);
-        Self {
-            x,
-            y,
-            w: (right - x as i64).max(0) as u32,
-            h: (bottom - y as i64).max(0) as u32,
-        }
-    }
-}
 /// Vertical separators produce side-by-side panes; horizontal separators stack them.
 fn pane_rects(layout: &Layout, rect: Rect, gap: u32, out: &mut Vec<(u64, Rect)>) {
     match layout {
@@ -510,429 +478,6 @@ impl Selection {
         point >= start && point <= end
     }
 }
-struct CachedRow {
-    cells: Vec<Cell>,
-    pixels: Vec<u32>,
-    width: usize,
-}
-/// Families that hold the Nerd Font icons (Private Use Area), in preference order.
-const SYMBOL_FAMILIES: [&str; 2] = ["Symbols Nerd Font Mono", "Symbols Nerd Font"];
-/// Private Use Area code points: icon fonts live here, and a system CJK font's
-/// vendor glyphs at the same code points are never the intended icon.
-fn private_use(text: &str) -> bool {
-    text.chars().next().is_some_and(|c| {
-        matches!(c, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
-    })
-}
-struct Renderer {
-    fonts: FontSystem,
-    /// Installed Nerd symbols family for Private Use Area cells that the
-    /// configured family cannot draw itself.
-    symbols: Option<&'static str>,
-    /// Whether the configured family maps a Private Use Area code point.
-    primary_covers: HashMap<char, bool>,
-    swash: SwashCache,
-    rows: HashMap<(u64, usize), CachedRow>,
-    font_size: f32,
-    cell_width: u32,
-    cell_height: u32,
-    baseline: f32,
-}
-impl Renderer {
-    fn new(config: &Config, scale: f64) -> Self {
-        let mut fonts = FontSystem::new();
-        for data in [REGULAR, BOLD, ITALIC, BOLD_ITALIC] {
-            // Reuse the embedded read-only bytes instead of copying all four
-            // font faces (~38 MiB) into a second heap allocation.
-            fonts
-                .db_mut()
-                .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(data)));
-        }
-        fonts.db_mut().set_monospace_family(&config.font_family);
-        let symbols = SYMBOL_FAMILIES.into_iter().find(|family| {
-            fonts
-                .db()
-                .faces()
-                .any(|face| face.families.iter().any(|(name, _)| name == family))
-        });
-        let mut renderer = Self {
-            fonts,
-            symbols,
-            primary_covers: HashMap::new(),
-            swash: SwashCache::new(),
-            rows: HashMap::new(),
-            font_size: 18.0,
-            cell_width: 11,
-            cell_height: 23,
-            baseline: 18.0,
-        };
-        renderer.rescale(config, scale);
-        renderer
-    }
-    fn rescale(&mut self, config: &Config, scale: f64) {
-        self.font_size = (config.font_size * scale as f32).clamp(6.0, 160.0);
-        self.cell_height = (self.font_size * config.line_height).ceil().max(1.0) as u32;
-        let mut probe = Buffer::new(
-            &mut self.fonts,
-            Metrics::new(self.font_size, self.cell_height as f32),
-        );
-        probe.set_text(
-            "0",
-            &Attrs::new().family(Family::Name(&config.font_family)),
-            Shaping::Advanced,
-            None,
-        );
-        probe.shape_until_scroll(&mut self.fonts, false);
-        let metrics = probe
-            .layout_runs()
-            .next()
-            .map(|run| (run.line_w, run.line_y));
-        self.cell_width = metrics
-            .map(|(width, _)| width.ceil() as u32)
-            .unwrap_or((self.font_size * 0.6).ceil() as u32)
-            .max(1);
-        // Fallback fonts must not move the baseline of the entire terminal row.
-        self.baseline = metrics
-            .map(|(_, baseline)| baseline)
-            .unwrap_or(self.font_size);
-        self.rows.clear();
-        self.swash = SwashCache::new();
-    }
-    /// An icon cell drawn from the symbols family: a Private Use Area code point
-    /// the configured family does not map (a patched Nerd font keeps its own icons).
-    fn symbol_cell(&mut self, config: &Config, cell: &Cell) -> bool {
-        let Some(c) = cell.text.chars().next() else {
-            return false;
-        };
-        if self.symbols.is_none() || !private_use(&cell.text) {
-            return false;
-        }
-        if self.primary_covers.len() > 4096 {
-            self.primary_covers.clear();
-        }
-        let covered = match self.primary_covers.get(&c) {
-            Some(&covered) => covered,
-            None => {
-                let families = [cosmic_text::fontdb::Family::Name(&config.font_family)];
-                let id = self.fonts.db().query(&cosmic_text::fontdb::Query {
-                    families: &families,
-                    ..Default::default()
-                });
-                let covered = id
-                    .and_then(|id| self.fonts.get_font(id, Weight::NORMAL))
-                    .is_some_and(|font| font.as_swash().charmap().map(c) != 0);
-                self.primary_covers.insert(c, covered);
-                covered
-            }
-        };
-        !covered
-    }
-    fn attrs<'a>(&self, config: &'a Config, cell: &Cell, symbol: bool) -> Attrs<'a> {
-        let mut features = FontFeatures::new();
-        if !config.ligatures {
-            features
-                .disable(FeatureTag::STANDARD_LIGATURES)
-                .disable(FeatureTag::CONTEXTUAL_LIGATURES)
-                .disable(FeatureTag::CONTEXTUAL_ALTERNATES);
-        }
-        let family = match self.symbols {
-            Some(symbols) if symbol => symbols,
-            _ => config.font_family.as_str(),
-        };
-        Attrs::new()
-            .family(Family::Name(family))
-            // Symbols Nerd Font ships one weight; asking for bold would skip it.
-            .weight(if cell.bold && !symbol {
-                Weight::BOLD
-            } else {
-                Weight::NORMAL
-            })
-            .style(if cell.italic {
-                Style::Italic
-            } else {
-                Style::Normal
-            })
-            .color(cosmic_color(resolve_color(config, cell.fg)))
-            .font_features(features)
-    }
-    fn row(&mut self, config: &Config, pane: u64, row: usize, cells: &[Cell]) -> &CachedRow {
-        let key = (pane, row);
-        let needs_update = self
-            .rows
-            .get(&key)
-            .is_none_or(|cached| cached.cells != cells);
-        if needs_update {
-            let width = cells.len() * self.cell_width as usize;
-            let height = self.cell_height as usize;
-            let mut pixels = vec![parse_color(&config.background, 0x111111); width * height];
-            for (col, cell) in cells.iter().enumerate() {
-                let color = resolve_color(config, cell.bg);
-                for y in 0..height {
-                    let start = y * width + col * self.cell_width as usize;
-                    pixels[start..start + self.cell_width as usize].fill(color);
-                }
-            }
-            let (text, byte_cols) = row_text(cells);
-            let mut buffer = Buffer::new(
-                &mut self.fonts,
-                Metrics::new(self.font_size, self.cell_height as f32),
-            );
-            buffer.set_wrap(Wrap::None);
-            buffer.set_size(
-                Some(width as f32 + self.font_size * 4.0),
-                Some(self.cell_height as f32),
-            );
-            buffer.set_monospace_width(Some(self.cell_width as f32));
-            // Coalesce equal styles, rather than assigning per-cell metadata that breaks ligatures.
-            let mut spans: Vec<(&str, Attrs<'_>)> = Vec::new();
-            let mut begin = 0;
-            let symbol: Vec<bool> = cells
-                .iter()
-                .map(|cell| self.symbol_cell(config, cell))
-                .collect();
-            let mut previous_col: Option<usize> = None;
-            let mut current_attrs = None;
-            for &(byte, col) in &byte_cols {
-                let cell = &cells[col];
-                if previous_col.is_some_and(|old| {
-                    !same_text_style(&cells[old], cell) || symbol[old] != symbol[col]
-                }) {
-                    if let Some(attrs) = current_attrs.take() {
-                        spans.push((&text[begin..byte], attrs));
-                    }
-                    begin = byte;
-                }
-                if current_attrs.is_none() {
-                    current_attrs = Some(self.attrs(config, cell, symbol[col]));
-                }
-                previous_col = Some(col);
-            }
-            if let Some(attrs) = current_attrs {
-                spans.push((&text[begin..], attrs));
-            }
-            buffer.set_rich_text(
-                spans,
-                &Attrs::new().family(Family::Name(&config.font_family)),
-                Shaping::Advanced,
-                None,
-            );
-            buffer.shape_until_scroll(&mut self.fonts, false);
-            for run in buffer.layout_runs() {
-                let mut cluster_origins: HashMap<(usize, usize), f32> = HashMap::new();
-                for glyph in run.glyphs {
-                    cluster_origins
-                        .entry((glyph.start, glyph.end))
-                        .and_modify(|x| *x = x.min(glyph.x))
-                        .or_insert(glyph.x);
-                }
-                for glyph in run.glyphs {
-                    let mut glyph = glyph.clone();
-                    let col = column_for_byte(&byte_cols, glyph.start);
-                    let original_x = cluster_origins[&(glyph.start, glyph.end)];
-                    // Anchor every shaped cluster to its terminal cell. Combining glyph offsets
-                    // and multi-cell ligatures survive, while fallback advances cannot shift the grid.
-                    glyph.x = col as f32 * self.cell_width as f32 + glyph.x - original_x;
-                    let physical = glyph.physical((0.0, self.baseline), 1.0);
-                    let color = glyph
-                        .color_opt
-                        .unwrap_or(cosmic_color(parse_color(&config.foreground, 0xeaeaea)));
-                    self.swash.with_pixels(
-                        &mut self.fonts,
-                        physical.cache_key,
-                        color,
-                        |x, y, color| {
-                            let x = x + physical.x;
-                            let y = y + physical.y;
-                            if x >= 0 && y >= 0 && (x as usize) < width && (y as usize) < height {
-                                blend(&mut pixels[y as usize * width + x as usize], color);
-                            }
-                        },
-                    );
-                }
-            }
-            let cell_width = self.cell_width as usize;
-            for (col, cell) in cells.iter().enumerate() {
-                let color = resolve_color(config, cell.fg);
-                if cell.strike && width > 0 {
-                    let start = height / 2 * width + col * cell_width;
-                    pixels[start..start + cell_width].fill(color);
-                }
-                let (style, color) = underline_paint(config, cell);
-                draw_underline(
-                    &mut pixels,
-                    width,
-                    height,
-                    col * cell_width..(col + 1) * cell_width,
-                    style,
-                    color,
-                );
-            }
-            self.rows.insert(
-                key,
-                CachedRow {
-                    cells: cells.to_vec(),
-                    pixels,
-                    width,
-                },
-            );
-        }
-        &self.rows[&key]
-    }
-    // Raster destination, clipping and styling are deliberately explicit at this boundary.
-    #[allow(clippy::too_many_arguments)]
-    fn text(
-        &mut self,
-        frame: &mut [u32],
-        frame_width: usize,
-        clip: Rect,
-        x: i32,
-        y: i32,
-        text: &str,
-        color: u32,
-        config: &Config,
-        size: f32,
-    ) -> f32 {
-        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(size, size * 1.3));
-        buffer.set_wrap(Wrap::None);
-        buffer.set_text(
-            text,
-            &Attrs::new()
-                .family(Family::Name(&config.font_family))
-                .color(cosmic_color(color)),
-            Shaping::Advanced,
-            None,
-        );
-        buffer.shape_until_scroll(&mut self.fonts, false);
-        let mut width = 0f32;
-        for run in buffer.layout_runs() {
-            width = width.max(run.line_w);
-            for glyph in run.glyphs {
-                let physical = glyph.physical((x as f32, y as f32 + run.line_y), 1.0);
-                self.swash.with_pixels(
-                    &mut self.fonts,
-                    physical.cache_key,
-                    cosmic_color(color),
-                    |gx, gy, color| {
-                        let px = gx + physical.x;
-                        let py = gy + physical.y;
-                        if clip.contains(px as f64, py as f64)
-                            && let Some(pixel) =
-                                frame.get_mut(py as usize * frame_width + px as usize)
-                        {
-                            blend(pixel, color);
-                        }
-                    },
-                );
-            }
-        }
-        width
-    }
-}
-
-/// Underline style and color of a cell: SGR 58 color if set, else the
-/// foreground; snapshots that only set the boolean draw a single line.
-fn underline_paint(config: &Config, cell: &Cell) -> (UnderlineStyle, u32) {
-    let style = match cell.underline_style {
-        UnderlineStyle::None if cell.underline => UnderlineStyle::Single,
-        style => style,
-    };
-    let color = resolve_color(config, cell.underline_color.unwrap_or(cell.fg));
-    (style, color)
-}
-
-/// Rasterize one cell's underline into a row buffer. Pure and bounds-checked,
-/// so a later GPU renderer can share the geometry. Positions use row-absolute
-/// x, which keeps curly and dashed patterns continuous across cells.
-fn draw_underline(
-    pixels: &mut [u32],
-    width: usize,
-    height: usize,
-    columns: std::ops::Range<usize>,
-    style: UnderlineStyle,
-    color: u32,
-) {
-    if style == UnderlineStyle::None || width == 0 || height < 2 {
-        return;
-    }
-    let thickness = (height / 20).max(1);
-    let bottom = height - 1;
-    let mut plot = |x: usize, y: usize| {
-        if x < width && y < height {
-            pixels[y * width + x] = color;
-        }
-    };
-    let line = |plot: &mut dyn FnMut(usize, usize), x: usize, top: usize| {
-        for dy in 0..thickness {
-            plot(x, top + dy);
-        }
-    };
-    let single_top = height.saturating_sub(1 + thickness);
-    for x in columns.start..columns.end.min(width) {
-        match style {
-            UnderlineStyle::None => {}
-            UnderlineStyle::Single => line(&mut plot, x, single_top),
-            UnderlineStyle::Double => {
-                line(&mut plot, x, bottom + 1 - thickness);
-                line(&mut plot, x, bottom.saturating_sub(3 * thickness) + 1);
-            }
-            UnderlineStyle::Dotted => {
-                if (x / (thickness * 2).max(2)).is_multiple_of(2) {
-                    line(&mut plot, x, single_top);
-                }
-            }
-            UnderlineStyle::Dashed => {
-                let dash = (columns.len() / 2).max(3);
-                if (x / dash).is_multiple_of(2) {
-                    line(&mut plot, x, single_top);
-                }
-            }
-            UnderlineStyle::Curly => {
-                let amplitude = (height / 8).clamp(1, 12) as f32;
-                let period = (columns.len().max(4)) as f32;
-                let phase = (x as f32 / period) * std::f32::consts::TAU;
-                let offset = (amplitude * (1.0 - phase.cos()) / 2.0).round() as usize;
-                line(
-                    &mut plot,
-                    x,
-                    (bottom + 1).saturating_sub(thickness + offset),
-                );
-            }
-        }
-    }
-}
-
-fn same_text_style(a: &Cell, b: &Cell) -> bool {
-    a.fg == b.fg && a.bold == b.bold && a.italic == b.italic
-}
-fn row_text(cells: &[Cell]) -> (String, Vec<(usize, usize)>) {
-    let mut text = String::new();
-    let mut byte_cols = Vec::new();
-    for (col, cell) in cells.iter().enumerate() {
-        if cell.wide_spacer {
-            continue;
-        }
-        byte_cols.push((text.len(), col));
-        if cell.text.is_empty() {
-            text.push(' ');
-        } else {
-            text.push_str(&cell.text);
-        }
-    }
-    (text, byte_cols)
-}
-fn column_for_byte(map: &[(usize, usize)], byte: usize) -> usize {
-    map.iter()
-        .rev()
-        .find(|(start, _)| *start <= byte)
-        .map_or(0, |(_, col)| *col)
-}
-fn parse_color(value: &str, fallback: u32) -> u32 {
-    value
-        .strip_prefix('#')
-        .filter(|s| s.len() == 6)
-        .and_then(|s| u32::from_str_radix(s, 16).ok())
-        .unwrap_or(fallback)
-}
 fn mix_rgb(a: u32, b: u32, amount: u32) -> u32 {
     let channel = |shift: u32| -> u32 {
         let a = (a >> shift) & 255;
@@ -983,119 +528,37 @@ fn tone_color(tone: Tone, chrome: &Chrome, light: bool) -> u32 {
         (Tone::Alert, false) => 0xf07167,
     }
 }
-/// Rasterised crow panel, rebuilt only when its lines, size or scale change.
-struct PanelLayer {
-    key: u64,
-    width: usize,
-    pixels: Vec<u32>,
-}
-fn cosmic_color(value: u32) -> Color {
-    Color::rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
-}
-fn resolve_color(config: &Config, color: ColorSpec) -> u32 {
-    match color {
-        ColorSpec::Foreground => parse_color(&config.foreground, 0xeaeaea),
-        ColorSpec::Background => parse_color(&config.background, 0x111111),
-        ColorSpec::Rgb(r, g, b) => (r as u32) << 16 | (g as u32) << 8 | b as u32,
-        ColorSpec::Indexed(i) if i < 16 => config
-            .palette
-            .get(i as usize)
-            .map(|s| parse_color(s, 0xeaeaea))
-            .unwrap_or(0xeaeaea),
-        ColorSpec::Indexed(i) if i < 232 => {
-            let i = i as u32 - 16;
-            let v = |n| if n == 0 { 0 } else { 55 + 40 * n };
-            v(i / 36) << 16 | v(i / 6 % 6) << 8 | v(i % 6)
-        }
-        ColorSpec::Indexed(i) => {
-            let c = 8 + 10 * (i as u32 - 232);
-            c << 16 | c << 8 | c
-        }
-    }
-}
-fn blend(target: &mut u32, color: Color) {
-    let alpha = color.a() as u32;
-    if alpha == 0 {
-        return;
-    }
-    let mix = |old: u32, new: u32| (new * alpha + old * (255 - alpha) + 127) / 255;
-    *target = mix((*target >> 16) & 255, color.r() as u32) << 16
-        | mix((*target >> 8) & 255, color.g() as u32) << 8
-        | mix(*target & 255, color.b() as u32);
-}
-fn fill(frame: &mut [u32], width: usize, rect: Rect, color: u32) {
-    if width == 0 {
-        return;
-    }
-    let bounds = Rect {
-        x: 0,
-        y: 0,
-        w: width as u32,
-        h: (frame.len() / width) as u32,
-    };
-    let rect = rect.intersection(bounds);
-    for y in rect.y..rect.y + rect.h as i32 {
-        let start = y as usize * width + rect.x as usize;
-        frame[start..start + rect.w as usize].fill(color);
-    }
-}
-fn blit(
-    frame: &mut [u32],
-    width: usize,
-    source: &[u32],
-    source_width: usize,
-    x: i32,
-    y: i32,
-    clip: Rect,
-) {
-    if width == 0 || source_width == 0 {
-        return;
-    }
-    let target = Rect {
-        x,
-        y,
-        w: source_width as u32,
-        h: (source.len() / source_width) as u32,
-    }
-    .intersection(clip)
-    .intersection(Rect {
-        x: 0,
-        y: 0,
-        w: width as u32,
-        h: (frame.len() / width) as u32,
-    });
-    for row in target.y..target.y + target.h as i32 {
-        let src = (row - y) as usize * source_width + (target.x - x) as usize;
-        let dst = row as usize * width + target.x as usize;
-        frame[dst..dst + target.w as usize].copy_from_slice(&source[src..src + target.w as usize]);
-    }
-}
-
-/// Paint the crow agent list into its own buffer (cached by the caller).
+/// The crow agent list as a layer in panel-local coordinates (cached by the caller).
+// Layout inputs are deliberately explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn render_panel(
-    renderer: &mut Renderer,
+    shaper: &mut GridShaper,
     config: &Config,
     lines: &[Vec<Segment>],
     panel: Rect,
     scale: f64,
     chrome: &Chrome,
     light: bool,
-) -> Vec<u32> {
-    let (w, h) = (panel.w as usize, panel.h as usize);
-    let mut pixels = vec![chrome.surface; w * h];
+    key: u64,
+) -> Layer {
+    let h = panel.h as usize;
     let local = Rect {
         x: 0,
         y: 0,
         w: panel.w,
         h: panel.h,
     };
+    let mut ops = Vec::new();
     // Divider on the edge facing the panes.
     let divider = if config.crow.panel_position == "bottom" {
         Rect { h: 1, ..local }
     } else {
         Rect { w: 1, ..local }
     };
-    fill(&mut pixels, w, divider, chrome.border);
+    ops.push(Op::Fill {
+        rect: divider,
+        color: chrome.border,
+    });
     let pad = (PADDING * 1.4 * scale as f32) as i32;
     let line = (PANEL_LINE * scale as f32) as i32;
     let size = (12.0 * scale) as f32;
@@ -1105,22 +568,28 @@ fn render_panel(
     for segments in &crow::fit_lines(lines, capacity) {
         let mut x = pad;
         for segment in segments {
-            let width = renderer.text(
-                &mut pixels,
-                w,
+            let width = text_op(
+                &mut ops,
+                shaper,
+                config,
                 local,
                 x,
                 y,
                 &segment.text,
                 tone_color(segment.tone, chrome, light),
-                config,
                 size,
             );
             x += width.ceil() as i32 + gap;
         }
         y += line;
     }
-    pixels
+    Layer {
+        key,
+        width: panel.w,
+        height: panel.h,
+        background: chrome.surface,
+        ops,
+    }
 }
 
 struct App {
@@ -1136,7 +605,8 @@ struct App {
     fatal_error: Option<String>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    renderer: Renderer,
+    shaper: GridShaper,
+    software: SoftwareRenderer,
     view: Option<View>,
     scale: f64,
     mods: ModifiersState,
@@ -1171,7 +641,10 @@ struct App {
     crow_view: CrowView,
     crow_panel: bool,
     crow_pane: u64,
-    panel_layer: Option<PanelLayer>,
+    panel_layer: Option<Arc<Layer>>,
+    /// Offscreen tests draw without a window.
+    #[cfg(test)]
+    size_override: Option<PhysicalSize<u32>>,
     #[cfg(feature = "frame-dump")]
     frame_dump: Option<crate::frame_dump::FrameDump>,
 }
@@ -1190,7 +663,7 @@ impl App {
         mailbox: Arc<ViewMailbox>,
         crow: Option<Arc<crow::Shared>>,
     ) -> Self {
-        let renderer = Renderer::new(&config, 1.0);
+        let shaper = GridShaper::new(&config, 1.0);
         let crow_panel = crow.is_some() && config.crow.panel;
         Self {
             config,
@@ -1205,7 +678,8 @@ impl App {
             fatal_error: None,
             window: None,
             surface: None,
-            renderer,
+            shaper,
+            software: SoftwareRenderer::default(),
             view: None,
             scale: 1.0,
             mods: ModifiersState::empty(),
@@ -1234,6 +708,8 @@ impl App {
             crow_panel,
             crow_pane: pane_id,
             panel_layer: None,
+            #[cfg(test)]
+            size_override: None,
             #[cfg(feature = "frame-dump")]
             frame_dump: crate::frame_dump::FrameDump::from_env(),
         }
@@ -1243,7 +719,7 @@ impl App {
         if !self.crow_panel {
             return None;
         }
-        let size = self.window.as_ref()?.inner_size();
+        let size = self.window_size()?;
         let scale = self.scale as f32;
         let top = (HEADER * scale).round() as u32;
         let footer = (FOOTER * scale).round() as u32;
@@ -1283,7 +759,7 @@ impl App {
         shared.panel.store(self.crow_panel, Ordering::Relaxed);
         shared.wake();
         self.panel_layer = None;
-        self.renderer.rows.clear();
+        self.software.invalidate();
         self.resize_panes();
         self.redraw();
     }
@@ -1343,10 +819,9 @@ impl App {
             .unwrap_or_default()
     }
     fn rects(&self) -> Vec<(u64, Rect)> {
-        let Some(window) = &self.window else {
+        let Some(size) = self.window_size() else {
             return Vec::new();
         };
-        let size = window.inner_size();
         let padding = (PADDING * self.scale as f32).round() as u32;
         let top = (HEADER * self.scale as f32).round() as u32;
         let footer = (FOOTER * self.scale as f32).round() as u32;
@@ -1380,10 +855,10 @@ impl App {
     }
     fn rect_size(&self, rect: Rect) -> Size {
         Size {
-            cols: (rect.w / self.renderer.cell_width).clamp(2, 400) as u16,
-            rows: (rect.h / self.renderer.cell_height)
+            cols: (rect.w / self.shaper.cell_width).clamp(2, 400) as u16,
+            rows: (rect.h / self.shaper.cell_height)
                 .clamp(1, 200)
-                .min(40_000 / (rect.w / self.renderer.cell_width).clamp(2, 400))
+                .min(40_000 / (rect.w / self.shaper.cell_width).clamp(2, 400))
                 as u16,
         }
     }
@@ -1393,8 +868,8 @@ impl App {
             if self.sent_sizes.get(&pane) != Some(&size) {
                 self.sent_sizes.insert(pane, size);
                 let cell = CellPixels {
-                    width: self.renderer.cell_width.min(u32::from(u16::MAX)) as u16,
-                    height: self.renderer.cell_height.min(u32::from(u16::MAX)) as u16,
+                    width: self.shaper.cell_width.min(u32::from(u16::MAX)) as u16,
+                    height: self.shaper.cell_height.min(u32::from(u16::MAX)) as u16,
                 };
                 self.send(
                     Request::Resize {
@@ -1415,10 +890,10 @@ impl App {
         {
             window.set_ime_cursor_area(
                 PhysicalPosition::new(
-                    rect.x + (screen.cursor.col as u32 * self.renderer.cell_width) as i32,
-                    rect.y + (screen.cursor.row as u32 * self.renderer.cell_height) as i32,
+                    rect.x + (screen.cursor.col as u32 * self.shaper.cell_width) as i32,
+                    rect.y + (screen.cursor.row as u32 * self.shaper.cell_height) as i32,
                 ),
-                PhysicalSize::new(self.renderer.cell_width, self.renderer.cell_height),
+                PhysicalSize::new(self.shaper.cell_width, self.shaper.cell_height),
             );
         }
     }
@@ -1468,7 +943,7 @@ impl App {
             self.focus_pane(id);
         }
         self.selection = None;
-        self.renderer.rows.clear();
+        self.software.invalidate();
         self.resize_panes();
         self.redraw();
     }
@@ -1731,9 +1206,9 @@ impl App {
                 (
                     pane,
                     Point {
-                        col: (((x - rect.x as f64) / self.renderer.cell_width as f64) as usize)
+                        col: (((x - rect.x as f64) / self.shaper.cell_width as f64) as usize)
                             .min(size.cols.saturating_sub(1) as usize),
-                        row: (((y - rect.y as f64) / self.renderer.cell_height as f64) as usize)
+                        row: (((y - rect.y as f64) / self.shaper.cell_height as f64) as usize)
                             .min(size.rows.saturating_sub(1) as usize),
                     },
                 )
@@ -1773,8 +1248,8 @@ impl App {
             origin,
             self.cursor.x,
             self.cursor.y,
-            self.renderer.cell_width,
-            self.renderer.cell_height,
+            self.shaper.cell_width,
+            self.shaper.cell_height,
         ) {
             self.mouse_report_to(pane, mouse_code(button), point, true);
         }
@@ -1790,8 +1265,8 @@ impl App {
                     origin,
                     self.cursor.x,
                     self.cursor.y,
-                    self.renderer.cell_width,
-                    self.renderer.cell_height,
+                    self.shaper.cell_width,
+                    self.shaper.cell_height,
                 )
             {
                 let modes = self
@@ -1884,7 +1359,7 @@ impl App {
     fn wheel(&mut self, delta: MouseScrollDelta) {
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, y) => y as f64,
-            MouseScrollDelta::PixelDelta(position) => position.y / self.renderer.cell_height as f64,
+            MouseScrollDelta::PixelDelta(position) => position.y / self.shaper.cell_height as f64,
         };
         self.wheel_remainder += lines;
         let count = self.wheel_remainder.trunc() as i32;
@@ -1999,14 +1474,11 @@ impl App {
         }
     }
     fn tab_rects(&self) -> Vec<(u64, Rect)> {
-        let Some(window) = &self.window else {
+        let Some(size) = self.window_size() else {
             return Vec::new();
         };
         let start = (190.0 * self.scale) as i32;
-        let available = window
-            .inner_size()
-            .width
-            .saturating_sub(start.max(0) as u32 + 16);
+        let available = size.width.saturating_sub(start.max(0) as u32 + 16);
         let windows = self.windows();
         let width = if windows.is_empty() {
             0
@@ -2029,19 +1501,121 @@ impl App {
             })
             .collect()
     }
+    /// Physical size of the drawable area.
+    fn window_size(&self) -> Option<PhysicalSize<u32>> {
+        #[cfg(test)]
+        if let Some(size) = self.size_override {
+            return Some(size);
+        }
+        Some(self.window.as_ref()?.inner_size())
+    }
     fn draw(&mut self) -> Result<()> {
-        let Some(window) = &self.window else {
+        let Some(size) = self.window_size() else {
             return Ok(());
         };
-        let size = window.inner_size();
         let (Some(width), Some(height)) =
             (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
             return Ok(());
         };
+        let Some(mut surface) = self.surface.take() else {
+            return Ok(());
+        };
+        let result = (|| -> Result<()> {
+            surface
+                .resize(width, height)
+                .map_err(|error| anyhow::anyhow!("resize native surface: {error}"))?;
+            let mut frame = surface
+                .buffer_mut()
+                .map_err(|error| anyhow::anyhow!("native framebuffer: {error}"))?;
+            self.paint(&mut frame, size);
+            #[cfg(feature = "frame-dump")]
+            self.dump_frame(&frame, size);
+            frame
+                .present()
+                .map_err(|error| anyhow::anyhow!("present native surface: {error}"))
+        })();
+        self.surface = Some(surface);
+        result
+    }
+    /// Compose the frame and draw it with the software backend.
+    fn paint(&mut self, frame: &mut [u32], size: PhysicalSize<u32>) {
         let rects = self.rects();
-        #[cfg(feature = "frame-dump")]
-        let dump_panes: Vec<crate::frame_dump::PaneMeta> = rects
+        let panel = self.panel_rect().map(|rect| (rect, self.panel_layer(rect)));
+        let parts = FrameParts {
+            config: &self.config,
+            session: &self.session,
+            window_id: self.window_id,
+            pane_id: self.pane_id,
+            scale: self.scale,
+            view: self.view.as_ref(),
+            selection: self.selection.as_ref(),
+            ime: &self.ime,
+            status: &self.status,
+            prefix: self.prefix,
+            bell_flash: self.bell_flash.as_ref(),
+            crow_status: &self.crow_view.status,
+            stuck: self.stuck,
+            rects,
+            tabs: self.tab_rects(),
+            windows: self.windows(),
+            panel,
+        };
+        let scene = compose(&parts, &mut self.shaper, size);
+        self.software
+            .render(&scene, &mut self.shaper, &self.config, frame);
+        if let Some(shared) = &self.crow
+            && self.crow_pane != self.pane_id
+        {
+            self.crow_pane = self.pane_id;
+            shared.pane.store(self.pane_id, Ordering::Relaxed);
+            shared.wake();
+        }
+    }
+    /// The crow panel as a cached layer, reshaped only when its lines, size,
+    /// scale or colors change.
+    fn panel_layer(&mut self, panel: Rect) -> Arc<Layer> {
+        let chrome = Chrome::new(&self.config);
+        let light = light_background(&self.config);
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            self.crow_view.panel.hash(&mut hash);
+            (
+                panel.w,
+                panel.h,
+                self.scale.to_bits(),
+                chrome.surface,
+                light,
+            )
+                .hash(&mut hash);
+            hash.finish()
+        };
+        if let Some(layer) = &self.panel_layer
+            && layer.key == key
+        {
+            return layer.clone();
+        }
+        let layer = Arc::new(render_panel(
+            &mut self.shaper,
+            &self.config,
+            &self.crow_view.panel,
+            panel,
+            self.scale,
+            &chrome,
+            light,
+            key,
+        ));
+        self.panel_layer = Some(layer.clone());
+        layer
+    }
+    #[cfg(feature = "frame-dump")]
+    fn dump_frame(&mut self, frame: &[u32], size: PhysicalSize<u32>) {
+        if self.frame_dump.is_none() {
+            return;
+        }
+        let panes = self
+            .rects()
             .iter()
             .map(|&(id, rect)| {
                 let grid = self.rect_size(rect);
@@ -2056,467 +1630,438 @@ impl App {
                 }
             })
             .collect();
-        let flash_rects = rects.clone();
-        let panel_rect = self.panel_rect();
-        let tabs = self.tab_rects();
-        let windows = self.windows();
-        let chrome = Chrome::new(&self.config);
-        let Some(surface) = &mut self.surface else {
-            return Ok(());
-        };
-        surface
-            .resize(width, height)
-            .map_err(|error| anyhow::anyhow!("resize native surface: {error}"))?;
-        let mut frame = surface
-            .buffer_mut()
-            .map_err(|error| anyhow::anyhow!("native framebuffer: {error}"))?;
-        let fw = size.width as usize;
-        let bounds = Rect {
-            x: 0,
-            y: 0,
-            w: size.width,
-            h: size.height,
-        };
-        frame.fill(parse_color(&self.config.background, 0x111111));
-        let header_h = (HEADER as f64 * self.scale) as u32;
-        fill(
-            &mut frame,
-            fw,
-            Rect {
-                h: header_h,
-                ..bounds
-            },
-            chrome.surface,
-        );
-        fill(
-            &mut frame,
-            fw,
-            Rect {
-                x: 0,
-                y: header_h.saturating_sub(1) as i32,
-                w: size.width,
-                h: 1,
-            },
-            chrome.border,
-        );
-        let label = format!("CROW / {}", self.session);
-        self.renderer.text(
-            &mut frame,
-            fw,
-            Rect {
-                w: (180.0 * self.scale) as u32,
-                h: header_h,
-                ..bounds
-            },
-            (14.0 * self.scale) as i32,
-            (13.0 * self.scale) as i32,
-            &label,
-            chrome.text,
-            &self.config,
-            (14.0 * self.scale) as f32,
-        );
-        for (id, rect) in tabs {
-            let active = id == self.window_id;
-            if active {
-                fill(&mut frame, fw, rect, chrome.active);
-                fill(
-                    &mut frame,
-                    fw,
-                    Rect {
-                        x: rect.x,
-                        y: rect.h.saturating_sub(2) as i32,
-                        w: rect.w,
-                        h: 2,
-                    },
-                    chrome.text,
-                );
-            }
-            if let Some(info) = windows.iter().find(|info| info.id == id) {
-                let index = windows
-                    .iter()
-                    .position(|window| window.id == id)
-                    .unwrap_or(0)
-                    + 1;
-                let text = format!("{index}  {}", info.name);
-                self.renderer.text(
-                    &mut frame,
-                    fw,
-                    rect.intersection(bounds),
-                    rect.x + (10.0 * self.scale) as i32,
-                    (13.0 * self.scale) as i32,
-                    &text,
-                    if active { chrome.text } else { chrome.muted },
-                    &self.config,
-                    (14.0 * self.scale) as f32,
-                );
-            }
-        }
-        let active_panes = rects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        self.renderer
-            .rows
-            .retain(|(id, _), _| active_panes.contains(id));
-        let screens = self
+        let cursor = self
             .view
             .as_ref()
-            .map(|view| view.screens.as_slice())
-            .unwrap_or(&[]);
-        for (pane, rect) in rects {
-            let clip = rect.intersection(bounds);
-            if let Some((_, screen)) = screens.iter().find(|(id, _)| *id == pane) {
-                let cw = self.renderer.cell_width;
-                let ch = self.renderer.cell_height;
-                for (row, cells) in screen.cells.iter().enumerate().take((rect.h / ch) as usize) {
-                    let mut selected_cells = None;
-                    if let Some(selection) = &self.selection
-                        && selection.pane == pane
-                        && cells
-                            .iter()
-                            .enumerate()
-                            .any(|(col, _)| selection.contains(row, col))
-                    {
-                        let mut copy = cells.clone();
-                        let color = parse_color(&self.config.selection, 0xdadada);
-                        for (col, cell) in copy.iter_mut().enumerate() {
-                            if selection.contains(row, col) {
-                                cell.bg = ColorSpec::Rgb(
-                                    (color >> 16) as u8,
-                                    (color >> 8) as u8,
-                                    color as u8,
-                                );
-                            }
-                        }
-                        selected_cells = Some(copy);
-                    }
-                    let cached = self.renderer.row(
-                        &self.config,
-                        pane,
-                        row,
-                        selected_cells.as_deref().unwrap_or(cells),
-                    );
-                    blit(
-                        &mut frame,
-                        fw,
-                        &cached.pixels,
-                        cached.width,
-                        rect.x,
-                        rect.y + (row as u32 * ch) as i32,
-                        clip,
-                    );
-                }
-                if pane == self.pane_id
-                    && screen.cursor.visible
-                    && screen.cursor.shape != "hidden"
-                    && screen.display_offset == 0
-                {
-                    let mut cursor = Rect {
-                        x: rect.x + (screen.cursor.col as u32 * cw) as i32,
-                        y: rect.y + (screen.cursor.row as u32 * ch) as i32,
-                        w: cw,
-                        h: ch,
-                    };
-                    let color = parse_color(&self.config.cursor, 0xffffff);
-                    let shape = screen.cursor.shape.to_ascii_lowercase();
-                    if shape.contains("beam") {
-                        cursor.w = (self.scale.ceil() as u32).max(1);
-                        fill(&mut frame, fw, cursor.intersection(clip), color);
-                    } else if shape.contains("underline") {
-                        cursor.y += ch.saturating_sub(2) as i32;
-                        cursor.h = 2;
-                        fill(&mut frame, fw, cursor.intersection(clip), color);
-                    } else if shape.contains("hollow") {
-                        let border = cursor.intersection(clip);
-                        fill(&mut frame, fw, Rect { h: 1, ..border }, color);
-                        fill(
-                            &mut frame,
-                            fw,
-                            Rect {
-                                y: border.y + border.h.saturating_sub(1) as i32,
-                                h: 1,
-                                ..border
-                            },
-                            color,
-                        );
-                        fill(&mut frame, fw, Rect { w: 1, ..border }, color);
-                        fill(
-                            &mut frame,
-                            fw,
-                            Rect {
-                                x: border.x + border.w.saturating_sub(1) as i32,
-                                w: 1,
-                                ..border
-                            },
-                            color,
-                        );
-                    } else {
-                        let cursor = cursor.intersection(clip);
-                        for y in cursor.y..cursor.y + cursor.h as i32 {
-                            for x in cursor.x..cursor.x + cursor.w as i32 {
-                                let pixel = &mut frame[y as usize * fw + x as usize];
-                                *pixel ^= 0xffffff;
-                            }
-                        }
-                    }
-                    if !self.ime.is_empty() {
-                        let composition = Rect {
-                            x: cursor.x,
-                            y: cursor.y,
-                            w: ((self.ime.chars().count() + 2) as u32 * cw).min(clip.w),
-                            h: ch,
-                        }
-                        .intersection(clip);
-                        fill(&mut frame, fw, composition, chrome.active);
-                        self.renderer.text(
-                            &mut frame,
-                            fw,
-                            composition,
-                            composition.x,
-                            composition.y,
-                            &self.ime,
-                            chrome.text,
-                            &self.config,
-                            self.renderer.font_size,
-                        );
-                    }
-                }
-                if pane == self.pane_id && active_panes.len() > 1 {
-                    fill(
-                        &mut frame,
-                        fw,
-                        Rect {
-                            x: rect.x,
-                            y: rect.y.saturating_sub(2),
-                            w: rect.w,
-                            h: 1,
-                        }
-                        .intersection(bounds),
-                        chrome.border,
-                    );
-                }
-            } else {
-                self.renderer.text(
-                    &mut frame,
-                    fw,
-                    clip,
-                    rect.x,
-                    rect.y,
-                    "Connecting to persistent session…",
-                    chrome.muted,
-                    &self.config,
-                    self.renderer.font_size,
-                );
-            }
+            .and_then(|view| view.screens.iter().find(|(id, _)| *id == self.pane_id))
+            .map(|(_, screen)| crate::frame_dump::CursorMeta {
+                row: screen.cursor.row,
+                col: screen.cursor.col,
+                visible: screen.cursor.visible,
+                shape: screen.cursor.shape.clone(),
+            });
+        let Some(dump) = &mut self.frame_dump else {
+            return;
+        };
+        let meta = crate::frame_dump::FrameMeta {
+            schema: "crow-frame/1",
+            seq: dump.next_seq(),
+            renderer: "software",
+            width: size.width,
+            height: size.height,
+            scale: self.scale,
+            cell_width: self.shaper.cell_width,
+            cell_height: self.shaper.cell_height,
+            revision: self.view.as_ref().map_or(0, |view| view.revision),
+            session: self.session.clone(),
+            window: self.window_id,
+            pane: self.pane_id,
+            panes,
+            cursor,
+            focused: self.focused,
+            prefix: self.prefix,
+            status: self.status.clone(),
+            ime: self.ime.clone(),
+            stuck_pane: self.stuck.map(|(pane, _)| pane),
+        };
+        if let Err(error) = dump.write(frame, size.width, size.height, &meta) {
+            eprintln!(
+                "crow-term: frame dump to {} failed: {error}",
+                dump.dir().display()
+            );
         }
-        if let Some((until, panes)) = &self.bell_flash
-            && Instant::now() < *until
-        {
-            let thickness = (2.0 * self.scale).ceil().max(1.0) as u32;
-            for &(pane, rect) in &flash_rects {
-                if !panes.contains(&pane) {
-                    continue;
+    }
+}
+
+/// Everything a frame shows, borrowed from the app so composing a scene does
+/// not copy terminal cells.
+struct FrameParts<'a> {
+    config: &'a Config,
+    session: &'a str,
+    window_id: u64,
+    pane_id: u64,
+    scale: f64,
+    view: Option<&'a View>,
+    selection: Option<&'a Selection>,
+    ime: &'a str,
+    status: &'a str,
+    prefix: bool,
+    bell_flash: Option<&'a (Instant, HashSet<u64>)>,
+    crow_status: &'a [Segment],
+    stuck: Option<(u64, usize)>,
+    rects: Vec<(u64, Rect)>,
+    tabs: Vec<(u64, Rect)>,
+    windows: Vec<WindowInfo>,
+    panel: Option<(Rect, Arc<Layer>)>,
+}
+
+/// Push shaped UI text and return its width.
+// Text origin, clip, color and size are deliberately explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
+fn text_op(
+    ops: &mut Vec<Op<'_>>,
+    shaper: &mut GridShaper,
+    config: &Config,
+    clip: Rect,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: u32,
+    size: f32,
+) -> f32 {
+    let (glyphs, width) = shaper.shape_text(config, x, y, text, color, size);
+    ops.push(Op::Glyphs { clip, glyphs });
+    width
+}
+
+/// Build the frame: chrome, panes, cursor, overlays, footer and crow panel,
+/// in painting order.
+fn compose<'a>(
+    parts: &FrameParts<'a>,
+    shaper: &mut GridShaper,
+    size: PhysicalSize<u32>,
+) -> Scene<'a> {
+    let config = parts.config;
+    let scale = parts.scale;
+    let chrome = Chrome::new(config);
+    let mut ops: Vec<Op<'a>> = Vec::new();
+    let bounds = Rect {
+        x: 0,
+        y: 0,
+        w: size.width,
+        h: size.height,
+    };
+    let header_h = (HEADER as f64 * scale) as u32;
+    ops.push(Op::Fill {
+        rect: Rect {
+            h: header_h,
+            ..bounds
+        },
+        color: chrome.surface,
+    });
+    ops.push(Op::Fill {
+        rect: Rect {
+            x: 0,
+            y: header_h.saturating_sub(1) as i32,
+            w: size.width,
+            h: 1,
+        },
+        color: chrome.border,
+    });
+    let label = format!("CROW / {}", parts.session);
+    text_op(
+        &mut ops,
+        shaper,
+        config,
+        Rect {
+            w: (180.0 * scale) as u32,
+            h: header_h,
+            ..bounds
+        },
+        (14.0 * scale) as i32,
+        (13.0 * scale) as i32,
+        &label,
+        chrome.text,
+        (14.0 * scale) as f32,
+    );
+    for &(id, rect) in &parts.tabs {
+        let active = id == parts.window_id;
+        if active {
+            ops.push(Op::Fill {
+                rect,
+                color: chrome.active,
+            });
+            ops.push(Op::Fill {
+                rect: Rect {
+                    x: rect.x,
+                    y: rect.h.saturating_sub(2) as i32,
+                    w: rect.w,
+                    h: 2,
+                },
+                color: chrome.text,
+            });
+        }
+        if let Some(info) = parts.windows.iter().find(|info| info.id == id) {
+            let index = parts
+                .windows
+                .iter()
+                .position(|window| window.id == id)
+                .unwrap_or(0)
+                + 1;
+            let text = format!("{index}  {}", info.name);
+            text_op(
+                &mut ops,
+                shaper,
+                config,
+                rect.intersection(bounds),
+                rect.x + (10.0 * scale) as i32,
+                (13.0 * scale) as i32,
+                &text,
+                if active { chrome.text } else { chrome.muted },
+                (14.0 * scale) as f32,
+            );
+        }
+    }
+    let live_panes = parts.rects.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    let screens = parts
+        .view
+        .map(|view| view.screens.as_slice())
+        .unwrap_or(&[]);
+    let cw = shaper.cell_width;
+    let ch = shaper.cell_height;
+    for &(pane, rect) in &parts.rects {
+        let clip = rect.intersection(bounds);
+        let Some((_, screen)) = screens.iter().find(|(id, _)| *id == pane) else {
+            text_op(
+                &mut ops,
+                shaper,
+                config,
+                clip,
+                rect.x,
+                rect.y,
+                "Connecting to persistent session…",
+                chrome.muted,
+                shaper.font_size,
+            );
+            continue;
+        };
+        for (row, cells) in screen.cells.iter().enumerate().take((rect.h / ch) as usize) {
+            let mut row_cells = Cow::Borrowed(cells.as_slice());
+            if let Some(selection) = parts.selection
+                && selection.pane == pane
+                && (0..cells.len()).any(|col| selection.contains(row, col))
+            {
+                let color = parse_color(&config.selection, 0xdadada);
+                for (col, cell) in row_cells.to_mut().iter_mut().enumerate() {
+                    if selection.contains(row, col) {
+                        cell.bg =
+                            ColorSpec::Rgb((color >> 16) as u8, (color >> 8) as u8, color as u8);
+                    }
                 }
-                let rect = rect.intersection(bounds);
-                for edge in [
+            }
+            ops.push(Op::Row {
+                pane,
+                row,
+                cells: row_cells,
+                x: rect.x,
+                y: rect.y + (row as u32 * ch) as i32,
+                clip,
+            });
+        }
+        if pane == parts.pane_id
+            && screen.cursor.visible
+            && screen.cursor.shape != "hidden"
+            && screen.display_offset == 0
+        {
+            let mut cursor = Rect {
+                x: rect.x + (screen.cursor.col as u32 * cw) as i32,
+                y: rect.y + (screen.cursor.row as u32 * ch) as i32,
+                w: cw,
+                h: ch,
+            };
+            let color = parse_color(&config.cursor, 0xffffff);
+            let shape = screen.cursor.shape.to_ascii_lowercase();
+            if shape.contains("beam") {
+                cursor.w = (scale.ceil() as u32).max(1);
+                ops.push(Op::Fill {
+                    rect: cursor.intersection(clip),
+                    color,
+                });
+            } else if shape.contains("underline") {
+                cursor.y += ch.saturating_sub(2) as i32;
+                cursor.h = 2;
+                ops.push(Op::Fill {
+                    rect: cursor.intersection(clip),
+                    color,
+                });
+            } else if shape.contains("hollow") {
+                let border = cursor.intersection(clip);
+                for rect in [
+                    Rect { h: 1, ..border },
                     Rect {
-                        h: thickness,
-                        ..rect
+                        y: border.y + border.h.saturating_sub(1) as i32,
+                        h: 1,
+                        ..border
                     },
+                    Rect { w: 1, ..border },
                     Rect {
-                        y: rect.y + rect.h.saturating_sub(thickness) as i32,
-                        h: thickness,
-                        ..rect
-                    },
-                    Rect {
-                        w: thickness,
-                        ..rect
-                    },
-                    Rect {
-                        x: rect.x + rect.w.saturating_sub(thickness) as i32,
-                        w: thickness,
-                        ..rect
+                        x: border.x + border.w.saturating_sub(1) as i32,
+                        w: 1,
+                        ..border
                     },
                 ] {
-                    fill(&mut frame, fw, edge.intersection(bounds), chrome.text);
+                    ops.push(Op::Fill { rect, color });
                 }
+            } else {
+                ops.push(Op::Invert {
+                    rect: cursor.intersection(clip),
+                });
+            }
+            if !parts.ime.is_empty() {
+                let composition = Rect {
+                    x: cursor.x,
+                    y: cursor.y,
+                    w: ((parts.ime.chars().count() + 2) as u32 * cw).min(clip.w),
+                    h: ch,
+                }
+                .intersection(clip);
+                ops.push(Op::Fill {
+                    rect: composition,
+                    color: chrome.active,
+                });
+                text_op(
+                    &mut ops,
+                    shaper,
+                    config,
+                    composition,
+                    composition.x,
+                    composition.y,
+                    parts.ime,
+                    chrome.text,
+                    shaper.font_size,
+                );
             }
         }
-        let footer_y = size
-            .height
-            .saturating_sub((FOOTER as f64 * self.scale) as u32) as i32;
-        let footer = Rect {
-            x: 0,
-            y: footer_y,
-            w: size.width,
-            h: size.height.saturating_sub(footer_y as u32),
-        };
-        fill(&mut frame, fw, footer, chrome.surface);
-        let hint = if self.prefix {
-            "PREFIX  c window   % / \" split   n/p tabs   h/j/k/l panes   a agents   d detach   x close"
-                .to_owned()
-        } else if !self.status.is_empty() {
-            self.status.clone()
-        } else {
-            format!(
-                "{}  ·  session {}  ·  pane {}  ·  closing this window detaches",
-                if self.config.prefix.eq_ignore_ascii_case("none") {
-                    "tmux passthrough".to_owned()
-                } else {
-                    format!("{} prefix", self.config.prefix)
+        if pane == parts.pane_id && live_panes.len() > 1 {
+            ops.push(Op::Fill {
+                rect: Rect {
+                    x: rect.x,
+                    y: rect.y.saturating_sub(2),
+                    w: rect.w,
+                    h: 1,
+                }
+                .intersection(bounds),
+                color: chrome.border,
+            });
+        }
+    }
+    if let Some((until, panes)) = parts.bell_flash
+        && Instant::now() < *until
+    {
+        let thickness = (2.0 * scale).ceil().max(1.0) as u32;
+        for &(pane, rect) in &parts.rects {
+            if !panes.contains(&pane) {
+                continue;
+            }
+            let rect = rect.intersection(bounds);
+            for edge in [
+                Rect {
+                    h: thickness,
+                    ..rect
                 },
-                self.session,
-                self.pane_id
+                Rect {
+                    y: rect.y + rect.h.saturating_sub(thickness) as i32,
+                    h: thickness,
+                    ..rect
+                },
+                Rect {
+                    w: thickness,
+                    ..rect
+                },
+                Rect {
+                    x: rect.x + rect.w.saturating_sub(thickness) as i32,
+                    w: thickness,
+                    ..rect
+                },
+            ] {
+                ops.push(Op::Fill {
+                    rect: edge.intersection(bounds),
+                    color: chrome.text,
+                });
+            }
+        }
+    }
+    let footer_y = size.height.saturating_sub((FOOTER as f64 * scale) as u32) as i32;
+    let footer = Rect {
+        x: 0,
+        y: footer_y,
+        w: size.width,
+        h: size.height.saturating_sub(footer_y as u32),
+    };
+    ops.push(Op::Fill {
+        rect: footer,
+        color: chrome.surface,
+    });
+    let hint = if parts.prefix {
+        "PREFIX  c window   % / \" split   n/p tabs   h/j/k/l panes   a agents   d detach   x close"
+            .to_owned()
+    } else if !parts.status.is_empty() {
+        parts.status.to_owned()
+    } else {
+        format!(
+            "{}  ·  session {}  ·  pane {}  ·  closing this window detaches",
+            if config.prefix.eq_ignore_ascii_case("none") {
+                "tmux passthrough".to_owned()
+            } else {
+                format!("{} prefix", config.prefix)
+            },
+            parts.session,
+            parts.pane_id
+        )
+    };
+    let light = light_background(config);
+    // Footer order: prefix help alone; otherwise status/error messages first (they
+    // must stay visible), then the crow segments, then the default session hint.
+    let hint_color = if parts.prefix {
+        chrome.text
+    } else {
+        chrome.muted
+    };
+    let mut footer_items: Vec<(&str, u32)> = Vec::new();
+    // Shown whatever else the footer says: input is waiting, not lost.
+    let stuck = parts.stuck.map(|(pane, kib)| {
+        format!("pane {pane}: the program is not reading input — {kib} KB waiting")
+    });
+    if let Some(stuck) = &stuck {
+        footer_items.push((stuck, chrome.text));
+    }
+    let message_first = parts.prefix || !parts.status.is_empty();
+    if message_first {
+        footer_items.push((&hint, hint_color));
+    }
+    if !parts.prefix {
+        footer_items.extend(parts.crow_status.iter().map(|segment| {
+            (
+                segment.text.as_str(),
+                tone_color(segment.tone, &chrome, light),
             )
-        };
-        let light = light_background(&self.config);
-        // Footer order: prefix help alone; otherwise status/error messages first (they
-        // must stay visible), then the crow segments, then the default session hint.
-        let hint_color = if self.prefix {
-            chrome.text
-        } else {
-            chrome.muted
-        };
-        let mut footer_items: Vec<(&str, u32)> = Vec::new();
-        // Shown whatever else the footer says: input is waiting, not lost.
-        let stuck = self.stuck.map(|(pane, kib)| {
-            format!("pane {pane}: the program is not reading input — {kib} KB waiting")
+        }));
+    }
+    if !message_first {
+        footer_items.push((&hint, hint_color));
+    }
+    let mut footer_x = (12.0 * scale) as i32;
+    let gap = (16.0 * scale) as i32;
+    for (text, color) in footer_items {
+        if footer_x >= footer.w as i32 {
+            break;
+        }
+        let width = text_op(
+            &mut ops,
+            shaper,
+            config,
+            footer,
+            footer_x,
+            footer_y + (4.0 * scale) as i32,
+            text,
+            color,
+            (11.0 * scale) as f32,
+        );
+        footer_x += width.ceil() as i32 + gap;
+    }
+    if let Some((rect, layer)) = &parts.panel {
+        ops.push(Op::Layer {
+            rect: *rect,
+            clip: bounds,
+            layer: layer.clone(),
         });
-        if let Some(stuck) = &stuck {
-            footer_items.push((stuck, chrome.text));
-        }
-        let message_first = self.prefix || !self.status.is_empty();
-        if message_first {
-            footer_items.push((&hint, hint_color));
-        }
-        if !self.prefix {
-            footer_items.extend(self.crow_view.status.iter().map(|segment| {
-                (
-                    segment.text.as_str(),
-                    tone_color(segment.tone, &chrome, light),
-                )
-            }));
-        }
-        if !message_first {
-            footer_items.push((&hint, hint_color));
-        }
-        let mut footer_x = (12.0 * self.scale) as i32;
-        let gap = (16.0 * self.scale) as i32;
-        for (text, color) in footer_items {
-            if footer_x >= footer.w as i32 {
-                break;
-            }
-            let width = self.renderer.text(
-                &mut frame,
-                fw,
-                footer,
-                footer_x,
-                footer_y + (4.0 * self.scale) as i32,
-                text,
-                color,
-                &self.config,
-                (11.0 * self.scale) as f32,
-            );
-            footer_x += width.ceil() as i32 + gap;
-        }
-        if let Some(panel) = panel_rect {
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut hash = std::collections::hash_map::DefaultHasher::new();
-                self.crow_view.panel.hash(&mut hash);
-                (
-                    panel.w,
-                    panel.h,
-                    self.scale.to_bits(),
-                    chrome.surface,
-                    light,
-                )
-                    .hash(&mut hash);
-                hash.finish()
-            };
-            if self
-                .panel_layer
-                .as_ref()
-                .is_none_or(|layer| layer.key != key)
-            {
-                self.panel_layer = Some(PanelLayer {
-                    key,
-                    width: panel.w as usize,
-                    pixels: render_panel(
-                        &mut self.renderer,
-                        &self.config,
-                        &self.crow_view.panel,
-                        panel,
-                        self.scale,
-                        &chrome,
-                        light,
-                    ),
-                });
-            }
-            if let Some(layer) = &self.panel_layer {
-                blit(
-                    &mut frame,
-                    fw,
-                    &layer.pixels,
-                    layer.width,
-                    panel.x,
-                    panel.y,
-                    bounds,
-                );
-            }
-        }
-        if let Some(shared) = &self.crow
-            && self.crow_pane != self.pane_id
-        {
-            self.crow_pane = self.pane_id;
-            shared.pane.store(self.pane_id, Ordering::Relaxed);
-            shared.wake();
-        }
-        // Row raster cache is bounded by visible panes; bound glyph growth during long sessions.
-        if self.renderer.swash.image_cache.len() > 16384 {
-            self.renderer.swash.image_cache.clear();
-        }
-        #[cfg(feature = "frame-dump")]
-        if let Some(dump) = &mut self.frame_dump {
-            let cursor = self
-                .view
-                .as_ref()
-                .and_then(|view| view.screens.iter().find(|(id, _)| *id == self.pane_id))
-                .map(|(_, screen)| crate::frame_dump::CursorMeta {
-                    row: screen.cursor.row,
-                    col: screen.cursor.col,
-                    visible: screen.cursor.visible,
-                    shape: screen.cursor.shape.clone(),
-                });
-            let meta = crate::frame_dump::FrameMeta {
-                schema: "crow-frame/1",
-                seq: dump.next_seq(),
-                renderer: "software",
-                width: size.width,
-                height: size.height,
-                scale: self.scale,
-                cell_width: self.renderer.cell_width,
-                cell_height: self.renderer.cell_height,
-                revision: self.view.as_ref().map_or(0, |view| view.revision),
-                session: self.session.clone(),
-                window: self.window_id,
-                pane: self.pane_id,
-                panes: dump_panes,
-                cursor,
-                focused: self.focused,
-                prefix: self.prefix,
-                status: self.status.clone(),
-                ime: self.ime.clone(),
-                stuck_pane: self.stuck.map(|(pane, _)| pane),
-            };
-            if let Err(error) = dump.write(&frame, size.width, size.height, &meta) {
-                eprintln!(
-                    "crow-term: frame dump to {} failed: {error}",
-                    dump.dir().display()
-                );
-            }
-        }
-        frame
-            .present()
-            .map_err(|error| anyhow::anyhow!("present native surface: {error}"))?;
-        Ok(())
+    }
+    Scene {
+        width: size.width,
+        height: size.height,
+        background: parse_color(&config.background, 0x111111),
+        live_panes,
+        ops,
     }
 }
 impl ApplicationHandler<UiEvent> for App {
@@ -2542,7 +2087,8 @@ impl ApplicationHandler<UiEvent> for App {
             let window = Arc::new(event_loop.create_window(attributes)?);
             window.set_ime_allowed(true);
             self.scale = window.scale_factor();
-            self.renderer.rescale(&self.config, self.scale);
+            self.shaper.rescale(&self.config, self.scale);
+            self.software.invalidate();
             let context = softbuffer::Context::new(window.clone())
                 .map_err(|e| anyhow::anyhow!("native display: {e}"))?;
             let surface = softbuffer::Surface::new(&context, window.clone())
@@ -2674,7 +2220,7 @@ impl ApplicationHandler<UiEvent> for App {
                 self.pane_id = pane;
                 self.pending_focus_in = None;
                 self.selection = None;
-                self.renderer.rows.clear();
+                self.software.invalidate();
                 self.status =
                     "Daemon restarted — a new session replaced the one that ended with it".into();
                 self.status_expires = Some(Instant::now() + Duration::from_secs(10));
@@ -2705,7 +2251,8 @@ impl ApplicationHandler<UiEvent> for App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.scale = scale_factor;
-                self.renderer.rescale(&self.config, self.scale);
+                self.shaper.rescale(&self.config, self.scale);
+                self.software.invalidate();
                 self.sent_sizes.clear();
                 self.resize_panes();
                 self.redraw();
@@ -3217,8 +2764,14 @@ fn encode_key(key: &Key, text: Option<&str>, mods: ModifiersState, modes: &Modes
 }
 
 #[cfg(test)]
+#[path = "ui_fixture.rs"]
+mod fixture;
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::resolve_color;
+    use crate::render::shaper::{column_for_byte, row_text};
+    use crate::render::software::{blit, fill};
     fn cell(text: &str) -> Cell {
         Cell {
             text: text.into(),
@@ -3357,80 +2910,6 @@ mod tests {
             ),
             b"\x1b[24;3~"
         );
-    }
-    #[test]
-    fn underline_styles_rasterize_distinct_shapes_inside_the_cell() {
-        let (width, height) = (24usize, 20usize);
-        let render = |style| {
-            let mut pixels = vec![0u32; width * height];
-            draw_underline(&mut pixels, width, height, 8..16, style, 0xff0000);
-            pixels
-        };
-        let rows = |pixels: &[u32]| {
-            (0..height)
-                .filter(|y| pixels[y * width..(y + 1) * width].contains(&0xff0000))
-                .collect::<Vec<_>>()
-        };
-        let lit = |pixels: &[u32]| pixels.iter().filter(|&&p| p == 0xff0000).count();
-        assert_eq!(lit(&render(UnderlineStyle::None)), 0);
-        let single = render(UnderlineStyle::Single);
-        assert_eq!(rows(&single), [height - 2]);
-        assert_eq!(lit(&single), 8);
-        // Nothing is drawn outside the cell's columns.
-        for pixels in [
-            UnderlineStyle::Double,
-            UnderlineStyle::Curly,
-            UnderlineStyle::Dotted,
-            UnderlineStyle::Dashed,
-        ]
-        .map(render)
-        {
-            for y in 0..height {
-                for x in (0..8).chain(16..width) {
-                    assert_eq!(pixels[y * width + x], 0);
-                }
-            }
-        }
-        assert_eq!(rows(&render(UnderlineStyle::Double)).len(), 2);
-        assert!(
-            rows(&render(UnderlineStyle::Curly)).len() >= 2,
-            "undercurl is not flat"
-        );
-        assert!(lit(&render(UnderlineStyle::Dotted)) < 8);
-        assert!(lit(&render(UnderlineStyle::Dashed)) < 8);
-        // Tiny rows and out-of-range columns never index outside the buffer.
-        let mut tiny = vec![0u32; 4];
-        draw_underline(&mut tiny, 4, 1, 0..100, UnderlineStyle::Curly, 1);
-        draw_underline(&mut tiny, 2, 2, 0..100, UnderlineStyle::Double, 1);
-    }
-    #[test]
-    fn row_raster_uses_the_cell_underline_style_and_color() {
-        let config = Config::default();
-        let mut curly = cell("x");
-        curly.underline = true;
-        curly.underline_style = UnderlineStyle::Curly;
-        curly.underline_color = Some(ColorSpec::Rgb(255, 0, 0));
-        assert_eq!(
-            underline_paint(&config, &curly),
-            (UnderlineStyle::Curly, 0xff0000)
-        );
-        let mut legacy = cell("x");
-        legacy.underline = true;
-        legacy.fg = ColorSpec::Rgb(0, 0, 255);
-        assert_eq!(
-            underline_paint(&config, &legacy),
-            (UnderlineStyle::Single, 0x0000ff)
-        );
-        // Through the real row rasterizer: red pixels only below the glyph area,
-        // on more than one scanline (a curl, not a straight line).
-        let mut renderer = Renderer::new(&config, 1.0);
-        let row = renderer.row(&config, 1, 0, &[curly]);
-        let height = row.pixels.len() / row.width;
-        let red: Vec<usize> = (0..height)
-            .filter(|y| row.pixels[y * row.width..(y + 1) * row.width].contains(&0xff0000))
-            .collect();
-        assert!(red.len() >= 2, "{red:?}");
-        assert!(red.iter().all(|&y| y >= height * 2 / 3), "{red:?}");
     }
     #[test]
     fn alternate_scroll_sends_three_cursor_keys_per_notch() {
@@ -3845,129 +3324,5 @@ mod tests {
             }
         ));
         assert_eq!(mailbox.take().unwrap().0, 2);
-    }
-    #[test]
-    fn shaped_clusters_do_not_shift_following_terminal_cells() {
-        let config = Config::default();
-        let mut renderer = Renderer::new(&config, 1.0);
-        let cw = renderer.cell_width as usize;
-        let mut spacer = cell("");
-        spacer.wide_spacer = true;
-        for mut prefix in [
-            vec![cell("界"), spacer],
-            vec![cell("e\u{301}"), cell(" ")],
-            vec![cell("!"), cell("=")],
-        ] {
-            prefix.push(cell("X"));
-            let actual = renderer.row(&config, 1, 0, &prefix).pixels.clone();
-            let expected = renderer
-                .row(&config, 2, 0, &[cell(" "), cell(" "), cell("X")])
-                .pixels
-                .clone();
-            for row in 0..renderer.cell_height as usize {
-                assert_eq!(
-                    &actual[row * 3 * cw + 2 * cw..(row + 1) * 3 * cw],
-                    &expected[row * 3 * cw + 2 * cw..(row + 1) * 3 * cw]
-                );
-            }
-        }
-    }
-    #[test]
-    fn private_use_cells_are_icon_cells() {
-        for icon in ["\u{E702}", "\u{F113}", "\u{F0001}", "\u{10FFFD}"] {
-            assert!(private_use(icon), "{icon:?}");
-        }
-        for text in ["a", "界", "🚀", "", "\u{F900}"] {
-            assert!(!private_use(text), "{text:?}");
-        }
-    }
-    #[test]
-    fn symbols_family_only_for_icons_the_configured_font_lacks() {
-        let config = Config::default();
-        let mut renderer = Renderer::new(&config, 1.0);
-        renderer.symbols = None;
-        assert!(
-            !renderer.symbol_cell(&config, &cell("\u{E702}")),
-            "no symbols font installed"
-        );
-        renderer.symbols = Some(SYMBOL_FAMILIES[0]);
-        assert!(!renderer.symbol_cell(&config, &cell("a")));
-        assert!(!renderer.symbol_cell(&config, &cell("")));
-        // The configured face's own charmap decides: the bundled Crowquill Mono
-        // maps the powerline separators (U+E0A0-E0B3) but not nf-dev-git (U+E702).
-        assert!(renderer.symbol_cell(&config, &cell("\u{E702}")));
-        assert!(!renderer.symbol_cell(&config, &cell("\u{E0B0}")));
-        assert_eq!(renderer.primary_covers.get(&'\u{E0B0}'), Some(&true));
-        // A configured family that does not exist covers nothing: always the symbols family.
-        let missing = Config {
-            font_family: "No Such Family For Crow Tests".into(),
-            ..Config::default()
-        };
-        renderer.primary_covers.clear();
-        assert!(renderer.symbol_cell(&missing, &cell("\u{F113}")));
-        let attrs = renderer.attrs(
-            &missing,
-            &Cell {
-                bold: true,
-                ..cell("\u{F113}")
-            },
-            true,
-        );
-        assert_eq!(attrs.family, Family::Name(SYMBOL_FAMILIES[0]));
-        assert_eq!(
-            attrs.weight,
-            Weight::NORMAL,
-            "single-weight icon font must not be skipped for bold"
-        );
-    }
-    #[test]
-    fn bundled_font_shapes_ligatures_and_raster_cache_reuses_rows() {
-        let config = Config {
-            ligatures: true,
-            ..Config::default()
-        };
-        let mut renderer = Renderer::new(&config, 1.0);
-        let cells = "!=->==="
-            .chars()
-            .map(|c| cell(&c.to_string()))
-            .collect::<Vec<_>>();
-        let first = renderer.row(&config, 1, 0, &cells).pixels.as_ptr();
-        assert_eq!(first, renderer.row(&config, 1, 0, &cells).pixels.as_ptr());
-        assert!(
-            renderer
-                .row(&config, 1, 0, &cells)
-                .pixels
-                .iter()
-                .any(|pixel| *pixel != parse_color(&config.background, 0xffffff))
-        );
-        let attrs = Attrs::new().family(Family::Name(&config.font_family));
-        let mut buffer = Buffer::new(&mut renderer.fonts, Metrics::new(18.0, 24.0));
-        buffer.set_text("!=", &attrs, Shaping::Advanced, None);
-        buffer.shape_until_scroll(&mut renderer.fonts, false);
-        // Crowquill's contextual alternates may use one glyph per cell; verify actual
-        // glyph substitutions rather than assuming ligatures reduce the glyph count.
-        let enabled = buffer
-            .layout_runs()
-            .flat_map(|run| run.glyphs.iter().map(|g| g.glyph_id))
-            .collect::<Vec<_>>();
-        let mut features = FontFeatures::new();
-        features
-            .disable(FeatureTag::CONTEXTUAL_ALTERNATES)
-            .disable(FeatureTag::STANDARD_LIGATURES);
-        buffer.set_text(
-            "!=",
-            &attrs.font_features(features),
-            Shaping::Advanced,
-            None,
-        );
-        buffer.shape_until_scroll(&mut renderer.fonts, false);
-        let disabled = buffer
-            .layout_runs()
-            .flat_map(|run| run.glyphs.iter().map(|g| g.glyph_id))
-            .collect::<Vec<_>>();
-        assert_ne!(
-            enabled, disabled,
-            "bundled font must provide the requested ligature feature"
-        );
     }
 }
