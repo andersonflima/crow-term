@@ -168,6 +168,8 @@ class LoginShells(unittest.TestCase):
         cli, runtime = self.daemon(home, "", autostart=True)
         doctor = cli("doctor")
         self.assertIn("user database (login shell); login shell)", doctor)
+        self.assertIn("login environment: captured (", doctor)
+        self.assertNotIn("  (", doctor.split("shell: ")[1].splitlines()[0], "no double space")
         started = (runtime / "daemon.log").read_text()
         count = int(started.split("daemon starts with ")[1].split(" variable")[0]) if "daemon starts with" in started else 0
         self.assertGreater(count, 0, f"a daemon started without TERM must get the login environment: {started}")
