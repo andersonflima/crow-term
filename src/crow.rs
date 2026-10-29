@@ -826,7 +826,26 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
     git_branch_with_home(cwd, home.as_deref())
 }
 
+/// `\\?\C:\…` (Windows' verbatim form of a local drive path, as
+/// `canonicalize` returns it) as the plain `C:\…`; anything else unchanged.
+fn plain_local(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest)
+            if rest.len() >= 2
+                && rest.as_bytes()[0].is_ascii_alphabetic()
+                && rest.as_bytes()[1] == b':' =>
+        {
+            PathBuf::from(rest)
+        }
+        _ => path.to_path_buf(),
+    }
+}
+
 fn git_branch_with_home(cwd: &Path, home: Option<&Path>) -> Option<String> {
+    let cwd = plain_local(cwd);
+    let home = home.map(plain_local);
+    let home = home.as_deref();
     for dir in cwd.ancestors().take(64) {
         let dot_git = dir.join(".git");
         let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
@@ -1744,7 +1763,14 @@ mod tests {
         // A hostile repository: every way git runs repository-configured
         // commands would leave a marker file.
         let marker = |name: &str| dir.join(format!("MARKER-{name}"));
-        let touch = |name: &str| format!("touch '{}'", marker(name).display());
+        // Forward slashes: a backslash is an escape in git config values
+        // (and Git for Windows' sh reads `C:/…` paths).
+        let touch = |name: &str| {
+            format!(
+                "touch '{}'",
+                marker(name).to_string_lossy().replace('\\', "/")
+            )
+        };
         let mut config = std::fs::read_to_string(dir.join(".git/config")).unwrap();
         config.push_str(&format!(
             "[core]\n\tfsmonitor = {}\n\thooksPath = hooks\n[filter \"evil\"]\n\tclean = {}\n\tsmudge = {}\n",
@@ -1786,6 +1812,17 @@ mod tests {
             branch(&repo).as_deref(),
             Some("ok"),
             "a pointer inside the repository"
+        );
+        // A repository with a real `.git` directory shows its branch wherever
+        // it is, home or not (here the "home" is elsewhere entirely).
+        let plain = home.join("plain");
+        std::fs::create_dir_all(plain.join(".git")).unwrap();
+        std::fs::write(plain.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(plain.join("src")).unwrap();
+        assert_eq!(
+            git_branch_with_home(&plain.join("src"), Some(Path::new("/nonexistent-home")))
+                .as_deref(),
+            Some("main")
         );
         // Every reviewer bypass is refused before anything is opened.
         let depth = "../".repeat(repo.components().count() + 2);
