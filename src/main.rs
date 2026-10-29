@@ -311,7 +311,8 @@ fn main() -> Result<()> {
                 ),
                 Err(error) => println!("renderer: invalid: {error:#}"),
             }
-            match render::gpu::probe() {
+            // Bounded: a hung GPU driver must not stall doctor.
+            match render::gpu::probe_within(std::time::Duration::from_secs(5)) {
                 Ok(adapter) if adapter.cpu => println!(
                     "gpu: {adapter} is a CPU rasterizer (auto uses the software renderer; --renderer gpu still works)"
                 ),
