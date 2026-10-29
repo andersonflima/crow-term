@@ -51,6 +51,7 @@ tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 widestring = "1"

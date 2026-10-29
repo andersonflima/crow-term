@@ -17,6 +17,9 @@ pub struct Config {
     pub palette: Vec<String>,
     pub shell: Option<String>,
     pub shell_args: Vec<String>,
+    /// Start the shell as a login shell (its own login switch) when
+    /// `shell_args` is empty, as macOS/Linux terminals do. Default true.
+    pub login_shell: bool,
     pub prefix: String,
     /// Terminal protocol options that grant applications extra access.
     pub terminal: TerminalConfig,
@@ -109,6 +112,7 @@ impl Default for Config {
             .collect(),
             shell: None,
             shell_args: vec![],
+            login_shell: true,
             prefix: "Ctrl-t".into(),
             terminal: TerminalConfig::default(),
             crow: CrowConfig::default(),
@@ -208,26 +212,24 @@ impl Config {
                 cwd,
             });
         }
-        let program = match &self.shell {
-            Some(s) => s.clone(),
-            None => default_shell(),
-        };
+        let (program, _) = crate::login::default_shell(self.shell.as_deref());
         Ok(ShellSpec {
+            args: self.shell_args_for(&program),
             program,
-            args: self.shell_args.clone(),
             cwd,
         })
     }
-}
-fn default_shell() -> String {
-    if cfg!(windows) {
-        "powershell.exe".into()
-    } else {
-        which::which("fish")
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-            .or_else(|| std::env::var("SHELL").ok())
-            .unwrap_or_else(|| "/bin/sh".into())
+    /// Arguments for `program`: the configured `shell_args` when set, else its
+    /// login switch (when `login_shell` and the shell has one).
+    pub fn shell_args_for(&self, program: &str) -> Vec<String> {
+        if !self.shell_args.is_empty() {
+            return self.shell_args.clone();
+        }
+        if self.login_shell {
+            crate::login::login_args(program).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
     }
 }
 

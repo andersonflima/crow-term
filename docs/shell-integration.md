@@ -1,3 +1,35 @@
+# Shells
+
+## Default: your login shell, started as a login shell
+
+Without a `shell` in the config, Crow Term runs the login shell recorded for
+your user (`getpwuid`; `chsh` sets it), falling back to `$SHELL`, then
+`/bin/sh`. It is started **as a login shell**, like Terminal, iTerm or Ghostty
+do, so profiles, `path_helper`, plugin managers (oh-my-zsh, zinit, p10k,
+Fisher, bash-completion) and PATH load as in your terminal. Each shell gets its
+own login switch: `-l` for sh, bash, zsh, dash, ksh, mksh, fish, nu, xonsh,
+tcsh/csh; `-Login` for PowerShell 7 (`pwsh`). elvish has no login mode and is
+started plainly. On Windows the default stays `powershell.exe`, which loads
+its profiles itself; WSL is unchanged.
+
+When the daemon is started outside a terminal (from Finder or the Dock there
+is no `TERM`), the starting GUI or command first captures your login
+environment once through the same shell — interactive for zsh and bash, so
+`.zshrc`/`.bashrc` PATH edits count — and starts the daemon with it (3 s limit;
+a profile's background jobs cannot hold it longer; `daemon.log` says how many
+variables were adopted). Programs started without a shell (`crow-term start --
+nvim`) then see your PATH too. csh/tcsh panes are login shells, but their
+environment is not captured (their `-l` cannot be combined with `-c`).
+
+```toml
+shell = "/opt/homebrew/bin/fish"   # optional: a specific shell (still a login shell)
+shell_args = ["-l"]                # optional: exact arguments; replaces the login switch
+login_shell = false                # optional: start the shell without its login switch
+```
+
+`crow-term doctor` prints the shell, where it came from and whether it is a
+login shell.
+
 # Fish and zsh: isolated, explicit integration
 
 Crow Term does not modify a user's login shell or startup files. The following

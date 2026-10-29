@@ -683,8 +683,30 @@ fn start_daemon(config: Option<&std::path::Path>, user_command: bool) -> Result<
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let log = options.open(runtime.join("daemon.log"))?;
+    let mut log = options.open(runtime.join("daemon.log"))?;
     let mut command = Command::new(std::env::current_exe()?);
+    // Started outside a terminal (Finder, Dock: no TERM), the daemon would
+    // inherit launchd's minimal environment. Give it the user's login
+    // environment, captured once here through their login shell.
+    let settings = crate::config::Config::load(config).unwrap_or_default();
+    let (shell, _) = crate::login::default_shell(settings.shell.as_deref());
+    match crate::login::daemon_environment(&shell, settings.login_shell, Duration::from_secs(3)) {
+        Some(Ok(changes)) => {
+            let _ = writeln!(
+                log,
+                "crow-term: daemon starts with {} variable(s) of {shell}'s login environment",
+                changes.len()
+            );
+            command.envs(changes);
+        }
+        Some(Err(error)) => {
+            let _ = writeln!(
+                log,
+                "crow-term: daemon keeps the inherited environment ({error})"
+            );
+        }
+        None => {}
+    }
     if let Some(path) = config {
         command.arg("--config").arg(path);
     }

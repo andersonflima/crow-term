@@ -169,7 +169,13 @@ class LazyVimTests(daemon_e2e.DaemonHarness):
             self.key("Space")
             self.screen_has("Files", "alpha.lua", "beta.md")
             self.keys("beta")
+            # The picker filters asynchronously: Enter before the filter ran
+            # opens the first file (alpha.lua). Wait for beta.md to be the
+            # only match (its preview drawn) before choosing it.
+            self.screen_lacks("alpha.lua")
+            self.screen_has("beta.md", "# Beta")
             self.key("Enter")
+            self.screen_lacks("Files")
             self.screen_has("# Beta")
         with self.subTest("bufferline and lualine"):
             self.ex("edit alpha.lua")
