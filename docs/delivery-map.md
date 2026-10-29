@@ -15,11 +15,12 @@ engineering alpha, not a certification of complete terminal compatibility.
 | Existing tmux configuration | Real tmux compatibility profile; native prefix disabled | `src/config.rs:1`, `src/main.rs:1`; E2E config marker/prefix and detach, not arbitrary plugin certification |
 | Fish/Fisher and zsh | Existing shells plus opt-in offline isolated profiles | `shell/setup.py:1`, pinned licensed sources; real fish/zsh syntax and plugin load tested when installed |
 | Crowquill Ink and Mono | Owner-selected light default, dark example, four embedded OFL faces | `src/config.rs:1`, `assets/`; exact upstream attribution preserved |
-| Underline styles (Neovim diagnostics) | SGR 4:1-4:5 single/double/curly/dotted/dashed and SGR 58/59 underline color carried engine → model → IPC (wire v4) → software renderer (`draw_underline`) | `src/engine.rs` and `src/ui.rs` unit tests, daemon E2E JSON capture; raster geometry is unit-tested, not screenshot-verified on every platform |
+| Underline styles (Neovim diagnostics) | SGR 4:1-4:5 single/double/curly/dotted/dashed and SGR 58/59 underline color carried engine → model → IPC (wire v4) → renderers (`underline_rects`) | `src/engine.rs` and `src/render/` unit tests, daemon E2E JSON capture; geometry pinned by the software goldens and compared GPU vs software in CI |
 | Terminal queries and events | XTVERSION, XTGETTCAP (Tc/RGB/Smulx/Setulc/Ss/Se, Ms only with OSC 52 copy), DECRQSS (SGR, DECSCUSR), DA2 with the crow-term version, CSI 14t/16t from the GUI's real cell metrics (also TIOCSWINSZ pixels), DEC 1004 focus on pane switch, OSC 8 links kept in the snapshot (not clickable yet), visual bell, DEC 1007 alternate scroll, window title from OSC 0/2 | `src/intercept.rs`, `src/engine.rs` unit tests; GUI behaviours are covered by unit tests of their pure parts; DEC 1004 focus reports are also exercised with native focus changes in GUI journey J8 (see Graphical validation), the other GUI-side behaviours are not. Pixel reports are withheld until a GUI reported cell metrics; OSC 52 strings over the cap are discarded before decoding; OSC 8 targets are bounded (64 KiB per snapshot) |
 | Ligatures, icons, emojis | Advanced shaping, cell anchoring, fallback, raster cache; Private Use Area icons from an installed Symbols Nerd Font when the configured font lacks them | UI unit tests verify substitutions and grid alignment; GUI journey J2 checks `->`, accents, CJK width, colour emoji and Nerd icons in the renderer's frames against reviewed goldens on Linux (X11, Wayland), Windows and macOS (see Graphical validation) |
 | Crow agent status (owner request) | Footer status line + toggleable agent panel from `crow-skills events snapshot --json`; focused-pane cwd via `PaneCwd` IPC, git branch from `.git/HEAD` | `src/crow.rs` parsing/format/throttle unit tests, `src/engine.rs` cwd test; versioned, tolerant parser; read-only, no prompt content |
-| Lightweight / fast | Native software renderer, no WebView; dirty row/glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented, **no claim of maximum performance or comparative superiority**; GPU rendering remains follow-up |
+| Lightweight / fast | Native renderers, no WebView; content-keyed row caches (scrolling reuses shaped rows), glyph caches, coalesced output, bounded queues/history, binary IPC, LTO | Mechanisms implemented; **no claim of maximum performance or comparative superiority** |
+| GPU renderer | wgpu backend (Metal / DX12 / Vulkan+GL) behind `renderer = "gpu"` or `"auto"` (`--renderer`, `CROW_TERM_RENDERER`); default stays `software`. Same `Scene` and shaping as software, R8 + RGBA glyph atlases, instanced quads, non-sRGB blending, block-cursor inversion by blend state, FIFO, no idle frames, runtime fallback to software in `auto` | `src/render/gpu.rs` unit tests; CI `gpu` jobs compare offscreen GPU frames with the software renderer (Linux lavapipe, Windows WARP, macOS Metal when exposed); a real macOS window matched the software frame byte for byte. Not validated by hand on discrete GPUs, Wayland compositors, Windows hardware drivers or mixed-DPI setups |
 
 The owner explicitly chose a **new engine**, rejecting the fork alternative, and
 **Crowquill Ink Light** over the existing dark terminal profile. Reversal is by
@@ -92,8 +93,8 @@ What CI does not prove and still needs a person: input methods and dead keys
 (only ASCII and Ctrl/Shift chords are synthesized; no IME composition, no
 non-US layouts); real compositors and desktops (GNOME/KDE, decorations, fractional
 and HiDPI scaling — CI runs at scale 1, single virtual monitor, no multi-monitor
-or DPI change), GPU drivers (the renderer is CPU softbuffer; X11/Wayland/Windows
-presentation paths only), screen readers and accessibility trees, perceived
+or DPI change), GPU drivers (the GUI journeys use the default CPU softbuffer renderer; the
+opt-in GPU renderer is compared offscreen only), screen readers and accessibility trees, perceived
 latency and smoothness, WSL, and long-running sessions.
 
 ## Responsibilities and interfaces
@@ -169,8 +170,10 @@ wire-size observations, not rendering/latency benchmarks.
 - Semantic screen-reader grid accessibility, GUI session switcher, draggable
   split ratios, search UI, crash/reboot layout restore and process persistence
   beyond daemon lifetime.
-- GPU renderer and controlled comparative startup/RSS/throughput/input-latency
-  benchmarks. Initial software rasterization is deliberate, not a GPU claim.
+- Manual GPU validation on real drivers (discrete/integrated GPUs on Windows and
+  Linux, Wayland compositors, HiDPI and mixed-DPI moves) before `auto` becomes
+  the default; controlled startup/RSS/throughput and present-time
+  comparisons between the renderers.
 - Release pipeline exists (`.github/workflows/release.yml`, [release](release.md)):
   macOS Developer ID signing and notarization run only when the signing/notary
   secrets are configured, otherwise builds are explicitly unsigned; Linux

@@ -289,3 +289,111 @@ fn software_frames_match_committed_goldens() {
         golden::assert_golden(&format!("software-{name}"), &frame, w, h);
     }
 }
+
+/// GPU adapter for comparison tests. Without one the tests are skipped with
+/// the reason on stderr, unless `CROW_TERM_GPU_TESTS=1` requires it (CI GPU jobs).
+pub(crate) fn gpu_or_skip(test: &str) -> Option<crate::render::gpu::GpuRenderer> {
+    let required = std::env::var("CROW_TERM_GPU_TESTS").is_ok_and(|value| value == "1");
+    match crate::render::gpu::GpuRenderer::headless(true) {
+        Ok(gpu) => {
+            eprintln!("{test}: GPU adapter {}", gpu.adapter());
+            Some(gpu)
+        }
+        Err(error) if required => panic!("{test}: CROW_TERM_GPU_TESTS=1 but no GPU: {error:#}"),
+        Err(error) => {
+            eprintln!("{test}: skipped, no GPU adapter: {error:#}");
+            None
+        }
+    }
+}
+pub(crate) fn gpu_frame(app: &mut App, gpu: &mut crate::render::gpu::GpuRenderer) -> Vec<u32> {
+    let size = app.window_size().unwrap();
+    let scene = scene_of!(app, size);
+    gpu.render_offscreen(&scene, &mut app.shaper, &app.config)
+        .expect("GPU offscreen frame")
+}
+/// Platform fallback fonts (CJK, combining marks, color emoji, Nerd icons when
+/// installed): not in committed goldens, but both backends must agree.
+fn fallback_rows(cols: usize) -> Vec<Vec<Cell>> {
+    let mut rows = styled_rows(cols);
+    let mut wide = Vec::new();
+    for text in [
+        "界", "", "e\u{301}", " ", "😀", "", " ", "\u{E702}", " ", "─", "│", "┌", "┐", " ", "λ",
+        "→", " ", "🦀", "",
+    ] {
+        let mut c = cell(text);
+        c.wide_spacer = text.is_empty();
+        wide.push(c);
+    }
+    wide.resize(cols, cell(" "));
+    rows.insert(4, wide);
+    rows
+}
+
+#[test]
+fn gpu_frames_match_software_within_tolerance() {
+    let Some(mut gpu) = gpu_or_skip("gpu_frames_match_software_within_tolerance") else {
+        return;
+    };
+    let mut cases = cases();
+    let mut fallback = app(Config::default(), 2.0, PhysicalSize::new(1200, 700));
+    if let Some(view) = &mut fallback.view {
+        view.screens[0].1.cells = fallback_rows(48);
+        view.screens[1].1.cells = fallback_rows(40);
+    }
+    fallback.ime = "かな".into();
+    cases.push(("fallback-fonts-scale2", fallback));
+    for (index, (name, mut app)) in cases.into_iter().enumerate() {
+        // Each fixture app has its own font system (font ids and glyph cache
+        // keys are per font system), so each gets its own GPU renderer, as in
+        // the application (one shaper per renderer).
+        if index > 0 {
+            gpu = gpu_or_skip(name).expect("GPU adapter disappeared");
+        }
+        let (expected, w, h) = software_frame(&mut app);
+        let actual = gpu_frame(&mut app, &mut gpu);
+        let diff = golden::diff(&actual, &expected, golden::RENDERER);
+        eprintln!("{name}: {diff:?}");
+        if !diff.within(golden::RENDERER) {
+            golden::write_png(
+                &golden::candidate_path(&format!("gpu-{name}")),
+                &actual,
+                w,
+                h,
+            );
+            golden::write_png(
+                &golden::candidate_path(&format!("cpu-{name}")),
+                &expected,
+                w,
+                h,
+            );
+            panic!(
+                "{name}: GPU frame differs from software beyond tolerance: {diff:?}; see {}",
+                golden::candidate_path(&format!("gpu-{name}")).display()
+            );
+        }
+        // Warm GPU caches (rows, layer, atlas) draw the same frame again.
+        let again = gpu_frame(&mut app, &mut gpu);
+        assert_eq!(again, actual, "{name}: warm GPU frame differs");
+    }
+}
+
+#[test]
+fn gpu_atlas_growth_and_row_changes_keep_frames_correct() {
+    let Some(mut gpu) = gpu_or_skip("gpu_atlas_growth_and_row_changes_keep_frames_correct") else {
+        return;
+    };
+    // Many distinct glyph sizes overflow the first atlas page and force growth
+    // mid-frame; changed rows must be reshaped, unchanged ones reused.
+    let mut app = app(Config::default(), 3.0, PhysicalSize::new(1600, 1000));
+    for step in 0..3 {
+        if let Some(view) = &mut app.view {
+            let rows = &mut view.screens[0].1.cells;
+            rows[step] = line(&format!("changed row {step} !@#$%^&*()_+{{}}|:<>?~"), 48);
+        }
+        let (expected, _, _) = software_frame(&mut app);
+        let actual = gpu_frame(&mut app, &mut gpu);
+        let diff = golden::diff(&actual, &expected, golden::RENDERER);
+        assert!(diff.within(golden::RENDERER), "step {step}: {diff:?}");
+    }
+}

@@ -1,6 +1,11 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use crow_term::{config::Config, ipc, model::*, server, ui};
+use crow_term::{
+    config::{Config, RendererMode},
+    ipc,
+    model::*,
+    server, ui,
+};
 use std::{
     path::{Path, PathBuf},
     process::Command,
@@ -20,6 +25,9 @@ struct Cli {
     /// Run real tmux and read its existing config; native prefix is disabled.
     #[arg(long, global = true)]
     tmux: Option<String>,
+    /// Frame renderer (overrides CROW_TERM_RENDERER and the config `renderer`).
+    #[arg(long, global = true, value_enum)]
+    renderer: Option<RendererMode>,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -188,6 +196,14 @@ fn main() -> Result<()> {
     if cli.tmux.is_some() {
         config.prefix = "none".into();
     }
+    // The daemon never draws: a renderer setting must not keep it from starting.
+    if matches!(cli.command, Some(Action::Daemon)) {
+        return server::run(config);
+    }
+    let env_renderer = std::env::var(RendererMode::ENV).ok();
+    let (renderer, renderer_source) =
+        RendererMode::resolve(cli.renderer, env_renderer.as_deref(), config.renderer)?;
+    config.renderer = renderer;
     match cli.command.as_ref() {
         Some(Action::Daemon) => return server::run(config),
         Some(Action::Config { path }) => {
@@ -271,7 +287,10 @@ fn main() -> Result<()> {
                     "not connected"
                 }
             );
-            println!("renderer: native software framebuffer; OpenType shaping; no WebView");
+            println!(
+                "renderer: {} (from {renderer_source}); OpenType shaping; no WebView",
+                renderer.as_str()
+            );
             println!(
                 "osc52: {} (terminal output may {}; reading the clipboard is never allowed)",
                 match config.terminal.osc52 {

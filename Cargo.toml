@@ -24,6 +24,9 @@ arboard = { version = "3.7", features = ["wayland-data-control"] }
 clap = { version = "4", features = ["derive"] }
 which = "8"
 unicode-width = "0.2"
+etagere = "0.3"
+pollster = "1"
+bytemuck = { version = "1", features = ["derive"] }
 
 [features]
 # Test-only: write each presented GUI frame to $CROW_TERM_FRAME_DUMP/frame.ppm
@@ -50,10 +53,18 @@ strip = true
 tempfile = "3"
 png = "0.18"
 
+# GPU renderer: one native backend per platform keeps the binary and driver
+# surface small. The software framebuffer stays the mandatory fallback.
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "metal"] }
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "vulkan", "gles"] }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["process"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12"] }
 widestring = "1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_Security","Win32_System_Threading","Win32_System_Pipes"] }

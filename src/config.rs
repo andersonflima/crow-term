@@ -21,10 +21,62 @@ pub struct Config {
     /// `shell_args` is empty, as macOS/Linux terminals do. Default true.
     pub login_shell: bool,
     pub prefix: String,
+    /// Frame renderer: "software" (default), "gpu" or "auto". Overridden by
+    /// `CROW_TERM_RENDERER` and by `--renderer`.
+    pub renderer: RendererMode,
     /// Terminal protocol options that grant applications extra access.
     pub terminal: TerminalConfig,
     /// Crow agent status bar and panel. Last field: TOML tables follow plain values.
     pub crow: CrowConfig,
+}
+/// How frames are drawn.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum RendererMode {
+    /// GPU when a hardware adapter works, otherwise the software framebuffer
+    /// (the reason is shown in the status line).
+    Auto,
+    /// GPU (wgpu: Metal, DX12, Vulkan/GL); failing to start it is an error.
+    Gpu,
+    /// CPU framebuffer (softbuffer). The default until GPU rendering has been
+    /// validated manually on real drivers.
+    #[default]
+    Software,
+}
+impl RendererMode {
+    /// Environment variable that overrides the config file.
+    pub const ENV: &'static str = "CROW_TERM_RENDERER";
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Gpu => "gpu",
+            Self::Software => "software",
+        }
+    }
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "gpu" => Ok(Self::Gpu),
+            "software" => Ok(Self::Software),
+            other => anyhow::bail!("renderer must be auto, gpu or software (got {other:?})"),
+        }
+    }
+    /// Effective mode and where it came from: command line, then
+    /// `CROW_TERM_RENDERER`, then the config file.
+    pub fn resolve(
+        cli: Option<Self>,
+        env: Option<&str>,
+        config: Self,
+    ) -> Result<(Self, &'static str)> {
+        if let Some(mode) = cli {
+            return Ok((mode, "--renderer"));
+        }
+        if let Some(value) = env {
+            let mode = Self::parse(value).with_context(|| format!("invalid {}", Self::ENV))?;
+            return Ok((mode, Self::ENV));
+        }
+        Ok((config, "config"))
+    }
 }
 /// OSC 52 clipboard access from programs running in the terminal.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +166,7 @@ impl Default for Config {
             shell_args: vec![],
             login_shell: true,
             prefix: "Ctrl-t".into(),
+            renderer: RendererMode::default(),
             terminal: TerminalConfig::default(),
             crow: CrowConfig::default(),
         }
@@ -253,6 +306,39 @@ mod tests {
         c.font_size = 18.0;
         c.palette.clear();
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn renderer_is_software_by_default_and_strictly_validated() {
+        assert_eq!(Config::default().renderer, RendererMode::Software);
+        let gpu: Config = toml::from_str("renderer = \"gpu\"").unwrap();
+        assert_eq!(gpu.renderer, RendererMode::Gpu);
+        let auto: Config = toml::from_str("renderer = \"auto\"").unwrap();
+        assert_eq!(auto.renderer, RendererMode::Auto);
+        for invalid in [
+            "renderer = \"GPU\"",
+            "renderer = \"opengl\"",
+            "renderer = true",
+            "renderer = \"\"",
+        ] {
+            assert!(toml::from_str::<Config>(invalid).is_err(), "{invalid}");
+        }
+        // Precedence: --renderer, then CROW_TERM_RENDERER, then the config file.
+        let config = RendererMode::Software;
+        assert_eq!(
+            RendererMode::resolve(Some(RendererMode::Auto), Some("gpu"), config).unwrap(),
+            (RendererMode::Auto, "--renderer")
+        );
+        assert_eq!(
+            RendererMode::resolve(None, Some("gpu"), config).unwrap(),
+            (RendererMode::Gpu, RendererMode::ENV)
+        );
+        assert_eq!(
+            RendererMode::resolve(None, None, RendererMode::Auto).unwrap(),
+            (RendererMode::Auto, "config")
+        );
+        // An invalid environment value is an error, never a silent default.
+        assert!(RendererMode::resolve(None, Some("vulkan"), config).is_err());
+        assert!(RendererMode::resolve(None, Some(""), config).is_err());
     }
     #[test]
     fn osc52_defaults_to_copy_and_accepts_only_off_or_copy() {

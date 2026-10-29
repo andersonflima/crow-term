@@ -22,7 +22,7 @@ pub struct ShellSpec {
     pub args: Vec<String>,
     pub cwd: Option<String>,
 }
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum ColorSpec {
     Foreground,
     Background,
@@ -30,7 +30,7 @@ pub enum ColorSpec {
     Rgb(u8, u8, u8),
 }
 /// SGR 4 / 4:x underline variants. `None` when the cell is not underlined.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum UnderlineStyle {
     #[default]
     None,
@@ -40,7 +40,7 @@ pub enum UnderlineStyle {
     Dotted,
     Dashed,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct Cell {
     pub text: String,
     pub fg: ColorSpec,

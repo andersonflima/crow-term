@@ -10,10 +10,12 @@ use crate::config::Config;
 use crate::model::{Cell, ColorSpec};
 use cosmic_text::Color;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(test)]
 pub(crate) mod golden;
+pub mod gpu;
 pub mod shaper;
 pub mod software;
 
@@ -100,9 +102,97 @@ pub struct Scene<'a> {
     pub width: u32,
     pub height: u32,
     pub background: u32,
-    /// Panes drawn in this frame; row caches of other panes are dropped.
-    pub live_panes: Vec<u64>,
     pub ops: Vec<Op<'a>>,
+}
+
+/// Per-row backend data keyed by row *content*, so a row that moved (scroll,
+/// split, window switch back) reuses its shaping/raster instead of being
+/// redone. A position index keeps the common case (row unchanged in place) to
+/// one comparison. Entries not drawn in the latest frame are dropped, which
+/// bounds the cache by the visible rows.
+pub(crate) struct RowCache<T> {
+    positions: HashMap<(u64, usize), u64>,
+    entries: HashMap<u64, Vec<RowEntry<T>>>,
+    frame: u64,
+}
+struct RowEntry<T> {
+    cells: Vec<Cell>,
+    value: T,
+    frame: u64,
+}
+impl<T> Default for RowCache<T> {
+    fn default() -> Self {
+        Self {
+            positions: HashMap::new(),
+            entries: HashMap::new(),
+            frame: 0,
+        }
+    }
+}
+impl<T> RowCache<T> {
+    pub fn clear(&mut self) {
+        self.positions.clear();
+        self.entries.clear();
+    }
+    pub fn begin_frame(&mut self) {
+        self.frame += 1;
+    }
+    /// Drop every row not used since [`Self::begin_frame`].
+    pub fn end_frame(&mut self) {
+        let frame = self.frame;
+        self.entries.retain(|_, bucket| {
+            bucket.retain(|entry| entry.frame == frame);
+            !bucket.is_empty()
+        });
+        let entries = &self.entries;
+        self.positions.retain(|_, hash| entries.contains_key(hash));
+    }
+    /// The value for `cells` drawn at (`pane`, `row`), created by `make` on a miss.
+    pub fn get_or_insert_with(
+        &mut self,
+        pane: u64,
+        row: usize,
+        cells: &[Cell],
+        make: impl FnOnce() -> T,
+    ) -> &mut T {
+        let frame = self.frame;
+        // Fast path: the row is unchanged at its position.
+        let cached = self.positions.get(&(pane, row)).and_then(|&hash| {
+            let index = self
+                .entries
+                .get(&hash)?
+                .iter()
+                .position(|entry| entry.cells == cells)?;
+            Some((hash, index))
+        });
+        let (hash, index) = match cached {
+            Some(found) => found,
+            None => {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                cells.hash(&mut hasher);
+                let hash = hasher.finish();
+                self.positions.insert((pane, row), hash);
+                let bucket = self.entries.entry(hash).or_default();
+                let index = match bucket.iter().position(|entry| entry.cells == cells) {
+                    Some(index) => index,
+                    None => {
+                        bucket.push(RowEntry {
+                            cells: cells.to_vec(),
+                            value: make(),
+                            frame,
+                        });
+                        bucket.len() - 1
+                    }
+                };
+                (hash, index)
+            }
+        };
+        let bucket = self.entries.get_mut(&hash).expect("row entry present");
+        let entry = &mut bucket[index];
+        entry.frame = frame;
+        &mut entry.value
+    }
 }
 
 pub(crate) fn parse_color(value: &str, fallback: u32) -> u32 {
@@ -134,5 +224,61 @@ pub(crate) fn resolve_color(config: &Config, color: ColorSpec) -> u32 {
             let c = 8 + 10 * (i as u32 - 232);
             c << 16 | c << 8 | c
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::UnderlineStyle;
+    fn row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|c| Cell {
+                text: c.to_string(),
+                fg: ColorSpec::Foreground,
+                bg: ColorSpec::Background,
+                bold: false,
+                italic: false,
+                underline: false,
+                strike: false,
+                wide_spacer: false,
+                underline_style: UnderlineStyle::None,
+                underline_color: None,
+                link: None,
+            })
+            .collect()
+    }
+    #[test]
+    fn row_cache_reuses_moved_rows_and_drops_undrawn_ones() {
+        let mut cache = RowCache::<u32>::default();
+        let mut made = 0;
+        let mut draw = |cache: &mut RowCache<u32>, rows: &[&str]| {
+            cache.begin_frame();
+            for (index, text) in rows.iter().enumerate() {
+                cache.get_or_insert_with(1, index, &row(text), || {
+                    made += 1;
+                    made
+                });
+            }
+            cache.end_frame();
+        };
+        draw(&mut cache, &["a", "b", "c"]);
+        // Scrolling by one line only creates the new bottom row.
+        draw(&mut cache, &["b", "c", "d"]);
+        // Idle frame: nothing new.
+        draw(&mut cache, &["b", "c", "d"]);
+        drop(draw);
+        assert_eq!(made, 4);
+        // "a" was not drawn in the last frames: evicted, so it is made again.
+        cache.begin_frame();
+        let value = *cache.get_or_insert_with(1, 0, &row("a"), || 99);
+        assert_eq!(value, 99);
+        // Equal content at two positions shares one entry.
+        let shared = *cache.get_or_insert_with(2, 7, &row("b"), || 100);
+        assert_eq!(shared, 2);
+        cache.end_frame();
+        assert_eq!(cache.entries.values().map(Vec::len).sum::<usize>(), 2);
+        cache.clear();
+        assert!(cache.entries.is_empty() && cache.positions.is_empty());
     }
 }
