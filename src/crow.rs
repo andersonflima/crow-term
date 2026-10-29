@@ -52,6 +52,10 @@ pub struct AgentSession {
     pub context_percent: Option<f64>,
     pub tokens: Option<u64>,
     pub age_seconds: u64,
+    /// Process id and terminal of the agent CLI, when crow-skills reports
+    /// them: they tie the session to a pane exactly.
+    pub pid: Option<u32>,
+    pub tty: Option<String>,
 }
 impl AgentSession {
     pub fn live(&self) -> bool {
@@ -267,6 +271,8 @@ fn parse_session(item: &Value) -> AgentSession {
             .map(|p| p.clamp(0.0, 100.0)),
         tokens,
         age_seconds: uint(item, "ageSeconds").unwrap_or(0),
+        pid: uint(item, "pid").and_then(|pid| u32::try_from(pid).ok()),
+        tty: text(item, "tty"),
     }
 }
 
@@ -332,6 +338,135 @@ pub type Line = Vec<Segment>;
 pub struct CrowView {
     pub status: Vec<Segment>,
     pub panel: Vec<Line>,
+    /// Facts for the tab context (footer and tab labels).
+    pub context: Context,
+}
+
+/// Agent sessions, the focused pane's run and repository, the global crow
+/// summary: the UI composes them with `tab_context`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Context {
+    pub agents: Vec<crate::tab_context::Agent>,
+    pub progress: Option<crate::tab_context::Progress>,
+    pub repo: Option<crate::tab_context::Repo>,
+    pub global: Option<crate::tab_context::Segment>,
+    /// The pane and cwd these facts are about.
+    pub pane: u64,
+    pub cwd: Option<String>,
+}
+
+/// The tab-context facts of `source` for the focused pane's `cwd`.
+pub fn context(
+    source: &Source,
+    pane: u64,
+    cwd: Option<&str>,
+    repo: Option<crate::tab_context::Repo>,
+) -> Context {
+    use crate::tab_context::{Agent, GlobalInput, Progress, global_segment};
+    let mut out = Context {
+        repo,
+        pane,
+        cwd: cwd.map(str::to_owned),
+        ..Context::default()
+    };
+    let Source::Ready(state) = source else {
+        return out;
+    };
+    let run_for = |dir: &str| {
+        state
+            .runs
+            .iter()
+            .filter(|r| r.status == "running" && is_ancestor(&r.cwd, dir))
+            .max_by_key(|r| r.cwd.len())
+    };
+    out.agents = state
+        .sessions
+        .iter()
+        .filter(|s| s.live())
+        .map(|s| Agent {
+            host: s.host.clone(),
+            state: s.state.clone(),
+            blocked: s.blocked,
+            cwd: s.cwd.clone(),
+            pid: s.pid,
+            tty: s.tty.clone(),
+            model: s.model.clone(),
+            tool: s.tool.clone(),
+            task: run_for(&s.cwd).map(|r| r.title.clone()),
+            context_percent: s.context_percent.map(|p| p.round() as u8),
+            age_seconds: s.age_seconds,
+        })
+        .collect();
+    out.progress = cwd.and_then(run_for).map(|r| Progress {
+        title: r.title.clone(),
+        done: r.done,
+        total: r.total,
+        failed: r.failed,
+    });
+    out.global = global_segment(&GlobalInput {
+        crow_on: Some(state.mode_on != Some(false)),
+        active_sessions: state
+            .sessions
+            .iter()
+            .filter(|s| s.state == "working" || s.blocked || s.state == "blocked")
+            .count(),
+        memory: state
+            .memory
+            .as_ref()
+            .map(|m| (m.level.clone(), m.used_percent.map(|p| p.round() as u8))),
+    });
+    out
+}
+
+/// The repository containing `cwd` and its branch, from `.git` files only.
+pub fn git_repo(cwd: &Path) -> Option<(PathBuf, String)> {
+    for dir in cwd.ancestors().take(64) {
+        if dir.join(".git").exists() {
+            return git_branch(dir).map(|branch| (dir.to_path_buf(), branch));
+        }
+    }
+    None
+}
+
+/// Branch, dirty state and ahead/behind of the repository at `cwd`, from
+/// `git status` (bounded to 1 s; no index lock is taken).
+pub fn git_status(cwd: &Path) -> Option<crate::tab_context::Repo> {
+    let (top, _) = git_repo(cwd)?;
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&top)
+        .args([
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=no",
+        ])
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stdout.read_to_string(&mut text);
+        text
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let text = reader.join().ok()?;
+    crate::tab_context::parse_git_status(&text, &top.to_string_lossy())
 }
 
 /// Snapshot availability as seen by the worker.
@@ -994,6 +1129,12 @@ pub fn spawn(
             let mut fetched_at = Instant::now();
             let mut last_sent: Option<CrowView> = None;
             let mut cwd_cache: Option<(u64, Option<String>, Option<String>)> = None;
+            // `git status` of the focused cwd: on a cwd change, else every 5 s.
+            let mut repo_cache: Option<(
+                Option<String>,
+                Instant,
+                Option<crate::tab_context::Repo>,
+            )> = None;
             let mut first = true;
             let mut cwd_failures = 0u32;
             let mut cwd_failed_at: Option<Instant> = None;
@@ -1090,7 +1231,28 @@ pub fn spawn(
                     Source::Ready(state) => Source::Ready(aged(state, fetched_at.elapsed())),
                     other => other.clone(),
                 };
+                let repo = if config.status_bar {
+                    match &repo_cache {
+                        Some((c, at, repo))
+                            if *c == cwd && at.elapsed() < Duration::from_secs(5) =>
+                        {
+                            repo.clone()
+                        }
+                        _ => {
+                            let repo = cwd.as_deref().and_then(|c| git_status(Path::new(c)));
+                            repo_cache = Some((cwd.clone(), Instant::now(), repo.clone()));
+                            repo
+                        }
+                    }
+                } else {
+                    None
+                };
                 let view = CrowView {
+                    context: if config.status_bar {
+                        context(&current, pane, cwd.as_deref(), repo)
+                    } else {
+                        Context::default()
+                    },
                     status: if config.status_bar {
                         status_segments(&current, branch.as_deref(), cwd.as_deref())
                     } else {
@@ -1563,5 +1725,86 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3, "then once per CWD_RETRY");
         // Missing crow-skills: nothing but an empty status line is published.
         assert!(published.try_iter().all(|view| view.status.is_empty()));
+    }
+    #[test]
+    fn the_tab_context_gets_agents_their_run_and_the_global_summary() {
+        let with_ids = CURRENT.replace(
+            r#""ageSeconds":3,"ledgerRun":"r1""#,
+            r#""ageSeconds":3,"ledgerRun":"r1","pid":4242,"tty":"/dev/ttys004""#,
+        );
+        let state = parse_snapshot(with_ids.as_bytes()).unwrap();
+        assert_eq!(state.sessions[0].pid, Some(4242));
+        assert_eq!(state.sessions[0].tty.as_deref(), Some("/dev/ttys004"));
+        let context = context(&Source::Ready(state), 7, Some("/w/crow-term/src"), None);
+        assert_eq!(context.pane, 7);
+        // Live sessions only (the ended one is left out).
+        let hosts: Vec<_> = context.agents.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(hosts, ["claude", "codex", "claude"]);
+        let claude = &context.agents[0];
+        assert_eq!(
+            claude.task.as_deref(),
+            Some("Crow panel"),
+            "the run of its directory"
+        );
+        assert_eq!(claude.context_percent, Some(57));
+        assert_eq!(claude.pid, Some(4242));
+        let progress = context.progress.unwrap();
+        assert_eq!((progress.done, progress.total), (3, 7));
+        // Active = working or blocked: 2 of the 3 live sessions.
+        assert_eq!(context.global.unwrap().text, "crow on · 2 active");
+        // Nothing to say before the first snapshot.
+        assert_eq!(
+            super::context(&Source::Pending, 1, None, None).agents.len(),
+            0
+        );
+    }
+
+    #[test]
+    fn git_repo_and_status_read_the_real_repository() {
+        let dir = tempfile_dir();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        if git(&["init", "-q", "-b", "trunk"]).status.code() != Some(0) {
+            return; // git not installed
+        }
+        std::fs::write(dir.join("a.txt"), "1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "one"]);
+        let sub = dir.join("deep/er");
+        std::fs::create_dir_all(&sub).unwrap();
+        let (top, branch) = git_repo(&sub).unwrap();
+        assert_eq!((top.as_path(), branch.as_str()), (dir.as_path(), "trunk"));
+        let repo = git_status(&sub).unwrap();
+        assert_eq!((repo.branch.as_str(), repo.dirty), ("trunk", false));
+        std::fs::write(dir.join("a.txt"), "2").unwrap();
+        assert!(git_status(&sub).unwrap().dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "crow-git-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }

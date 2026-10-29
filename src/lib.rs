@@ -13,4 +13,5 @@ pub mod login;
 pub mod model;
 pub mod render;
 pub mod server;
+pub mod tab_context;
 pub mod ui;

@@ -180,6 +180,7 @@ pub(crate) fn app(config: Config, scale: f64, size: PhysicalSize<u32>) -> App {
             (11, screen(styled_rows(48), (4, 7), "Block")),
             (12, screen(styled_rows(40), (0, 0), "Block")),
         ],
+        panes: vec![],
     });
     app
 }
@@ -255,6 +256,7 @@ pub(crate) fn cases() -> Vec<(&'static str, App)> {
                 },
             ],
         ],
+        ..CrowView::default()
     };
     if let Some(view) = &mut panel.view {
         view.screens[0].1.cursor.shape = "Underline".into();

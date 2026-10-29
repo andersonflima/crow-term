@@ -65,6 +65,10 @@ pub struct FrameMeta {
     /// The link under the pointer while the link modifier is held.
     #[serde(default)]
     pub hover_link: Option<String>,
+    /// Footer context segments as drawn (global segment last).
+    pub footer: Vec<String>,
+    /// Tab labels as drawn.
+    pub tabs: Vec<String>,
 }
 
 pub struct FrameDump {
@@ -194,6 +198,8 @@ mod tests {
             ime: String::new(),
             stuck_pane: None,
             hover_link: None,
+            footer: Vec::new(),
+            tabs: Vec::new(),
         }
     }
 

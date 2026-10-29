@@ -127,21 +127,47 @@ truecolor, alternate screen and application mouse reporting are implemented.
   soft-wrapped lines are joined, wide characters and emoji kept, trailing
   blanks of each line trimmed. OSC 52 is unchanged (below).
 
-## Crow agent status bar and panel
+## Tab context: status bar and tab labels
 
-When the [`crow-skills`](https://github.com/andersonflima/crow-skills) CLI is
-installed, the footer shows a thin status line for agent CLIs running on the
-machine, and prefix `a` toggles an agent list panel:
+The footer describes the **focused pane**, most important first; when the
+window is narrow, whole low-priority parts are dropped first, and a part that
+still has to be shortened keeps its distinctive end (`crow-te…/feature/x`) or
+ends at a word. Click a shortened part to read it whole.
 
 ```text
-▸▸ crow on   claude 2  codex 1   ⚠ 1 blocked   Crow panel 3/7   mem 41%   ⎇ main
+claude ● working · fix the login flow · 3/8 · 37% ▰▰▰▱▱▱▱▱ · opus-5.5 · ctx 57% · crow-term@main *↑1      crow on · 2 active
+nvim main.rs · ~/w/crow-term                                                                           crow on
 ```
 
-- crow mode (`on`/`off`, coloured), live sessions per CLI, blocked/error
-  sessions highlighted, the active crow-behaviour run `title done/total`
-  (preferring the run that contains the focused pane's directory), memory
-  pressure when `crow-skills` reports it (0.9.0+), and the git branch of the
-  focused pane's working directory (read from `.git/HEAD`, no `git` subprocess).
+- With an agent CLI (claude, codex, gemini, agy, devin) in the pane: the agent
+  and its state, its task (the crow-behaviour run of its directory) or tool,
+  the run's progress, model and context use. The session is matched to the
+  pane by process id, then terminal, then (an agent CLI in the foreground) by
+  directory, most recently active first.
+- Otherwise: the foreground program (with one argument only for editors and
+  build tools, and only if it cannot be a secret) and the directory.
+- `repo@branch` with `*` (uncommitted changes), `↑`/`↓` (ahead/behind), from
+  `git status` run at most every 5 s, bounded to 1 s, taking no index lock.
+- The session name only when more than one session exists.
+- On the right, one global part: crow on/off, the number of agent sessions
+  working or blocked, memory only under pressure.
+- Help for the prefix keys is shown while the prefix is armed, not all the time.
+
+Tab labels follow what runs in each tab: a name you gave the window
+(rename) wins, then the program's own title (OSC 0/2), an agent and its task,
+the foreground program, `repo@branch`, the shell. A label changes only after
+holding for 0.6 s (a quick `ls` does not flash it), is shortened in the middle,
+and hovering a shortened tab shows it whole. `tab_labels = false` keeps the
+window names. The daemon refreshes each pane's summary (foreground program,
+title, directory) on its own thread once a second, never while answering a
+request, and wakes the GUI only when one changes.
+
+## Crow agent panel
+
+When the [`crow-skills`](https://github.com/andersonflima/crow-skills) CLI is
+installed, the status bar above includes agent sessions and runs, and prefix
+`a` toggles an agent list panel:
+
 - The panel lists each running run as `● main  <title>  x/y`, one
   `○ <owner>  <activity>` line per running unit and a `✓ done ✗ failed pending`
   count line, then each session (CLI, state, tool, age; project@branch, model,
@@ -155,7 +181,8 @@ machine, and prefix `a` toggles an agent list panel:
   0.14 s CPU (crow-skills is node + python). Unknown fields and newer minor
   versions are ignored; an unknown major version is shown as `crow ?`. The source
   never contains prompt, message or tool I/O text.
-- Without `crow-skills` the crow segments are hidden (the branch remains).
+- Without `crow-skills` the agent parts are hidden (program, directory and
+  repository remain).
 
 ```toml
 [crow]

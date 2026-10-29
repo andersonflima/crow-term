@@ -29,6 +29,9 @@ pub struct Config {
     /// Frame renderer: "software" (default), "gpu" or "auto". Overridden by
     /// `CROW_TERM_RENDERER` and by `--renderer`.
     pub renderer: RendererMode,
+    /// Tab labels follow what runs in the tab (program title, agent and task,
+    /// program, repo@branch) unless the window was renamed. Default true.
+    pub tab_labels: bool,
     /// Terminal protocol options that grant applications extra access.
     pub terminal: TerminalConfig,
     /// Crow agent status bar and panel. Last field: TOML tables follow plain values.
@@ -173,6 +176,7 @@ impl Default for Config {
             login_shell: true,
             prefix: "Ctrl-t".into(),
             renderer: RendererMode::default(),
+            tab_labels: true,
             terminal: TerminalConfig::default(),
             crow: CrowConfig::default(),
         }

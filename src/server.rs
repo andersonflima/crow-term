@@ -129,6 +129,9 @@ pub struct Server {
     registry: Mutex<Registry>,
     signals: Arc<Signals>,
     stopped: AtomicBool,
+    /// Pane summaries (tab labels, status bar), refreshed by their own thread
+    /// once a second; a view only copies them, never computes them.
+    summaries: Mutex<HashMap<u64, crate::model::PaneSummary>>,
     config: Config,
 }
 impl Server {
@@ -147,6 +150,7 @@ impl Server {
             registry: Mutex::new(Registry::default()),
             signals: Arc::default(),
             stopped: AtomicBool::new(false),
+            summaries: Mutex::default(),
             config: config.clone(),
         }
     }
@@ -192,6 +196,16 @@ impl Server {
             vec![]
         };
         let sessions = registry.infos();
+        // Summaries of every pane of the watched session (tab labels), sent
+        // along with screens: copied from the cache the summary thread keeps.
+        let summarized: Vec<u64> = if screens {
+            session
+                .and_then(|s| registry.sessions.get(s))
+                .map(|windows| windows.iter().flat_map(|w| w.layout.panes()).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let engines: Vec<_> = panes
             .into_iter()
             .filter_map(|id| registry.panes.get(&id).cloned().map(|e| (id, e)))
@@ -221,11 +235,22 @@ impl Server {
                 .map(|(id, engine)| Ok((id, engine.snapshot()?)))
                 .collect::<Result<_>>()?
         };
+        let panes = {
+            let cache = self
+                .summaries
+                .lock()
+                .map_err(|_| anyhow::anyhow!("summaries poisoned"))?;
+            summarized
+                .into_iter()
+                .filter_map(|id| cache.get(&id).map(|summary| (id, summary.clone())))
+                .collect()
+        };
         Ok(View {
             instance: self.instance,
             revision,
             sessions,
             screens,
+            panes,
         })
     }
     pub fn handle(&self, request: Request) -> Result<Response> {
@@ -496,6 +521,35 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+impl Server {
+    /// Recompute every pane's summary (off the request path; one pane at a
+    /// time, never waiting on a busy pane) and wake watchers when any changed.
+    fn refresh_summaries(&self) {
+        let engines: Vec<(u64, Arc<Engine>)> = match self.lock() {
+            Ok(registry) => registry
+                .panes
+                .iter()
+                .map(|(id, engine)| (*id, engine.clone()))
+                .collect(),
+            Err(_) => return,
+        };
+        let fresh: HashMap<u64, crate::model::PaneSummary> = engines
+            .into_iter()
+            .map(|(id, engine)| (id, engine.summary()))
+            .collect();
+        let changed = match self.summaries.lock() {
+            Ok(mut cache) if *cache != fresh => {
+                *cache = fresh;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.signals.bump();
+        }
+    }
+}
+
 pub fn run(config: Config) -> Result<()> {
     // Held for the daemon's whole life: starters use it to tell a live but
     // unresponsive daemon from a dead one (never replace a live daemon).
@@ -503,6 +557,17 @@ pub fn run(config: Config) -> Result<()> {
     let _ = std::fs::remove_file(ipc::runtime_dir()?.join(ipc::STOPPED_MARKER));
     let listener = ipc::listen()?;
     let server = Arc::new(Server::new(&config));
+    {
+        let server = server.clone();
+        std::thread::Builder::new()
+            .name("crow-summaries".into())
+            .spawn(move || {
+                while !server.stopped.load(Ordering::Acquire) {
+                    server.refresh_summaries();
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            })?;
+    }
     let active = Arc::new(AtomicUsize::new(0));
     while !server.stopped.load(Ordering::Acquire) {
         match listener.accept() {
@@ -589,6 +654,57 @@ pub fn run(config: Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[cfg(unix)]
+    fn views_carry_cached_pane_summaries_refreshed_off_the_request_path() {
+        let server = Server::new(&Config::default());
+        let Response::Created { window, pane } = server
+            .handle(Request::Ensure {
+                session: "s".into(),
+                shell: ShellSpec {
+                    program: "/bin/sh".into(),
+                    args: vec!["-c".into(), "exec sleep 30".into()],
+                    cwd: None,
+                },
+                size: Size::default(),
+            })
+            .unwrap()
+        else {
+            panic!("not created");
+        };
+        // Before the summary thread ran, a view has screens but no summaries:
+        // nothing is computed while answering.
+        let view = server.view(Some("s"), window, Some(0)).unwrap();
+        assert!(!view.screens.is_empty());
+        assert!(view.panes.is_empty(), "{:?}", view.panes);
+        let revision = server.signals.revision();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let summary = loop {
+            server.refresh_summaries();
+            let view = server.view(Some("s"), window, Some(0)).unwrap();
+            if let Some((_, summary)) = view.panes.iter().find(|(id, _)| *id == pane)
+                && summary.process == "sleep"
+            {
+                break summary.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "no summary");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(summary.pid.is_some());
+        assert!(
+            server.signals.revision() > revision,
+            "a changed summary wakes watchers"
+        );
+        // Unchanged summaries do not wake anyone.
+        let settled = server.signals.revision();
+        server.refresh_summaries();
+        assert_eq!(server.signals.revision(), settled);
+        server
+            .handle(Request::KillSession {
+                session: "s".into(),
+            })
+            .unwrap();
+    }
     #[test]
     fn guarded_commands_run_only_on_the_daemon_instance_they_were_made_for() {
         // Two daemons in a row reuse pane ids from 1: a command made for the

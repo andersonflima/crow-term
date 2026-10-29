@@ -22,7 +22,8 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 /// v5: cell pixel metrics on resize, bell count, hyperlinks, alternate scroll.
 /// v6: daemon instance in `View`, `Request::Guarded`.
 /// v7: soft-wrap flags in `Screen`.
-pub const WIRE_VERSION: u32 = 7;
+/// v8: pane summaries (foreground program, title, cwd) in `View`.
+pub const WIRE_VERSION: u32 = 8;
 const DEADLINE: Duration = Duration::from_secs(5);
 /// Unix sockets block in the kernel for at most this long per call, so the
 /// frame deadline is still checked while no byte flows.

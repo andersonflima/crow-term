@@ -523,10 +523,21 @@ fn tone_color(tone: Tone, chrome: &Chrome, light: bool) -> u32 {
         (Tone::Off, false) => 0xe39264,
         (Tone::Accent, true) => 0x2f5fb3,
         (Tone::Accent, false) => 0x7aa7f0,
-        (Tone::Warn, true) => 0xa86400,
+        (Tone::Warn, true) => 0x985a00,
         (Tone::Warn, false) => 0xe6b450,
         (Tone::Alert, true) => 0xc0392b,
         (Tone::Alert, false) => 0xf07167,
+    }
+}
+/// Tab-context tones painted with the crow palette.
+fn context_tone(tone: crate::tab_context::Tone) -> Tone {
+    match tone {
+        crate::tab_context::Tone::Plain => Tone::Plain,
+        crate::tab_context::Tone::On => Tone::On,
+        crate::tab_context::Tone::Accent => Tone::Accent,
+        crate::tab_context::Tone::Warn => Tone::Warn,
+        crate::tab_context::Tone::Alert => Tone::Alert,
+        crate::tab_context::Tone::Muted => Tone::Muted,
     }
 }
 /// The crow agent list as a layer in panel-local coordinates (cached by the caller).
@@ -601,6 +612,7 @@ macro_rules! scene_of {
         let size = $size;
         let rects = $app.rects();
         let panel = $app.panel_rect().map(|rect| (rect, $app.panel_layer(rect)));
+        let (tab_labels, context) = $app.prepare_context();
         let parts = FrameParts {
             config: &$app.config,
             session: &$app.session,
@@ -614,14 +626,15 @@ macro_rules! scene_of {
             status: &$app.status,
             prefix: $app.prefix,
             bell_flash: $app.bell_flash.as_ref(),
-            crow_status: &$app.crow_view.status,
             stuck: $app.stuck,
             rects,
             tabs: $app.tab_rects(),
             windows: $app.windows(),
+            tab_labels,
+            context,
             panel,
         };
-        compose(&parts, &mut $app.shaper, size)
+        compose(&parts, &mut $app.shaper, size, &mut $app.drawn)
     }};
 }
 
@@ -695,6 +708,13 @@ struct App {
     clipboard: Option<arboard::Clipboard>,
     crow: Option<Arc<crow::Shared>>,
     crow_view: CrowView,
+    /// Tab labels and the footer's pane context (see tab_context.rs).
+    tab_context: crate::tab_context::State,
+    /// What the last frame showed: shortened footer parts and tabs (for a
+    /// click or hover) and the drawn texts (frame dumps).
+    drawn: Drawn,
+    /// A debounced tab label is due to change then.
+    label_due: Option<Instant>,
     crow_panel: bool,
     crow_pane: u64,
     panel_layer: Option<Arc<Layer>>,
@@ -773,6 +793,9 @@ impl App {
             clipboard: None,
             crow,
             crow_view: CrowView::default(),
+            tab_context: Default::default(),
+            drawn: Drawn::default(),
+            label_due: None,
             crow_panel,
             crow_pane: pane_id,
             panel_layer: None,
@@ -1430,7 +1453,45 @@ impl App {
         self.dragging = false;
         true
     }
+    /// The full text of a shortened footer part or tab label under (x, y).
+    fn context_text_at(&self, x: f64, y: f64) -> Option<String> {
+        let size = self.window_size()?;
+        let footer_y = size
+            .height
+            .saturating_sub((FOOTER as f64 * self.scale) as u32) as f64;
+        if y >= footer_y {
+            let x = x as i32;
+            return self
+                .drawn
+                .footer_full
+                .iter()
+                .find(|(from, to, _)| (*from..=*to).contains(&x))
+                .map(|(_, _, full)| full.clone());
+        }
+        if y < HEADER as f64 * self.scale {
+            let (id, _) = self
+                .tab_rects()
+                .into_iter()
+                .find(|(_, rect)| rect.contains(x, y))?;
+            return self
+                .drawn
+                .tab_full
+                .iter()
+                .find(|(w, _)| *w == id)
+                .map(|(_, full)| full.clone());
+        }
+        None
+    }
     fn mouse_move(&mut self) {
+        // Hovering a shortened tab label shows it whole in the status line.
+        if self.cursor.y < HEADER as f64 * self.scale
+            && let Some(full) = self.context_text_at(self.cursor.x, self.cursor.y)
+            && self.status != full
+        {
+            self.status = full;
+            self.status_expires = Some(Instant::now() + Duration::from_secs(3));
+            self.redraw();
+        }
         if let Some(origin) = self.mouse_origin {
             if !self.mods.shift_key()
                 && let Some((pane, point)) = captured_mouse_target(
@@ -1471,6 +1532,17 @@ impl App {
         }
     }
     fn mouse_click(&mut self, state: ElementState, button: MouseButton) {
+        // A shortened footer part shows its full text when clicked.
+        if state == ElementState::Pressed
+            && button == MouseButton::Left
+            && self.cursor.y >= HEADER as f64 * self.scale
+            && let Some(full) = self.context_text_at(self.cursor.x, self.cursor.y)
+        {
+            self.status = full;
+            self.status_expires = Some(Instant::now() + Duration::from_secs(6));
+            self.redraw();
+            return;
+        }
         // Modifier+click on a link is the terminal's, never the program's
         // (press and release alike).
         if button == MouseButton::Left {
@@ -1921,6 +1993,66 @@ impl App {
         drop(scene);
         self.after_paint();
     }
+    /// Tab labels and the footer context of the next frame (tab_context.rs);
+    /// `compose` paints them and records what it drew in `self.drawn`.
+    #[allow(clippy::type_complexity)]
+    fn prepare_context(
+        &mut self,
+    ) -> (
+        Vec<(u64, String)>,
+        Option<(
+            Vec<crate::tab_context::Segment>,
+            Option<crate::tab_context::Segment>,
+        )>,
+    ) {
+        let tabs = self.tab_rects();
+        let windows = self.windows();
+        let mut tab_labels = Vec::new();
+        let mut tab_full = Vec::new();
+        for &(id, rect) in &tabs {
+            let Some(info) = windows.iter().find(|info| info.id == id) else {
+                continue;
+            };
+            let full = if self.config.tab_labels {
+                let pane = if id == self.window_id {
+                    Some(self.pane_id)
+                } else {
+                    info.layout.panes().first().copied()
+                };
+                self.tab_context.tab_label(
+                    id,
+                    &info.name,
+                    pane,
+                    &self.crow_view.context.agents,
+                    &self.shell.program,
+                )
+            } else {
+                info.name.clone()
+            };
+            let room = ((rect.w as f32 - 20.0 * self.scale as f32) / (8.0 * self.scale as f32))
+                .max(4.0) as usize;
+            let label = crate::tab_context::middle_ellipsis(&full, room.saturating_sub(3));
+            if label != full {
+                tab_full.push((id, full));
+            }
+            tab_labels.push((id, label));
+        }
+        let context = (!self.prefix).then(|| {
+            let sessions = self.view.as_ref().map_or(0, |v| v.sessions.len());
+            let session = (sessions > 1).then_some(self.session.as_str());
+            self.tab_context
+                .footer(self.pane_id, &self.crow_view.context, session)
+        });
+        self.label_due = self
+            .tab_context
+            .next_change()
+            .map(|after| Instant::now() + after);
+        self.drawn = Drawn {
+            tab_full,
+            ..Drawn::default()
+        };
+        (tab_labels, context)
+    }
     /// Effects of having drawn a frame for the focused pane.
     fn after_paint(&mut self) {
         if let Some(shared) = &self.crow
@@ -2022,6 +2154,8 @@ impl App {
             status: self.status.clone(),
             ime: self.ime.clone(),
             stuck_pane: self.stuck.map(|(pane, _)| pane),
+            footer: self.drawn.footer.clone(),
+            tabs: self.drawn.tabs.clone(),
             hover_link: self.hover_link.as_ref().map(|(_, hit)| hit.url.clone()),
         };
         if let Err(error) = dump.write(frame, size.width, size.height, &meta) {
@@ -2131,12 +2265,30 @@ struct FrameParts<'a> {
     status: &'a str,
     prefix: bool,
     bell_flash: Option<&'a (Instant, HashSet<u64>)>,
-    crow_status: &'a [Segment],
     stuck: Option<(u64, usize)>,
     rects: Vec<(u64, Rect)>,
     tabs: Vec<(u64, Rect)>,
     windows: Vec<WindowInfo>,
+    /// Tab labels as they fit (tab_context.rs).
+    tab_labels: Vec<(u64, String)>,
+    /// Footer context of the focused pane and the global part (not while
+    /// the prefix help is shown).
+    context: Option<(
+        Vec<crate::tab_context::Segment>,
+        Option<crate::tab_context::Segment>,
+    )>,
     panel: Option<(Rect, Arc<Layer>)>,
+}
+
+/// What a frame showed, for clicks/hover on shortened text and frame dumps.
+#[derive(Default)]
+struct Drawn {
+    /// Shortened footer parts: (x from, x to, full text).
+    footer_full: Vec<(i32, i32, String)>,
+    /// Shortened tab labels: (window, full label).
+    tab_full: Vec<(u64, String)>,
+    footer: Vec<String>,
+    tabs: Vec<String>,
 }
 
 /// Push shaped UI text and return its width.
@@ -2164,6 +2316,7 @@ fn compose<'a>(
     parts: &FrameParts<'a>,
     shaper: &mut GridShaper,
     size: PhysicalSize<u32>,
+    drawn: &mut Drawn,
 ) -> Scene<'a> {
     let config = parts.config;
     let scale = parts.scale;
@@ -2232,7 +2385,13 @@ fn compose<'a>(
                 .position(|window| window.id == id)
                 .unwrap_or(0)
                 + 1;
-            let text = format!("{index}  {}", info.name);
+            let label = parts
+                .tab_labels
+                .iter()
+                .find(|(w, _)| *w == id)
+                .map_or(info.name.as_str(), |(_, label)| label.as_str());
+            drawn.tabs.push(label.to_owned());
+            let text = format!("{index}  {label}");
             text_op(
                 &mut ops,
                 shaper,
@@ -2436,72 +2595,98 @@ fn compose<'a>(
         rect: footer,
         color: chrome.surface,
     });
-    let hint = if parts.prefix {
-        "PREFIX  c window   % / \" split   n/p tabs   h/j/k/l panes   a agents   d detach   x close"
-            .to_owned()
-    } else if !parts.status.is_empty() {
-        parts.status.to_owned()
-    } else {
-        format!(
-            "{}  ·  session {}  ·  pane {}  ·  closing this window detaches",
-            if config.prefix.eq_ignore_ascii_case("none") {
-                "tmux passthrough".to_owned()
-            } else {
-                format!("{} prefix", config.prefix)
-            },
-            parts.session,
-            parts.pane_id
-        )
-    };
     let light = light_background(config);
-    // Footer order: prefix help alone; otherwise status/error messages first (they
-    // must stay visible), then the crow segments, then the default session hint.
-    let hint_color = if parts.prefix {
-        chrome.text
-    } else {
-        chrome.muted
-    };
-    let mut footer_items: Vec<(&str, u32)> = Vec::new();
+    let size_px = (11.0 * scale) as f32;
+    let text_y = footer_y + (4.0 * scale) as i32;
+    let gap = (16.0 * scale) as f32;
+    let mut items: Vec<(String, u32)> = Vec::new();
     // Shown whatever else the footer says: input is waiting, not lost.
-    let stuck = parts.stuck.map(|(pane, kib)| {
-        format!("pane {pane}: the program is not reading input — {kib} KB waiting")
-    });
-    if let Some(stuck) = &stuck {
-        footer_items.push((stuck, chrome.text));
+    if let Some((pane, kib)) = parts.stuck {
+        items.push((
+            format!("pane {pane}: the program is not reading input — {kib} KB waiting"),
+            chrome.text,
+        ));
     }
-    let message_first = parts.prefix || !parts.status.is_empty();
-    if message_first {
-        footer_items.push((&hint, hint_color));
+    if parts.prefix {
+        // Static help lives here, not in the everyday footer.
+        items.push((
+            "PREFIX  c window  % / \" split  n/p tabs  h/j/k/l panes  a agents  d detach  x close  · closing the window detaches"
+                .to_owned(),
+            chrome.text,
+        ));
+    } else if !parts.status.is_empty() {
+        items.push((parts.status.to_owned(), chrome.text));
     }
-    if !parts.prefix {
-        footer_items.extend(parts.crow_status.iter().map(|segment| {
-            (
-                segment.text.as_str(),
-                tone_color(segment.tone, &chrome, light),
-            )
-        }));
-    }
-    if !message_first {
-        footer_items.push((&hint, hint_color));
-    }
-    let mut footer_x = (12.0 * scale) as i32;
-    let gap = (16.0 * scale) as i32;
-    for (text, color) in footer_items {
-        if footer_x >= footer.w as i32 {
-            break;
-        }
+    let mut x = (12.0 * scale) as i32;
+    for (text, color) in &items {
         let width = text_op(
-            &mut ops,
-            shaper,
-            config,
-            footer,
-            footer_x,
-            footer_y + (4.0 * scale) as i32,
-            text,
-            color,
-            (11.0 * scale) as f32,
+            &mut ops, shaper, config, footer, x, text_y, text, *color, size_px,
         );
-        footer_x += width.ceil() as i32 + gap;
+        x += (width + gap).ceil() as i32;
+    }
+    if let Some((segments, global)) = &parts.context {
+        // The focused pane's context, fitted to what is left: whole
+        // low-priority parts go first (tab_context::fit).
+        let advance = shaper.shape_text(config, 0, 0, "0000000000", 0, size_px).1 / 10.0;
+        let measure = |text: &str| unicode_width::UnicodeWidthStr::width(text) as f32 * advance;
+        let right = (12.0 * scale) as i32;
+        let global_width = global.as_ref().map_or(0.0, |g| measure(&g.text));
+        let room = (footer.w as f32 - x as f32 - right as f32 - global_width - gap).max(0.0);
+        let fitted = crate::tab_context::fit(segments.clone(), room, gap, measure);
+        // Separators are the only muted ink.
+        let separator = mix_rgb(chrome.surface, chrome.muted, 60);
+        for (index, segment) in fitted.iter().enumerate() {
+            if index > 0 {
+                text_op(
+                    &mut ops,
+                    shaper,
+                    config,
+                    footer,
+                    x - (gap * 0.6) as i32,
+                    text_y,
+                    "·",
+                    separator,
+                    size_px,
+                );
+            }
+            let color = tone_color(context_tone(segment.tone), &chrome, light);
+            let width = text_op(
+                &mut ops,
+                shaper,
+                config,
+                footer,
+                x,
+                text_y,
+                &segment.text,
+                color,
+                size_px,
+            );
+            drawn.footer.push(segment.text.clone());
+            if segment.text != segment.full {
+                drawn
+                    .footer_full
+                    .push((x, x + width.ceil() as i32, segment.full.clone()));
+            }
+            x += (width + gap).ceil() as i32;
+        }
+        if let Some(global) = global {
+            let gx = footer.w as i32 - right - global_width.ceil() as i32;
+            if gx > x {
+                let color = tone_color(context_tone(global.tone), &chrome, light);
+                text_op(
+                    &mut ops,
+                    shaper,
+                    config,
+                    footer,
+                    gx,
+                    text_y,
+                    &global.text,
+                    color,
+                    size_px,
+                );
+                drawn.footer.push(global.text.clone());
+            }
+        }
     }
     if let Some((rect, layer)) = &parts.panel {
         ops.push(Op::Layer {
@@ -2570,6 +2755,7 @@ impl ApplicationHandler<UiEvent> for App {
                     return;
                 }
                 self.dispatcher.set_instance(view.instance);
+                self.tab_context.update(&view.panes);
                 // Lanes of panes that no longer exist (closed, exited) end.
                 if view
                     .sessions
@@ -2780,6 +2966,16 @@ impl ApplicationHandler<UiEvent> for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // A debounced tab label becomes due: draw it then.
+        if let Some(due) = self.label_due {
+            if Instant::now() >= due {
+                self.label_due = None;
+                self.redraw();
+            } else if self.status_expires.is_none() && self.bell_flash.is_none() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+                return;
+            }
+        }
         // Timed redraws: transient status notes, the visual bell and retries
         // of skipped GPU frames; otherwise stay event-driven.
         let now = Instant::now();
@@ -3896,7 +4092,8 @@ mod tests {
                 instance: 1,
                 revision: 2,
                 sessions: vec![],
-                screens: vec![(1, screen)]
+                screens: vec![(1, screen)],
+                panes: vec![],
             }
         ));
         assert!(!mailbox.push(
@@ -3905,7 +4102,8 @@ mod tests {
                 instance: 1,
                 revision: 2,
                 sessions: vec![],
-                screens: vec![]
+                screens: vec![],
+                panes: vec![],
             }
         ));
         let (_, view) = mailbox.take().unwrap();
@@ -3916,7 +4114,8 @@ mod tests {
                 instance: 1,
                 revision: 3,
                 sessions: vec![],
-                screens: vec![]
+                screens: vec![],
+                panes: vec![],
             }
         ));
         assert_eq!(mailbox.take().unwrap().0, 2);

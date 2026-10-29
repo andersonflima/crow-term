@@ -944,6 +944,69 @@ def j18_links(ctx):
         [ctx.save_frame("j18-hover", hover), ctx.save_frame("j18-after", frame)]
 
 
+CROW_FIXTURE = r"""import json, os, sys
+path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "crow-snapshot.json")
+data = json.load(open(path, encoding="utf-8")) if os.path.exists(path) else {"sessions": [], "runs": []}
+data.update({"schema": "crow-snapshot/1", "mode": {"mode": "on"}})
+print(json.dumps({"schema_version": 1, "ok": True, "command": "events", "data": data}))
+"""
+
+
+@journey("J19", "the footer and the tab show the focused pane's agent, task, progress and model")
+def j19_tab_context(ctx):
+    import re
+    work = ctx.run.work
+    fixture = work / "crow_fixture.py"
+    fixture.write_text(CROW_FIXTURE, encoding="utf-8")
+    if os.name == "nt":
+        command = work / "crow-fixture.cmd"
+        command.write_text(f'@"{sys.executable}" "{fixture}" %*\r\n', encoding="utf-8")
+    else:
+        command = work / "crow-fixture"
+        command.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{fixture}' \"$@\"\n", encoding="utf-8")
+        command.chmod(0o755)
+    config = work / "context.toml"
+    config.write_text(harness.CONFIG.replace("[crow]\nenabled = false\n",
+                                             f"[crow]\nenabled = true\ncommand = {json.dumps(str(command))}\ninterval_ms = 1000\n"),
+                      encoding="utf-8")
+    # The session and its stand-in agent exist first, so the GUI's first crow
+    # snapshot already has them (later ones are minutes apart when idle).
+    pane = ctx.run.rpc("new-session", "agentctx")["Created"]["pane"]
+    quiet_screen(ctx, pane)
+    real = os.path.realpath(work)
+    if os.name == "nt":
+        ctx.run.send_keys(pane, f"cd '{real}'; echo \"PID:$PID\"\r")
+    else:
+        ctx.run.send_keys(pane, f"cd '{real}' && sh -c 'echo PID:$$; exec sleep 600'\r")
+    found = eventually(lambda: next((m for l in ctx.run.capture(pane).splitlines()
+                                     if (m := re.fullmatch(r"PID:(\d+)", l.strip()))), None),
+                       20, what="the agent stand-in's process id")
+    pid = int(found.group(1))
+    snapshot = {
+        "sessions": [{"schema": "crow-session/1", "host": "claude", "state": "working", "blocked": False,
+                      "cwd": real, "model": "claude-opus-5-5", "currentTool": "Bash", "pid": pid,
+                      "usage": {"used_percentage": 57}, "ageSeconds": 1}],
+        "runs": [{"id": "r1", "title": "Fixture task", "cwd": real, "status": "running",
+                  "done": 3, "failed": 0, "total": 8, "running": 1, "agents": []}],
+    }
+    (work / "crow-snapshot.json").write_text(json.dumps(snapshot), encoding="utf-8")
+    gui = ctx.run.launch("agentctx", attach=True, name="agentctx", config=config)
+    try:
+        gui.wait_frame(lambda m, i: m["revision"] > 0, what="agentctx frame")
+        ctx.driver.attach(gui)
+        want = ["claude ● working", "Fixture task", "3/8 · 37% ▰▰▰▱▱▱▱▱", "opus-5.5 · ctx 57%"]
+        frame = gui.wait_frame(lambda m, i: m["footer"][:4] == want, timeout=30,
+                               what=f"footer {want}")
+        footer, tab = frame[1]["footer"], frame[1]["tabs"][0]
+        if footer[-1] != "crow on · 1 active":
+            raise AssertionError(f"global segment: {footer}")
+        if not (tab.startswith("claude") and tab.endswith("task")):
+            raise AssertionError(f"tab label {tab!r}: expected the agent and its task")
+    finally:
+        gui.kill()
+    return f"footer {footer}; tab {tab!r}", [ctx.save_frame("j19-tab-context", frame)]
+
+
 @journey("J11", "a daemon that keeps stalling is waited for, never reported as disconnected")
 def j11_stall(ctx):
     gui, session, pane = link_gui(ctx)
@@ -1050,7 +1113,7 @@ def j13_stop(ctx):
 
 
 JOURNEYS = [j1_launch, j2_text, j3_split, j4_resize, j5_nvim_edit, j6_paste, j7_mouse, j8_focus, j10_chords, j9_reattach,
-            j15_stuck_pane, j16_exit_frozen, j17_backlog, j18_links, j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
+            j15_stuck_pane, j16_exit_frozen, j17_backlog, j18_links, j19_tab_context, j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
 
 
 def summary_markdown(ctx):

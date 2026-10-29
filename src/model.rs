@@ -189,6 +189,21 @@ pub struct SessionInfo {
     pub name: String,
     pub windows: Vec<WindowInfo>,
 }
+/// What a pane runs, for tab labels and the status bar (wire v8).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct PaneSummary {
+    /// The program's title (OSC 0/2), empty when it set none.
+    pub title: String,
+    /// Executable name of the foreground process ("nvim", "-zsh").
+    pub process: String,
+    /// At most one argument, only when it cannot be a secret (see
+    /// `tab_context::safe_args`); filtered by the daemon.
+    pub args: Vec<String>,
+    pub pid: Option<u32>,
+    /// The pane's terminal device (`/dev/ttys004`), empty when unknown.
+    pub tty: String,
+    pub cwd: Option<String>,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct View {
     /// Random per daemon process (wire v6): commands carry it so a restarted
@@ -198,6 +213,10 @@ pub struct View {
     pub revision: u64,
     pub sessions: Vec<SessionInfo>,
     pub screens: Vec<(u64, Screen)>,
+    /// Summaries of the watched session's panes (all its windows), sent
+    /// with screens; empty means "unchanged".
+    #[serde(default)]
+    pub panes: Vec<(u64, PaneSummary)>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
