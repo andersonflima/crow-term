@@ -76,6 +76,53 @@ class UpdateTapTest(unittest.TestCase):
             self.run_tool("--assets-dir", str(self.assets))
         self.assertFalse((self.tap / "Formula/crow-term.rb").exists())
 
+    def cask_only_assets(self):
+        for token, name in update_tap.asset_names(VERSION).items():
+            if not token.endswith("_APP"):
+                (self.assets / name).unlink()
+
+    def test_cask_only_requires_only_app_archives_and_preserves_formula(self):
+        self.cask_only_assets()
+        formula = self.tap / "Formula/crow-term.rb"
+        sentinel = b"# Previous complete release\r\nclass CrowTerm < Formula\r\nend\r\n"
+        formula.write_bytes(sentinel)
+        changed, output = self.run_tool("--assets-dir", str(self.assets), "--cask-only", "--notarized")
+        self.assertEqual(changed, ["Casks/crow-term.rb"])
+        self.assertEqual(formula.read_bytes(), sentinel)
+        cask = (self.tap / "Casks/crow-term.rb").read_text()
+        self.assertIn(self.digests["SHA256_MACOS_ARM64_APP"], cask)
+        self.assertIn(self.digests["SHA256_MACOS_X86_64_APP"], cask)
+        self.assertNotIn("caveats", cask)
+        self.assertNotIn("Formula/crow-term.rb", output)
+        changed, _ = self.run_tool("--assets-dir", str(self.assets), "--cask-only", "--notarized")
+        self.assertEqual(changed, [])
+        self.assertEqual(formula.read_bytes(), sentinel)
+
+    def test_cask_only_sha256sums_dry_run_needs_only_app_archives(self):
+        self.cask_only_assets()
+        sums = self.assets / "SHA256SUMS"
+        sums.write_text("".join(f"{self.digests[t]}  {n}\n" for t, n in update_tap.asset_names(VERSION).items()
+                                if t.endswith("_APP")))
+        changed, output = self.run_tool("--sha256sums", str(sums), "--cask-only", "--dry-run")
+        self.assertEqual(changed, ["Casks/crow-term.rb"])
+        self.assertIn("+++ b/Casks/crow-term.rb", output)
+        self.assertNotIn("Formula/crow-term.rb", output)
+        self.assertFalse((self.tap / "Formula/crow-term.rb").exists())
+        self.assertFalse((self.tap / "Casks").exists())
+
+    def test_cask_only_refuses_missing_app_archive(self):
+        self.cask_only_assets()
+        for arch in ("arm64", "x86_64"):
+            with self.subTest(arch=arch):
+                name = f"crow-term-{VERSION}-macos-{arch}.app.zip"
+                path = self.assets / name
+                payload = path.read_bytes()
+                path.unlink()
+                with self.assertRaisesRegex(update_tap.TapError, name):
+                    self.run_tool("--assets-dir", str(self.assets), "--cask-only", "--notarized")
+                self.assertFalse((self.tap / "Casks").exists())
+                path.write_bytes(payload)
+
     def test_refuses_mismatched_sidecar(self):
         name = f"crow-term-{VERSION}-macos-arm64.tar.gz"
         (self.assets / f"{name}.sha256").write_text("0" * 64 + f"  {name}\n")
