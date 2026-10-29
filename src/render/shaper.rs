@@ -58,6 +58,8 @@ pub struct GridShaper {
     pub symbols: Option<&'static str>,
     /// Whether the configured family maps a Private Use Area code point.
     primary_covers: HashMap<char, bool>,
+    /// `minimum_contrast` adjustments by (foreground, background).
+    contrast: HashMap<(u32, u32), u32>,
     pub swash: SwashCache,
     pub font_size: f32,
     pub cell_width: u32,
@@ -85,6 +87,7 @@ impl GridShaper {
             fonts,
             symbols,
             primary_covers: HashMap::new(),
+            contrast: HashMap::new(),
             swash: SwashCache::new(),
             font_size: 18.0,
             cell_width: 11,
@@ -194,7 +197,7 @@ impl GridShaper {
         let cell_width = self.cell_width as usize;
         let width = cells.len() * cell_width;
         let height = self.cell_height as usize;
-        let cell_bg = cells
+        let cell_bg: Vec<u32> = cells
             .iter()
             .map(|cell| resolve_color(config, cell.bg))
             .collect();
@@ -244,6 +247,22 @@ impl GridShaper {
         );
         buffer.shape_until_scroll(&mut self.fonts, false);
         let default_fg = cosmic_color(parse_color(&config.foreground, 0xeaeaea));
+        // `minimum_contrast` for text drawn in the cell foreground, against the
+        // cell's final background (reverse video, dim and selection are
+        // already in the cells). Shared by every backend.
+        let minimum = config.minimum_contrast;
+        let mut readable = |fg: u32, bg: u32| -> u32 {
+            if minimum <= 1.0 {
+                return fg;
+            }
+            if self.contrast.len() > 4096 {
+                self.contrast.clear();
+            }
+            *self
+                .contrast
+                .entry((fg, bg))
+                .or_insert_with(|| super::ensure_contrast(fg, bg, minimum))
+        };
         let mut glyphs = Vec::new();
         for run in buffer.layout_runs() {
             let mut cluster_origins: HashMap<(usize, usize), f32> = HashMap::new();
@@ -259,17 +278,26 @@ impl GridShaper {
                 let original_x = cluster_origins[&(glyph.start, glyph.end)];
                 glyph.x = col as f32 * self.cell_width as f32 + glyph.x - original_x;
                 let physical = glyph.physical((0.0, self.baseline), 1.0);
+                let mut color = glyph.color_opt.unwrap_or(default_fg);
+                // Color glyphs (emoji) ignore this base color, so only text
+                // masks are affected; box drawing, blocks and Powerline keep
+                // their colors (they tile against neighbouring backgrounds).
+                if !contrast_exempt(&cells[col].text) {
+                    color = cosmic_color(readable(color.0 & 0xff_ffff, cell_bg[col]));
+                }
                 glyphs.push(PlacedGlyph {
                     key: physical.cache_key,
                     x: physical.x,
                     y: physical.y,
-                    color: glyph.color_opt.unwrap_or(default_fg),
+                    color,
                 });
             }
         }
         let mut decorations = Vec::new();
         for (col, cell) in cells.iter().enumerate() {
-            let color = resolve_color(config, cell.fg);
+            // Strike and foreground-colored underlines belong to the text and
+            // get the same adjusted color; SGR 58 underline colors are kept.
+            let color = readable(resolve_color(config, cell.fg), cell_bg[col]);
             if cell.strike && width > 0 {
                 decorations.push((
                     Rect {
@@ -281,7 +309,12 @@ impl GridShaper {
                     color,
                 ));
             }
-            let (style, color) = underline_paint(config, cell);
+            let (style, underline) = underline_paint(config, cell);
+            let color = if cell.underline_color.is_none() {
+                color
+            } else {
+                underline
+            };
             decorations.extend(
                 underline_rects(
                     width,
@@ -343,6 +376,15 @@ impl GridShaper {
         }
         (glyphs, width)
     }
+}
+
+/// Characters whose foreground is not adjusted for contrast: box drawing,
+/// block elements, legacy computing symbols and Powerline separators are
+/// shapes that must match neighbouring cell colors exactly.
+pub(crate) fn contrast_exempt(text: &str) -> bool {
+    text.chars().next().is_some_and(|c| {
+        matches!(c, '\u{2500}'..='\u{259F}' | '\u{1FB00}'..='\u{1FBFF}' | '\u{E0A0}'..='\u{E0D7}')
+    })
 }
 
 /// Underline style and color of a cell: SGR 58 color if set, else the

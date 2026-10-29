@@ -200,7 +200,10 @@ pub(crate) fn software_frame(app: &mut App) -> (Vec<u32>, u32, u32) {
 /// Named fixture states: (name, app). Each covers different ops and clipping.
 pub(crate) fn cases() -> Vec<(&'static str, App)> {
     let mut out = Vec::new();
-    let mut base = app(Config::default(), 1.0, PhysicalSize::new(800, 480));
+    // The first four goldens pin the renderer itself (they predate
+    // minimum_contrast and mix palette colors on palette backgrounds), so they
+    // run with the adjustment off; `light-minimum-contrast` covers it.
+    let mut base = app(pinned(Config::default()), 1.0, PhysicalSize::new(800, 480));
     base.selection = Some(Selection {
         pane: 11,
         start: Point { row: 6, col: 30 },
@@ -208,12 +211,12 @@ pub(crate) fn cases() -> Vec<(&'static str, App)> {
     });
     base.ime = "abc".into();
     out.push(("light-selection-block-ime", base));
-    let mut hidpi = app(dark(), 2.0, PhysicalSize::new(1000, 640));
+    let mut hidpi = app(pinned(dark()), 2.0, PhysicalSize::new(1000, 640));
     if let Some(view) = &mut hidpi.view {
         view.screens[0].1.cursor.shape = "Beam".into();
     }
     out.push(("dark-scale2-beam", hidpi));
-    let mut panel = app(Config::default(), 1.0, PhysicalSize::new(900, 420));
+    let mut panel = app(pinned(Config::default()), 1.0, PhysicalSize::new(900, 420));
     panel.prefix = true;
     panel.crow_panel = true;
     panel.bell_flash = Some((
@@ -257,10 +260,10 @@ pub(crate) fn cases() -> Vec<(&'static str, App)> {
     }
     out.push(("light-panel-prefix-bell-underline", panel));
     let mut tiny = app(
-        Config {
+        pinned(Config {
             ligatures: false,
             ..dark()
-        },
+        }),
         1.0,
         PhysicalSize::new(261, 161),
     );
@@ -269,13 +272,88 @@ pub(crate) fn cases() -> Vec<(&'static str, App)> {
         view.screens[0].1.cursor.row = 1;
     }
     out.push(("dark-tiny-hollow-noligatures", tiny));
+    // Default config (minimum_contrast 3.0) with a dark truecolor theme on the
+    // light background: the reported "typed text is unreadable" case.
+    let mut contrast = app(Config::default(), 1.0, PhysicalSize::new(800, 420));
+    if let Some(view) = &mut contrast.view {
+        view.screens[0].1.cells = dark_theme_rows(48);
+        view.screens[1].1.cells = dark_theme_rows(40);
+    }
+    out.push(("light-minimum-contrast", contrast));
     out
+}
+fn pinned(config: Config) -> Config {
+    Config {
+        minimum_contrast: 1.0,
+        ..config
+    }
+}
+fn painted(text: &str, rgb: u32) -> Vec<Cell> {
+    text.chars()
+        .map(|ch| Cell {
+            fg: ColorSpec::Rgb((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8),
+            ..cell(&ch.to_string())
+        })
+        .collect()
+}
+/// A fish prompt line as drawn by a Catppuccin Macchiato (dark) theme in
+/// truecolor, plus default-colored text and box drawing.
+pub(crate) fn dark_theme_rows(cols: usize) -> Vec<Vec<Cell>> {
+    let mut typed = painted("ls ", 0x8aadf4);
+    typed.extend(painted("-la ~/projects ", 0xf0c6c6));
+    typed.extend(painted("| grep crow", 0xcad3f5));
+    typed.extend(painted("  # suggestion", 0x6e738d));
+    typed.resize(cols, cell(" "));
+    let mut boxes = painted("\u{2500}\u{2500}\u{2502}\u{2588}", 0xcad3f5);
+    boxes.resize(cols, cell(" "));
+    let mut default = line("default #444444 text stays as it was", cols);
+    default.truncate(cols);
+    vec![typed, boxes, default, line("$ echo done", cols)]
 }
 
 /// The software backend's output for the bundled-font fixture is pinned by
 /// committed goldens (generated from the pre-extraction renderer, which was
 /// byte-identical on 52 fixture frames). Update procedure: run this test, review
 /// the candidate PNG it reports, then copy it into `tests/goldens/render/`.
+#[test]
+fn minimum_contrast_makes_dark_theme_text_readable_and_keeps_default_text() {
+    let config = Config::default();
+    assert_eq!(config.minimum_contrast, 3.0);
+    let mut shaper = GridShaper::new(&config, 1.0);
+    let rows = dark_theme_rows(48);
+    let shaped = shaper.shape_row(&config, &rows[0]);
+    assert!(!shaped.glyphs.is_empty());
+    for glyph in &shaped.glyphs {
+        let ratio = crate::render::contrast_ratio(glyph.color.0 & 0xff_ffff, 0xffffff);
+        assert!(
+            ratio >= 3.0,
+            "{:06x}: {ratio:.2}",
+            glyph.color.0 & 0xff_ffff
+        );
+    }
+    // Box drawing keeps its color; default text is byte-identical with the
+    // adjustment off.
+    let boxes = shaper.shape_row(&config, &rows[1]);
+    let box_glyphs: Vec<_> = boxes
+        .glyphs
+        .iter()
+        .filter(|g| g.x < 4 * shaper.cell_width as i32)
+        .collect();
+    assert!(!box_glyphs.is_empty());
+    assert!(
+        box_glyphs.iter().all(|g| g.color.0 & 0xff_ffff == 0xcad3f5),
+        "{box_glyphs:?}"
+    );
+    let off = pinned(Config::default());
+    for row in [&rows[2], &rows[3]] {
+        let on =
+            crate::render::software::rasterize_row(&shaper.shape_row(&config, row), &mut shaper);
+        let mut other = GridShaper::new(&off, 1.0);
+        let plain = crate::render::software::rasterize_row(&other.shape_row(&off, row), &mut other);
+        assert_eq!(on, plain);
+    }
+}
+
 #[test]
 fn software_frames_match_committed_goldens() {
     for (name, mut app) in cases() {
