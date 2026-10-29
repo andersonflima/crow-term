@@ -372,3 +372,70 @@ jobs:
             gh release create "${TAG}" dist/*.tar.gz dist/*.zip dist/*.sha256 dist/SHA256SUMS "${flags[@]}" "${args[@]}"
           fi
           echo "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}" >> "${GITHUB_STEP_SUMMARY}"
+
+  npm:
+    name: npm packages
+    # After the GitHub Release on a tag (publishes); after collect on a dry run
+    # (builds, packs and smoke-tests, publishes nothing).
+    needs: [prepare, collect, publish]
+    if: always() && needs.collect.result == 'success' && (needs.publish.result == 'success' || needs.publish.result == 'skipped')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write # npm Trusted Publishing (OIDC) and provenance
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PUBLISH: ${{ needs.prepare.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # Trusted publishing needs Node >= 22.14.0 and npm >= 11.5.1.
+          node-version: '22'
+          registry-url: https://registry.npmjs.org
+      - name: npm with trusted publishing support
+        run: npm install -g npm@11 && npm --version
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-bundle
+          path: dist
+      - name: Build the npm packages from the release archives
+        run: |
+          python tests/npm_package_test.py
+          python scripts/npm_package.py --dist dist --out npm-dist --version "${VERSION}"
+      - name: Pack and smoke-test the linux-x64 install layout
+        run: |
+          mkdir -p packs
+          for directory in npm-dist/*/; do
+            (cd "${directory}" && npm pack --pack-destination "${GITHUB_WORKSPACE}/packs" >/dev/null)
+          done
+          ls -l packs
+          # The layout npm creates for `npm i -g`, from the packed tarballs
+          # (file modes included), without contacting the registry.
+          prefix="${RUNNER_TEMP}/npm-smoke/node_modules/@andespindola"
+          mkdir -p "${prefix}/crow-term" "${prefix}/crow-term-linux-x64"
+          tar -xzf "packs/andespindola-crow-term-${VERSION}.tgz" -C "${prefix}/crow-term" --strip-components=1
+          tar -xzf "packs/andespindola-crow-term-linux-x64-${VERSION}.tgz" -C "${prefix}/crow-term-linux-x64" --strip-components=1
+          node "${prefix}/crow-term/bin/crow-term.js" --version | grep -F "crow-term ${VERSION}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-packages
+          path: packs/*.tgz
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish (platform packages first, then the launcher)
+        if: env.PUBLISH == 'true'
+        run: |
+          # Alpha-only project: prereleases also take the `latest` tag so that
+          # `npm i -g @andespindola/crow-term` installs them.
+          tag=latest
+          for pack in packs/andespindola-crow-term-*-"${VERSION}".tgz; do
+            npm publish "${pack}" --access public --tag "${tag}"
+          done
+          npm publish "packs/andespindola-crow-term-${VERSION}.tgz" --access public --tag "${tag}"

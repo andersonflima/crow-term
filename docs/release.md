@@ -111,6 +111,35 @@ brew install --cask andersonflima/tap/crow-term   # Crow Term.app + crow-term on
 
 Both provide a `crow-term` command; install one of them, not both.
 
+## npm
+
+On a tag, after the GitHub Release, the `npm` job of `release.yml` builds six
+packages from the release archives with `scripts/npm_package.py` (version from
+Cargo.toml) and publishes them with npm Trusted Publishing (OIDC, no token):
+
+| Package | Contents |
+|---|---|
+| `@andespindola/crow-term` | `bin/crow-term.js` launcher; every platform package as an exact-version `optionalDependency` |
+| `@andespindola/crow-term-darwin-arm64`, `-darwin-x64` | the signed (and notarized, when the release is) `Crow Term.app` |
+| `@andespindola/crow-term-linux-x64`, `-linux-arm64` | `crow-term` and `shell/` |
+| `@andespindola/crow-term-win32-x64` | `crow-term.exe` and `shell/` |
+
+npm installs only the platform package whose `os`/`cpu` match; there are no
+install scripts and nothing is downloaded at install or run time. Platform
+packages are published first, the launcher last. Prereleases also take the
+`latest` dist-tag while the project is alpha-only, so `npm i -g
+@andespindola/crow-term` installs them. A `workflow_dispatch` run builds, packs
+and smoke-tests the linux-x64 layout (`crow-term --version` through the
+launcher) without publishing.
+
+One-time setup by the npm account owner, per package (six times): the package
+must exist before a trusted publisher can be attached, so publish the first
+version by hand from the dry-run artifact (`npm publish <tgz> --access public`)
+or with a short-lived token, then on npmjs.com → package → Settings → Trusted
+Publisher add GitHub Actions `andersonflima/crow-term`, workflow `release.yml`.
+Until that is done for a package, its publish step fails and the job stops
+before the launcher is published.
+
 ## Verify a release
 
 ```sh
