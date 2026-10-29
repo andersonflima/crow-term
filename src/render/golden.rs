@@ -9,6 +9,11 @@ pub struct Tolerance {
     pub max_channel: u8,
     pub max_fraction: f64,
 }
+/// No difference at all: the software renderer against its own goldens.
+pub const EXACT: Tolerance = Tolerance {
+    max_channel: 0,
+    max_fraction: 0.0,
+};
 /// Documented renderer tolerance: <= 2 per channel on <= 0.1% of the pixels.
 pub const RENDERER: Tolerance = Tolerance {
     max_channel: 2,
@@ -101,8 +106,10 @@ pub fn candidate_path(name: &str) -> PathBuf {
         .join(format!("{name}.png"))
 }
 
-/// Compare a frame with its committed golden. A missing or different golden
-/// writes a candidate (outside the repository) and fails with its path.
+/// Compare a software frame with its committed golden, pixel for pixel: the
+/// software renderer is the reference, so any difference is a regression. A
+/// missing or different golden writes a candidate (outside the repository) and
+/// fails with its path.
 pub fn assert_golden(name: &str, pixels: &[u32], width: u32, height: u32) {
     let path = golden_path(name);
     let Some((expected, ew, eh)) = read_png(&path) else {
@@ -115,11 +122,11 @@ pub fn assert_golden(name: &str, pixels: &[u32], width: u32, height: u32) {
         );
     };
     let ok = (ew, eh) == (width, height) && {
-        let d = diff(pixels, &expected, RENDERER);
-        if !d.within(RENDERER) {
+        let d = diff(pixels, &expected, EXACT);
+        if !d.within(EXACT) {
             eprintln!("golden {name}: {d:?}");
         }
-        d.within(RENDERER)
+        d.within(EXACT)
     };
     if !ok {
         let candidate = candidate_path(name);
@@ -150,6 +157,11 @@ mod tests {
         assert!(!d.within(RENDERER));
         near[1] = 0xfafafa;
         assert_eq!(diff(&near, &pixels, RENDERER).over, 1);
+        // Software goldens accept no difference at all.
+        assert!(diff(&pixels, &pixels, EXACT).within(EXACT));
+        let mut lsb = pixels.clone();
+        lsb[0] ^= 1;
+        assert!(!diff(&lsb, &pixels, EXACT).within(EXACT));
         let big = vec![0u32; 2000];
         let mut one = big.clone();
         one[0] = 0x000001;
