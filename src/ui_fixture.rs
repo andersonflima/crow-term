@@ -306,6 +306,14 @@ pub(crate) fn gpu_or_skip(test: &str) -> Option<crate::render::gpu::GpuRenderer>
         }
     }
 }
+/// Tolerance for GPU-vs-software comparisons on this adapter.
+pub(crate) fn gpu_tolerance(gpu: &crate::render::gpu::GpuRenderer) -> golden::Tolerance {
+    if gpu.adapter().cpu {
+        golden::CPU_ADAPTER
+    } else {
+        golden::RENDERER
+    }
+}
 pub(crate) fn gpu_frame(app: &mut App, gpu: &mut crate::render::gpu::GpuRenderer) -> Vec<u32> {
     let size = app.window_size().unwrap();
     let scene = scene_of!(app, size);
@@ -352,9 +360,10 @@ fn gpu_frames_match_software_within_tolerance() {
         }
         let (expected, w, h) = software_frame(&mut app);
         let actual = gpu_frame(&mut app, &mut gpu);
-        let diff = golden::diff(&actual, &expected, golden::RENDERER);
+        let tolerance = gpu_tolerance(&gpu);
+        let diff = golden::diff(&actual, &expected, tolerance);
         eprintln!("{name}: {diff:?}");
-        if !diff.within(golden::RENDERER) {
+        if !diff.within(tolerance) {
             golden::write_png(
                 &golden::candidate_path(&format!("gpu-{name}")),
                 &actual,
@@ -383,8 +392,11 @@ fn gpu_atlas_growth_and_row_changes_keep_frames_correct() {
     let Some(mut gpu) = gpu_or_skip("gpu_atlas_growth_and_row_changes_keep_frames_correct") else {
         return;
     };
-    // Many distinct glyph sizes overflow the first atlas page and force growth
-    // mid-frame; changed rows must be reshaped, unchanged ones reused.
+    let tolerance = gpu_tolerance(&gpu);
+    // Tiny first pages: the first frame must grow them several times mid-frame
+    // and rebuild; changed rows are reshaped, unchanged ones reused.
+    gpu.set_atlas_limits(64, 8192);
+    let (start, _, _) = gpu.atlas_state();
     let mut app = app(Config::default(), 3.0, PhysicalSize::new(1600, 1000));
     for step in 0..3 {
         if let Some(view) = &mut app.view {
@@ -393,7 +405,42 @@ fn gpu_atlas_growth_and_row_changes_keep_frames_correct() {
         }
         let (expected, _, _) = software_frame(&mut app);
         let actual = gpu_frame(&mut app, &mut gpu);
-        let diff = golden::diff(&actual, &expected, golden::RENDERER);
-        assert!(diff.within(golden::RENDERER), "step {step}: {diff:?}");
+        let diff = golden::diff(&actual, &expected, tolerance);
+        assert!(diff.within(tolerance), "step {step}: {diff:?}");
+        assert_eq!(gpu.take_dropped_glyphs(), 0);
     }
+    let (generation, mask, _) = gpu.atlas_state();
+    assert!(
+        generation >= start + 2 && mask >= 256,
+        "atlas never grew: {:?}",
+        gpu.atlas_state()
+    );
+}
+
+#[test]
+fn gpu_atlas_overflow_draws_the_rest_of_the_frame_and_recovers() {
+    let Some(mut gpu) = gpu_or_skip("gpu_atlas_overflow_draws_the_rest_of_the_frame_and_recovers")
+    else {
+        return;
+    };
+    let tolerance = gpu_tolerance(&gpu);
+    // Pages capped far below what one frame needs: glyphs that do not fit are
+    // skipped, but fills, other glyphs and later ops are still drawn.
+    gpu.set_atlas_limits(32, 64);
+    let mut app = app(Config::default(), 2.0, PhysicalSize::new(1000, 640));
+    let (expected, _, _) = software_frame(&mut app);
+    let degraded = gpu_frame(&mut app, &mut gpu);
+    assert!(gpu.take_dropped_glyphs() > 0);
+    let diff = golden::diff(&degraded, &expected, tolerance);
+    // Missing glyphs only: most of the frame (backgrounds, chrome) matches.
+    assert!(
+        (diff.differing as f64) < 0.1 * diff.total as f64,
+        "frame mostly blank: {diff:?}"
+    );
+    // With room again the next frame is complete (skipped glyphs are not cached).
+    gpu.set_atlas_limits(1024, 8192);
+    let actual = gpu_frame(&mut app, &mut gpu);
+    let diff = golden::diff(&actual, &expected, tolerance);
+    assert!(diff.within(tolerance), "{diff:?}");
+    assert_eq!(gpu.take_dropped_glyphs(), 0);
 }
