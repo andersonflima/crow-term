@@ -295,9 +295,20 @@ impl GridShaper {
         }
         let mut decorations = Vec::new();
         for (col, cell) in cells.iter().enumerate() {
+            let (style, underline) = underline_paint(config, cell);
+            let fg_underline = style != UnderlineStyle::None && cell.underline_color.is_none();
+            if !cell.strike && style == UnderlineStyle::None {
+                continue;
+            }
             // Strike and foreground-colored underlines belong to the text and
-            // get the same adjusted color; SGR 58 underline colors are kept.
-            let color = readable(resolve_color(config, cell.fg), cell_bg[col]);
+            // get the same adjusted color (exempt shapes keep theirs); SGR 58
+            // underline colors are kept, so they need no adjustment.
+            let fg = resolve_color(config, cell.fg);
+            let color = if (cell.strike || fg_underline) && !contrast_exempt(&cell.text) {
+                readable(fg, cell_bg[col])
+            } else {
+                fg
+            };
             if cell.strike && width > 0 {
                 decorations.push((
                     Rect {
@@ -309,7 +320,6 @@ impl GridShaper {
                     color,
                 ));
             }
-            let (style, underline) = underline_paint(config, cell);
             let color = if cell.underline_color.is_none() {
                 color
             } else {
@@ -379,11 +389,15 @@ impl GridShaper {
 }
 
 /// Characters whose foreground is not adjusted for contrast: box drawing,
-/// block elements, legacy computing symbols and Powerline separators are
-/// shapes that must match neighbouring cell colors exactly.
+/// block elements, Symbols for Legacy Computing (except its segmented digits
+/// U+1FBF0-1FBF9, which are text) and the Powerline separators U+E0B0-E0D7
+/// are shapes that must match neighbouring cell colors exactly. Powerline's
+/// branch, line-number and padlock icons (U+E0A0-E0A3) and the Legacy
+/// Computing Supplement (U+1CC00-1CEBF, which mixes letters and digits with
+/// shapes) are adjusted like text.
 pub(crate) fn contrast_exempt(text: &str) -> bool {
     text.chars().next().is_some_and(|c| {
-        matches!(c, '\u{2500}'..='\u{259F}' | '\u{1FB00}'..='\u{1FBFF}' | '\u{E0A0}'..='\u{E0D7}')
+        matches!(c, '\u{2500}'..='\u{259F}' | '\u{1FB00}'..='\u{1FBEF}' | '\u{1FBFA}'..='\u{1FBFF}' | '\u{E0B0}'..='\u{E0D7}')
     })
 }
 

@@ -504,12 +504,11 @@ fn osc52_copy_enabled(config: Option<&crate::config::Config>) -> bool {
 }
 
 /// Whether the effective default background (OSC 11 override or the theme)
-/// is light: WCAG relative luminance above the midpoint.
+/// is light, by the same rule as the UI ([`crate::render::is_light`]).
 fn light_scheme(term: &Term<Events>, defaults: &[Rgb]) -> bool {
     let index = NamedColor::Background as usize;
     let bg = term.colors()[index].unwrap_or(defaults[index]);
-    let rgb = u32::from(bg.r) << 16 | u32::from(bg.g) << 8 | u32::from(bg.b);
-    crate::render::relative_luminance(rgb) > 0.5
+    crate::render::is_light(u32::from(bg.r) << 16 | u32::from(bg.g) << 8 | u32::from(bg.b))
 }
 /// `CSI ? 997 ; 1 n` (dark) or `CSI ? 997 ; 2 n` (light), as in contour,
 /// kitty and Ghostty.
