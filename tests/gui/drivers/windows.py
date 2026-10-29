@@ -73,6 +73,14 @@ class Windows(Driver):
         self.activate(gui)
         self.helper("click", self.hwnd(gui), int(x), int(y))
 
+    def move(self, gui, x, y):
+        self.activate(gui)
+        self.helper("move", self.hwnd(gui), int(x), int(y))
+
+    def modifier(self, gui, name, down):
+        self.activate(gui)
+        self.helper("keydown" if down else "keyup", name)
+
     def resize(self, gui, width, height):
         self.helper("resize", self.hwnd(gui), int(width), int(height))
 

@@ -609,6 +609,7 @@ macro_rules! scene_of {
             scale: $app.scale,
             view: $app.view.as_ref(),
             selection: $app.selection.as_ref(),
+            hover_link: $app.hover_link.as_ref(),
             ime: &$app.ime,
             status: &$app.status,
             prefix: $app.prefix,
@@ -663,6 +664,15 @@ struct App {
     dragging: bool,
     mouse_button: Option<MouseButton>,
     mouse_origin: Option<u64>,
+    /// The link under the pointer while the link modifier is held.
+    hover_link: Option<(u64, crate::hyperlinks::Hit)>,
+    /// A modifier+click opened (or asked about) a link: its release is ours.
+    link_press: bool,
+    /// A link waiting for a deliberate second modifier+click (file:, a
+    /// misleading OSC 8 text).
+    link_confirm: crate::hyperlinks::Confirm,
+    /// The status text showing the hovered link's target, to clear it after.
+    hover_status: Option<String>,
     wheel_remainder: f64,
     ime: String,
     sent_sizes: HashMap<u64, Size>,
@@ -744,6 +754,10 @@ impl App {
             dragging: false,
             mouse_button: None,
             mouse_origin: None,
+            hover_link: None,
+            link_press: false,
+            link_confirm: Default::default(),
+            hover_status: None,
             wheel_remainder: 0.0,
             ime: String::new(),
             sent_sizes: HashMap::new(),
@@ -1142,14 +1156,10 @@ impl App {
             Key::Character(s) => s.to_lowercase(),
             _ => String::new(),
         };
-        let shortcut = (self.mods.control_key() && self.mods.shift_key()) || self.mods.super_key();
-        if shortcut && c == "c" {
-            self.copy_selection();
-            return;
-        }
-        if shortcut && c == "v" {
-            self.paste();
-            return;
+        match clipboard_shortcut(self.mods, &c) {
+            Some(ClipboardShortcut::Copy) => return self.copy_selection(),
+            Some(ClipboardShortcut::Paste) => return self.paste(),
+            None => {}
         }
         let is_prefix = prefix_matches(&self.config.prefix, key, self.mods);
         // Pressing a modifier alone (Shift for `%`/`"`, a layout's AltGr) is part
@@ -1228,28 +1238,137 @@ impl App {
         if self.clipboard.is_none() {
             self.clipboard = arboard::Clipboard::new().ok();
         }
-        match self
-            .clipboard
-            .as_mut()
-            .and_then(|clipboard| clipboard.get_text().ok())
-        {
-            Some(text) => {
-                self.selection = None;
-                let bytes = paste_bytes(&text, self.modes().bracketed_paste);
-                if let Err(waiting) = self.dispatcher.paste(self.pane_id, bytes) {
-                    self.status = format!(
-                        "Paste refused: pane {} is not reading its input ({} KB already waiting)",
-                        self.pane_id, waiting
-                    );
-                    self.status_expires = None;
-                    self.redraw();
-                }
-            }
+        match self.clipboard.as_mut().and_then(crate::clip::read) {
+            Some(content) => self.paste_content(content),
             None => {
-                self.status = "Clipboard unavailable or has no text".into();
+                self.status = "Clipboard unavailable or empty".into();
                 self.redraw();
             }
         }
+    }
+    /// Files become quoted paths, an image the path of a PNG written for it,
+    /// text a (bracketed) paste.
+    fn paste_content(&mut self, content: crate::clip::Content) {
+        use crate::clip::Content;
+        let text = match content {
+            Content::Text(text) => Ok(text),
+            Content::Files(paths) => crate::clip::paths_text(&paths),
+            Content::Image {
+                width,
+                height,
+                rgba,
+            } => {
+                match crate::clip::image_dir()
+                    .and_then(|dir| crate::clip::save_png(&dir, width, height, &rgba))
+                {
+                    Ok(path) => crate::clip::paths_text(&[path]),
+                    Err(error) => {
+                        self.status = format!("Pasted image not saved: {error:#}");
+                        self.status_expires = None;
+                        self.redraw();
+                        return;
+                    }
+                }
+            }
+        };
+        let text = match text {
+            Ok(text) => text,
+            Err(why) => {
+                self.status = format!("Not pasted: {why}");
+                self.status_expires = Some(Instant::now() + Duration::from_secs(8));
+                self.redraw();
+                return;
+            }
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.selection = None;
+        let bytes = paste_bytes(&text, self.modes().bracketed_paste);
+        if let Err(waiting) = self.dispatcher.paste(self.pane_id, bytes) {
+            self.status = format!(
+                "Paste refused: pane {} is not reading its input ({} KB already waiting)",
+                self.pane_id, waiting
+            );
+            self.status_expires = None;
+            self.redraw();
+        }
+    }
+    /// Cmd (macOS) or Ctrl (Linux, Windows) held: clicks open links.
+    fn link_modifier(&self) -> bool {
+        link_modifier_held(self.mods)
+    }
+    fn link_under_pointer(&self) -> Option<(u64, crate::hyperlinks::Hit)> {
+        let (pane, point) = self.point_at(self.cursor.x, self.cursor.y)?;
+        let hit = crate::hyperlinks::link_at(self.screen(pane)?, point.row, point.col)?;
+        Some((pane, hit))
+    }
+    /// Underline the link under the pointer and show the hand cursor while
+    /// the link modifier is held.
+    fn update_hover(&mut self) {
+        let hover = if self.link_modifier() && self.mouse_origin.is_none() && !self.dragging {
+            self.link_under_pointer()
+        } else {
+            None
+        };
+        if hover != self.hover_link {
+            if let Some(window) = &self.window {
+                window.set_cursor(if hover.is_some() {
+                    winit::window::CursorIcon::Pointer
+                } else {
+                    winit::window::CursorIcon::Default
+                });
+            }
+            // The real target, before any click: an OSC 8 link's text can
+            // say anything.
+            if let Some(previous) = self.hover_status.take()
+                && self.status == previous
+            {
+                self.status.clear();
+            }
+            if let Some((_, hit)) = &hover {
+                let text = format!("Link: {}", crate::hyperlinks::display(&hit.url));
+                self.status = text.clone();
+                self.status_expires = None;
+                self.hover_status = Some(text);
+            }
+            self.hover_link = hover;
+            self.redraw();
+        }
+    }
+    /// Modifier+click on a link: open it (http, https, mailto), ask first
+    /// (file:, an OSC 8 text naming another host: a deliberate second click
+    /// confirms) or refuse.
+    fn click_link(&mut self, hit: crate::hyperlinks::Hit) {
+        use crate::hyperlinks::{Opened, Policy, decide, display};
+        let shown = display(&hit.url);
+        let decision = decide(&hit);
+        self.status = match decision {
+            Policy::Refuse => format!("Link not opened (not allowed): {shown}"),
+            Policy::Confirm if !self.link_confirm.click(&hit.url, Instant::now()) => format!(
+                "Open {shown}{}? {}+click again to confirm",
+                if hit.osc8 && crate::hyperlinks::policy(&hit.url) == Policy::Open {
+                    format!(" (the text shows {:?})", hit.text.trim())
+                } else {
+                    String::new()
+                },
+                if cfg!(target_os = "macos") {
+                    "Cmd"
+                } else {
+                    "Ctrl"
+                }
+            ),
+            Policy::Open | Policy::Confirm => match crate::hyperlinks::open(&hit.url) {
+                Ok(Opened::Revealed(path)) => {
+                    format!("Shown in the file manager, not run: {}", path.display())
+                }
+                Ok(_) => format!("Opened {shown}"),
+                Err(error) => format!("Link not opened: {error:#}"),
+            },
+        };
+        self.hover_status = None;
+        self.status_expires = Some(Instant::now() + Duration::from_secs(5));
+        self.redraw();
     }
     fn point_at(&self, x: f64, y: f64) -> Option<(u64, Point)> {
         self.rects()
@@ -1352,6 +1471,24 @@ impl App {
         }
     }
     fn mouse_click(&mut self, state: ElementState, button: MouseButton) {
+        // Modifier+click on a link is the terminal's, never the program's
+        // (press and release alike).
+        if button == MouseButton::Left {
+            if state == ElementState::Released && std::mem::take(&mut self.link_press) {
+                self.link_confirm.released();
+                return;
+            }
+            if state == ElementState::Pressed
+                && self.link_modifier()
+                && self.mouse_origin.is_none()
+                && let Some((pane, hit)) = self.link_under_pointer()
+            {
+                self.link_press = true;
+                self.focus_pane(pane);
+                self.click_link(hit);
+                return;
+            }
+        }
         // A release belongs to the application that received the press, even over
         // another pane, the header, or padding. Clamp to that pane's edge cells.
         if state == ElementState::Released && self.release_mouse_capture(button) {
@@ -1885,6 +2022,7 @@ impl App {
             status: self.status.clone(),
             ime: self.ime.clone(),
             stuck_pane: self.stuck.map(|(pane, _)| pane),
+            hover_link: self.hover_link.as_ref().map(|(_, hit)| hit.url.clone()),
         };
         if let Err(error) = dump.write(frame, size.width, size.height, &meta) {
             eprintln!(
@@ -1987,6 +2125,8 @@ struct FrameParts<'a> {
     scale: f64,
     view: Option<&'a View>,
     selection: Option<&'a Selection>,
+    /// The link under the pointer while the link modifier is held (underlined).
+    hover_link: Option<&'a (u64, crate::hyperlinks::Hit)>,
     ime: &'a str,
     status: &'a str,
     prefix: bool,
@@ -2131,6 +2271,16 @@ fn compose<'a>(
         };
         for (row, cells) in screen.cells.iter().enumerate().take((rect.h / ch) as usize) {
             let mut row_cells = Cow::Borrowed(cells.as_slice());
+            if let Some((link_pane, hit)) = parts.hover_link
+                && *link_pane == pane
+            {
+                for &(_, col) in hit.cells.iter().filter(|&&(r, _)| r == row) {
+                    if let Some(cell) = row_cells.to_mut().get_mut(col) {
+                        cell.underline = true;
+                        cell.underline_style = UnderlineStyle::Single;
+                    }
+                }
+            }
             if let Some(selection) = parts.selection
                 && selection.pane == pane
                 && (0..cells.len()).any(|col| selection.contains(row, col))
@@ -2461,6 +2611,7 @@ impl ApplicationHandler<UiEvent> for App {
                     }
                 }
                 self.apply_screen_events();
+                self.update_hover();
                 self.resize_panes();
                 if revision_changed {
                     self.redraw();
@@ -2560,7 +2711,13 @@ impl ApplicationHandler<UiEvent> for App {
                 self.resize_panes();
                 self.redraw();
             }
-            WindowEvent::ModifiersChanged(modifiers) => self.mods = modifiers.state(),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.mods = modifiers.state();
+                self.update_hover();
+            }
+            WindowEvent::DroppedFile(path) => {
+                self.paste_content(crate::clip::Content::Files(vec![path]))
+            }
             WindowEvent::KeyboardInput {
                 event,
                 is_synthetic: false,
@@ -2582,6 +2739,7 @@ impl ApplicationHandler<UiEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = position;
                 self.mouse_move();
+                self.update_hover();
             }
             WindowEvent::MouseInput { state, button, .. } => self.mouse_click(state, button),
             WindowEvent::MouseWheel { delta, .. } => self.wheel(delta),
@@ -2787,8 +2945,13 @@ fn encode_mouse(
     ])
 }
 fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    // Do not allow pasted data to terminate bracketed paste and inject commands.
-    let text = text.replace('\0', "").replace("\x1b[201~", "");
+    // Pasted data can never end bracketed paste (or start any sequence): every
+    // ESC and C1 CSI is removed, so no marker can be rebuilt from pieces
+    // (`\e[20\e[201~1~` is harmless). NUL is dropped too.
+    let text: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\0' | '\x1b' | '\u{9b}'))
+        .collect();
     if bracketed {
         format!("\x1b[200~{text}\x1b[201~").into_bytes()
     } else {
@@ -2797,7 +2960,7 @@ fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
 }
 fn selected_text(screen: &Screen, selection: &Selection) -> String {
     let (start, end) = selection.ordered();
-    let mut lines = Vec::new();
+    let mut out = String::new();
     for row in start.row..=end.row.min(screen.cells.len().saturating_sub(1)) {
         let Some(cells) = screen.cells.get(row) else {
             break;
@@ -2821,9 +2984,42 @@ fn selected_text(screen: &Screen, selection: &Selection) -> String {
                 }
             })
             .collect::<String>();
-        lines.push(text.trim_end().to_string());
+        // A soft-wrapped row continues on the next one: no line break, and
+        // its trailing spaces are content.
+        let wraps = row < end.row && screen.wrapped.get(row).copied().unwrap_or(false);
+        if wraps {
+            out.push_str(&text);
+        } else {
+            out.push_str(text.trim_end());
+            if row < end.row {
+                out.push('\n');
+            }
+        }
     }
-    lines.join("\n")
+    out
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardShortcut {
+    Copy,
+    Paste,
+}
+/// Cmd+C/V (macOS) or Ctrl+Shift+C/V: the terminal's clipboard. Plain Ctrl+C
+/// and Ctrl+V are keys for the program (an agent's image paste, an interrupt).
+fn clipboard_shortcut(mods: ModifiersState, key: &str) -> Option<ClipboardShortcut> {
+    let shortcut = (mods.control_key() && mods.shift_key()) || mods.super_key();
+    match key {
+        "c" if shortcut => Some(ClipboardShortcut::Copy),
+        "v" if shortcut => Some(ClipboardShortcut::Paste),
+        _ => None,
+    }
+}
+/// The modifier that turns a click into "open this link".
+fn link_modifier_held(mods: ModifiersState) -> bool {
+    if cfg!(target_os = "macos") {
+        mods.super_key()
+    } else {
+        mods.control_key()
+    }
 }
 /// Bytes for a named key or a character, as the GUI would send them
 /// (testing aid behind the hidden `debug-encode-key` command).
@@ -3422,10 +3618,89 @@ mod tests {
         assert_eq!(pixels[11], 1);
     }
     #[test]
+    fn plain_ctrl_v_and_ctrl_c_stay_keys_for_the_program() {
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(clipboard_shortcut(ctrl, "v"), None);
+        assert_eq!(clipboard_shortcut(ctrl, "c"), None);
+        assert_eq!(
+            clipboard_shortcut(ctrl | ModifiersState::SHIFT, "v"),
+            Some(ClipboardShortcut::Paste)
+        );
+        assert_eq!(
+            clipboard_shortcut(ModifiersState::SUPER, "c"),
+            Some(ClipboardShortcut::Copy)
+        );
+        // What the program gets for Ctrl+V: the control byte, or the kitty
+        // keyboard report when it asked for one (agents read images on it).
+        assert_eq!(
+            encode_named_key("v", ctrl, false, &Modes::default()),
+            b"\x16"
+        );
+        let kitty = Modes {
+            keyboard: 1,
+            ..Modes::default()
+        };
+        assert_eq!(encode_named_key("v", ctrl, false, &kitty), b"\x1b[118;5u");
+    }
+    #[test]
+    fn copy_joins_soft_wrapped_rows_and_keeps_wide_characters() {
+        let row = |text: &str| -> Vec<Cell> {
+            let mut cells = Vec::new();
+            for c in text.chars() {
+                let wide = unicode_width::UnicodeWidthChar::width(c) == Some(2);
+                cells.push(cell(&c.to_string()));
+                if wide {
+                    let mut spacer = cell("");
+                    spacer.wide_spacer = true;
+                    cells.push(spacer);
+                }
+            }
+            cells.resize(8, cell(" "));
+            cells
+        };
+        let screen = Screen {
+            size: Size { rows: 3, cols: 8 },
+            cells: vec![row("echo 界 "), row("🦀done  "), row("next   ")],
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+                shape: "block".into(),
+            },
+            modes: Modes::default(),
+            title: String::new(),
+            alive: true,
+            display_offset: 0,
+            bell: 0,
+            links: Vec::new(),
+            clipboard_seq: 0,
+            wrapped: vec![true, false, false],
+        };
+        let all = Selection {
+            pane: 1,
+            start: Point { row: 0, col: 0 },
+            end: Point { row: 2, col: 7 },
+        };
+        // The wrapped row keeps its trailing space (it is content); hard
+        // breaks become newlines with trailing blanks trimmed.
+        assert_eq!(selected_text(&screen, &all), "echo 界 🦀done\nnext");
+    }
+    #[test]
     fn paste_protocol_and_escape_injection() {
         assert_eq!(paste_bytes("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
         assert_eq!(paste_bytes("a\r\nb", false), b"a\rb");
-        assert_eq!(paste_bytes("a\x1b[201~b\0", true), b"\x1b[200~ab\x1b[201~");
+        assert_eq!(
+            paste_bytes("a\x1b[201~b\0", true),
+            b"\x1b[200~a[201~b\x1b[201~"
+        );
+        // A marker nested in a marker: one pass of removal used to rebuild it.
+        let nested = paste_bytes("x\x1b[20\x1b[201~1~\x15echo PWNED\r", true);
+        assert_eq!(nested, b"\x1b[200~x[20[201~1~\x15echo PWNED\r\x1b[201~");
+        assert_eq!(nested.windows(6).filter(|w| w == b"\x1b[201~").count(), 1);
+        assert!(
+            !paste_bytes("\u{9b}201~", false).contains(&0xc2),
+            "C1 CSI removed"
+        );
     }
     #[test]
     fn wide_and_combining_clusters_keep_grid_columns() {
@@ -3613,6 +3888,7 @@ mod tests {
             bell: 0,
             links: Vec::new(),
             clipboard_seq: 0,
+            wrapped: Vec::new(),
         };
         assert!(mailbox.push(
             1,

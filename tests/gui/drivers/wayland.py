@@ -188,16 +188,26 @@ class Wayland(Driver):
                 raise AssertionError(f"type() is ASCII only: {char!r}")
             self.press(([KEYSYMS["shift"]] if char in SHIFTED else []) + [ord(char)])
 
-    def click(self, gui, x, y):
+    def absolute(self, gui, x, y):
         node = self.node(gui)
         rect, inner = node["rect"], node["window_rect"]
-        absolute_x = rect["x"] + inner["x"] + int(x)
-        absolute_y = rect["y"] + inner["y"] + int(y)
+        return rect["x"] + inner["x"] + int(x), rect["y"] + inner["y"] + int(y)
+
+    def click(self, gui, x, y):
+        absolute_x, absolute_y = self.absolute(gui, x, y)
         self.rfb.pointer(absolute_x, absolute_y)
         time.sleep(0.15)
         self.rfb.pointer(absolute_x, absolute_y, 1)
         time.sleep(0.05)
         self.rfb.pointer(absolute_x, absolute_y, 0)
+
+    def move(self, gui, x, y):
+        self.rfb.pointer(*self.absolute(gui, x, y))
+        time.sleep(0.15)
+
+    def modifier(self, gui, name, down):
+        self.rfb.key(KEYSYMS[name], down)
+        time.sleep(0.05)
 
     def resize(self, gui, width, height):
         run("swaymsg", f"{self.criteria(gui)} resize set width {int(width)} px height {int(height)} px")

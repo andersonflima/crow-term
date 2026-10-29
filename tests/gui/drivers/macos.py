@@ -131,8 +131,7 @@ class MacOS(Driver):
         x, y, w, h = (int(float(v)) for v in out.split(", "))
         return x, y, w, h
 
-    def click(self, gui, x, y):
-        self.focus_back(gui)
+    def client_point(self, gui, x, y):
         frame = gui.frame()
         if frame is None:
             raise AssertionError("no frame to locate the client area")
@@ -141,12 +140,30 @@ class MacOS(Driver):
         # The client area is the bottom of the window frame (title bar above it).
         scale = meta["scale"]
         top = wh - meta["height"] / scale
-        point = CGPoint(wx + x / scale, wy + top + y / scale)
-        for kind in (5, 1, 2):  # mouse moved, left down, left up
+        return CGPoint(wx + x / scale, wy + top + y / scale)
+
+    def mouse(self, kinds, point):
+        for kind in kinds:
             event = self.cg.CGEventCreateMouseEvent(None, kind, point, 0)
+            # Modifiers held with modifier() apply to the click, as on hardware.
+            self.cg.CGEventSetFlags(event, getattr(self, "held", 0))
             self.cg.CGEventPost(0, event)
             self.cf.CFRelease(event)
             time.sleep(0.08)
+
+    def click(self, gui, x, y):
+        self.focus_back(gui)
+        self.mouse((5, 1, 2), self.client_point(gui, x, y))  # mouse moved, left down, left up
+
+    def move(self, gui, x, y):
+        self.focus_back(gui)
+        self.mouse((5,), self.client_point(gui, x, y))
+
+    def modifier(self, gui, name, down):
+        self.focus_back(gui)
+        code, flag = MODIFIERS[name]
+        self.held = (getattr(self, "held", 0) | flag) if down else (getattr(self, "held", 0) & ~flag)
+        self.post_key(code, down, self.held)
 
     def resize(self, gui, width, height):
         frame = gui.frame()

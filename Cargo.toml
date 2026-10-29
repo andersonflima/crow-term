@@ -27,6 +27,7 @@ unicode-width = "0.2"
 etagere = "0.3"
 pollster = "1"
 bytemuck = { version = "1", features = ["derive"] }
+png = "0.18"
 
 [features]
 # Test-only: write each presented GUI frame to $CROW_TERM_FRAME_DUMP/frame.ppm

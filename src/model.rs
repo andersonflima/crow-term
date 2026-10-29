@@ -108,6 +108,10 @@ pub struct Screen {
     /// a change means a new text is available through `Request::Clipboard`.
     #[serde(default)]
     pub clipboard_seq: u64,
+    /// `wrapped[row]`: the row continues on the next one (soft wrap), so
+    /// copying and link detection join them without a line break.
+    #[serde(default)]
+    pub wrapped: Vec<bool>,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Axis {

@@ -119,6 +119,7 @@ pub(crate) fn screen(rows: Vec<Vec<Cell>>, cursor: (usize, usize), shape: &str) 
         bell: 0,
         links: Vec::new(),
         clipboard_seq: 0,
+        wrapped: Vec::new(),
     }
 }
 /// An app with two windows (tabs) and a vertical split, never connected to a mux.

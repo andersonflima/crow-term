@@ -785,6 +785,165 @@ def j17_backlog(ctx):
         [ctx.save_frame("j17-backlog", frame)]
 
 
+LINK_DEMO = r"""import os, sys, time
+target, wrap, recorded, document = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+out = sys.stdout
+out.write("\x1b]8;;" + target + "\x1b\\CLICK_OSC8\x1b]8;;\x1b\\\r\n")
+out.write("WRAP " + wrap + "\r\n")
+out.write("FILE " + document + "\r\n")
+out.write("MISLEAD \x1b]8;;https://evil.example/\x1b\\bank.example\x1b]8;;\x1b\\\r\n")
+out.write("READY_LINKS\r\n")
+# Ask for mouse reports: a link click must still never reach the program.
+out.write("\x1b[?1000h\x1b[?1006h")
+out.flush()
+if os.name == "nt":
+    time.sleep(600)
+else:
+    import tty
+    tty.setraw(0)
+    with open(recorded, "ab", buffering=0) as log:
+        while True:
+            data = os.read(0, 1024)
+            if not data:
+                break
+            log.write(data)
+"""
+
+
+def logical_text(screen):
+    """All cell text, rows joined as they are (soft wraps keep their spaces)."""
+    return "".join(c["text"] or " " for row in screen["cells"] for c in row if not c["wide_spacer"])
+
+
+def expected_paths(paths):
+    """One portable form for every shell: each path in single quotes."""
+    return "".join(f"'{p}' " for p in paths)
+
+
+def file_url(path):
+    text = str(path).replace("\\", "/").replace(" ", "%20")
+    return "file://" + text if text.startswith("/") else "file:///" + text
+
+
+@journey("J18", "modifier+click opens links (OSC 8, wrapped URLs) through the opener only; file paste gives quoted paths")
+def j18_links(ctx):
+    ctx.need("keys", "mouse")
+    runtime = ctx.run.runtime
+    (runtime / "test-opener").write_text("record links instead of opening them\n")
+    opened = runtime / "test-opened-links"
+    held = "super" if sys.platform == "darwin" else "ctrl"
+    gui = ctx.run.launch("links", name="links")
+    pane = eventually(lambda: first_pane(ctx, "links"), 15, what="links session")
+    gui.wait_frame(lambda m, i: m["revision"] > 0, what="links frame")
+    ctx.driver.attach(gui)
+    try:
+        quiet_screen(ctx, pane)
+        # Copied files paste as quoted paths (stubbed file-list clipboard).
+        files = [ctx.run.work / "a b.txt", ctx.run.work / "日本 ü.txt"]
+        (runtime / "test-clipboard-files").write_text("".join(f"{p}\n" for p in files), encoding="utf-8")
+        ctx.driver.key(gui, ctx.driver.paste_chord)
+        want = expected_paths(files)
+        eventually(lambda: want in logical_text(ctx.run.capture_json(pane)), 15, what=f"pasted paths {want!r}")
+        ctx.driver.key(gui, "ctrl+c")
+        quiet_screen(ctx, pane)
+        # A name some shell could read differently is refused, never altered.
+        (runtime / "test-clipboard-files").write_text(f"{ctx.run.work / ('it' + chr(39) + 's.txt')}\n", encoding="utf-8")
+        before = logical_text(ctx.run.capture_json(pane))
+        ctx.driver.key(gui, ctx.driver.paste_chord)
+        gui.wait_frame(lambda m, i: "can't be pasted safely" in m["status"], timeout=10, what="refused file name")
+        if "it's.txt" in logical_text(ctx.run.capture_json(pane)) and "it's.txt" not in before:
+            raise AssertionError("a refused file name was pasted")
+        (runtime / "test-clipboard-files").unlink()
+        # An image alone on the clipboard pastes the path of a private PNG.
+        (runtime / "test-clipboard-image").write_bytes(b"2 1\n" + bytes([255, 0, 0, 255, 0, 0, 255, 128]))
+        ctx.driver.key(gui, ctx.driver.paste_chord)
+        import re
+        found = eventually(lambda: re.search(r"pasted-images[\\/](paste-[0-9]+-[0-9]+-[0-9]+\.png)",
+                                             logical_text(ctx.run.capture_json(pane))), 15, what="pasted image path")
+        png = runtime / "pasted-images" / found.group(1)
+        if not png.read_bytes().startswith(b"\x89PNG"):
+            raise AssertionError(f"{png} is not a PNG")
+        if os.name != "nt" and (png.stat().st_mode & 0o777, png.parent.stat().st_mode & 0o777) != (0o600, 0o700):
+            raise AssertionError(f"pasted image permissions {oct(png.stat().st_mode)} / {oct(png.parent.stat().st_mode)}")
+        (runtime / "test-clipboard-image").unlink()
+        ctx.driver.key(gui, "ctrl+c")
+        quiet_screen(ctx, pane)
+        # The demo prints an OSC 8 link, a URL wider than the pane, a file: URL.
+        _, meta = gui.wait_frame(what="frame before the demo")
+        index = find_pane(meta, pane)
+        cols = meta["panes"][index]["cols"]
+        target = "https://osc8.example/target"
+        wrap = "https://wrap.example/" + "w" * (cols + 5) + "/END"
+        document = ctx.run.work / "link-doc.txt"
+        document.write_text("a document\n")
+        demo = ctx.run.work / "link_demo.py"
+        demo.write_text(LINK_DEMO)
+        recorded = ctx.run.work / "link-demo-input.bin"
+        command = f"'{sys.executable}' '{demo}' '{target}' '{wrap}' '{recorded}' '{file_url(document)}'"
+        ctx.run.send_keys(pane, ("& " if os.name == "nt" else "") + command + "\r")
+        eventually(lambda: any(l.strip() == "READY_LINKS" for l in ctx.run.capture(pane).splitlines()), 30,
+                   what="link demo printed")
+
+        def links():
+            return opened.read_text().splitlines() if opened.exists() else []
+
+        def modifier_click(row, col, expect_hover):
+            _, meta = gui.wait_frame(what="frame for the click")
+            x, y = cell_center(meta, find_pane(meta, pane), row, col)
+            ctx.driver.move(gui, x, y)
+            ctx.driver.modifier(gui, held, True)
+            try:
+                # Underlined, and the real target shown before any click.
+                frame = gui.wait_frame(lambda m, i: m.get("hover_link") == expect_hover
+                                       and m["status"].startswith("Link: " + expect_hover[:20]), timeout=10,
+                                       what=f"hover underline and target for {expect_hover}")
+                ctx.driver.click(gui, x, y)
+            finally:
+                ctx.driver.modifier(gui, held, False)
+            return frame
+
+        screen = ctx.run.capture_json(pane)
+        row, cells = locate(screen, "CLICK_OSC8")
+        hover = modifier_click(row, column_of(cells, "CLICK_OSC8")[0] + 3, target)
+        eventually(lambda: target in links(), 10, what="OSC 8 link sent to the opener")
+        # Click on the wrapped URL's last row: the whole URL opens.
+        wrap_row, _ = locate(screen, "WRAP")
+        end_row = next(i for i, r in enumerate(screen["cells"])
+                       if i > wrap_row and "/END" in "".join(c["text"] for c in r))
+        end_cells = screen["cells"][end_row]
+        modifier_click(end_row, column_of(end_cells, "/END")[0], wrap)
+        eventually(lambda: wrap in links(), 10, what="wrapped URL sent to the opener")
+        # An OSC 8 text naming another host asks first.
+        row, cells = locate(screen, "MISLEAD")
+        modifier_click(row, column_of(cells, "bank.example")[0] + 2, "https://evil.example/")
+        gui.wait_frame(lambda m, i: "again to confirm" in m["status"], timeout=10, what="misleading link prompt")
+        if "https://evil.example/" in links():
+            raise AssertionError("a link whose text names another host opened without confirmation")
+        # file: asks first; a deliberate second click (not a double-click) opens it.
+        row, cells = locate(screen, "FILE")
+        col = column_of(cells, "file:")[0] + 2
+        modifier_click(row, col, file_url(document))
+        gui.wait_frame(lambda m, i: "again to confirm" in m["status"], timeout=10, what="file: confirmation prompt")
+        if any("link-doc.txt" in line for line in links()):
+            raise AssertionError("file: link opened without confirmation")
+        time.sleep(0.7)
+        modifier_click(row, col, file_url(document))
+        eventually(lambda: any(line.startswith("file ") and line.endswith("link-doc.txt") for line in links()), 10,
+                   what="file: document opened after confirmation")
+        forwarded = "not checked (Windows console input)"
+        if os.name != "nt":
+            time.sleep(0.5)
+            data = recorded.read_bytes() if recorded.exists() else b""
+            if b"\x1b[<" in data or b"\x1b[M" in data:
+                raise AssertionError(f"a link click reached the program: {data!r}")
+            forwarded = "no mouse report reached the program"
+        frame = gui.wait_frame(what="frame after the links")
+    finally:
+        gui.kill()
+    return (f"paths pasted as {want!r}; opened {links()}; {forwarded}"), \
+        [ctx.save_frame("j18-hover", hover), ctx.save_frame("j18-after", frame)]
+
+
 @journey("J11", "a daemon that keeps stalling is waited for, never reported as disconnected")
 def j11_stall(ctx):
     gui, session, pane = link_gui(ctx)
@@ -891,7 +1050,7 @@ def j13_stop(ctx):
 
 
 JOURNEYS = [j1_launch, j2_text, j3_split, j4_resize, j5_nvim_edit, j6_paste, j7_mouse, j8_focus, j10_chords, j9_reattach,
-            j15_stuck_pane, j16_exit_frozen, j17_backlog, j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
+            j15_stuck_pane, j16_exit_frozen, j17_backlog, j18_links, j11_stall, j14_frozen_daemon, j12_restart, j13_stop]
 
 
 def summary_markdown(ctx):

@@ -261,8 +261,10 @@ impl State {
         let mut link_index: std::collections::HashMap<String, u16> = Default::default();
         let mut link_bytes = 0usize;
         let mut row = Vec::with_capacity(self.size.cols as usize);
+        let mut wrapped = Vec::with_capacity(self.size.rows as usize);
         for indexed in content.display_iter {
             let cell = indexed.cell;
+            let wraps = cell.flags.contains(Flags::WRAPLINE);
             let mut fg = convert_color(cell.fg, content.colors, &self.default_colors);
             let mut bg = convert_color(cell.bg, content.colors, &self.default_colors);
             if cell.flags.contains(Flags::DIM) {
@@ -327,6 +329,7 @@ impl State {
                     .map(|color| convert_color(color, content.colors, &self.default_colors)),
             });
             if row.len() == self.size.cols as usize {
+                wrapped.push(wraps);
                 cells.push(std::mem::replace(
                     &mut row,
                     Vec::with_capacity(self.size.cols as usize),
@@ -375,6 +378,7 @@ impl State {
             bell: self.bell,
             links,
             clipboard_seq: self.clipboard_seq,
+            wrapped,
         }
     }
 }
@@ -1495,6 +1499,13 @@ mod tests {
                 "\x1bP0$r\x1b\\",
             ]
         );
+    }
+    #[test]
+    fn soft_wrapped_rows_are_marked_and_hard_breaks_are_not() {
+        let mut state = State::with_osc52(Size { rows: 5, cols: 10 }, 0, false);
+        state.advance(b"https://example.com/x\r\nshort");
+        let screen = state.snapshot(true);
+        assert_eq!(screen.wrapped, [true, true, false, false, false]);
     }
     #[test]
     fn osc52_copy_is_opt_out_bounded_and_never_readable() {
