@@ -348,6 +348,32 @@ pub fn probe() -> Result<AdapterSummary> {
     Ok(request_adapter(&instance, None)?.get_info().into())
 }
 
+/// [`probe`] for `crow-term doctor`: only an instance and an adapter request
+/// (no device, surface or window), on a helper thread that is abandoned after
+/// `timeout`, so a hung driver cannot stall the caller.
+pub fn probe_within(timeout: std::time::Duration) -> Result<AdapterSummary> {
+    within(timeout, probe)
+}
+/// Run `work` on a detached thread and wait at most `timeout` for it.
+fn within<T: Send + 'static>(
+    timeout: std::time::Duration,
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("crow-gpu-probe".into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .context("start the GPU probe thread")?;
+    rx.recv_timeout(timeout).map_err(|_| {
+        anyhow!(
+            "no answer from the GPU driver within {} ms",
+            timeout.as_millis()
+        )
+    })?
+}
+
 struct Target {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -1335,6 +1361,20 @@ fn layer_instances(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hung_probe_times_out_instead_of_stalling() {
+        use std::time::{Duration, Instant};
+        let started = Instant::now();
+        let result = within(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(())
+        });
+        assert!(result.is_err_and(|error| error.to_string().contains("50 ms")));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(within(Duration::from_secs(5), || Ok(7)).unwrap(), 7);
+        assert!(within::<()>(Duration::from_secs(5), || anyhow::bail!("no adapter")).is_err());
+    }
 
     #[test]
     fn clipping_shifts_texture_coordinates_with_the_quad() {
