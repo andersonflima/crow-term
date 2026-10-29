@@ -69,6 +69,9 @@ pub struct FrameMeta {
     pub footer: Vec<String>,
     /// Tab labels as drawn.
     pub tabs: Vec<String>,
+    /// No tab label is waiting to change (its debounce has run out): what
+    /// the tabs show is what they will keep showing.
+    pub labels_settled: bool,
 }
 
 pub struct FrameDump {
@@ -200,6 +203,7 @@ mod tests {
             hover_link: None,
             footer: Vec::new(),
             tabs: Vec::new(),
+            labels_settled: true,
         }
     }
 

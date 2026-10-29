@@ -156,6 +156,13 @@ def find_pane(meta, pane_id):
 
 # ----------------------------------------------------------------- journeys
 
+def labels_settled(meta):
+    """The tab label is final: no change pending, and it says what the
+    footer (not delayed) says about the focused pane's program."""
+    footer, tabs = meta.get("footer", []), meta.get("tabs", [])
+    return meta.get("labels_settled", True) and (not footer or not tabs or footer[0] == tabs[0])
+
+
 @journey("J1", "launch and first frame")
 def j1_launch(ctx):
     python = sys.executable
@@ -181,7 +188,11 @@ def j2_text(ctx):
         raise Skip("J1 did not start the fixture GUI")
     pane = first_pane(ctx, "fixture")
     revision = ctx.run.revision()
-    frame = gui.wait_frame(lambda meta, image: meta["revision"] >= revision, what="fixture frame")
+    # Goldens are taken once the tab label has settled (labels change only
+    # after holding for a moment, and the pane's command line is read once
+    # a second): what is compared is the steady state, not a moment of it.
+    frame = gui.wait_frame(lambda meta, image: meta["revision"] >= revision and labels_settled(meta),
+                           what="fixture frame with settled labels")
     screen = ctx.run.capture_json(pane)
     (ctx.artifacts / "j2-capture.txt").write_text("\n".join(harness.grid_text(screen)), encoding="utf-8")
     image, meta = frame
@@ -302,7 +313,9 @@ def j3_split(ctx):
     for pane in panes:
         eventually(lambda: "END" in ctx.run.capture(pane), 15, what=f"fixture in pane {pane}")
     revision = ctx.run.revision()
-    frame = gui.wait_frame(lambda meta, image: len(meta["panes"]) == len(panes) and meta["revision"] >= revision, what="split frame with every pane drawn")
+    frame = gui.wait_frame(lambda meta, image: len(meta["panes"]) == len(panes) and meta["revision"] >= revision
+                           and labels_settled(meta),
+                           what="split frame with every pane drawn and settled labels")
     evidence = [ctx.save_frame("j3-split", frame)]
     # Golden on the frame right after the splits: the newest pane has focus.
     notes = [f"{len(panes)} panes via {how}", ctx.golden("split", frame)]
