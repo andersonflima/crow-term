@@ -740,7 +740,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(summary.pid.is_some());
-        assert_eq!(summary.pids[0], summary.pid.unwrap(), "the job leader first");
+        assert_eq!(
+            summary.pids[0],
+            summary.pid.unwrap(),
+            "the job leader first"
+        );
         assert!(
             server.signals.revision() > revision,
             "a changed summary wakes watchers"
