@@ -7,6 +7,14 @@
       "https://raw.githubusercontent.com/madsmtm/objc2/4fc083f1c6d6784577e38b0ee8dbd344481e2fd2/LICENSE.txt"
     ]
   },
+  "block2 0.6.2": {
+    "files": [
+      "licenses/upstream/objc2-b4167b582b2f/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/b4167b582b2f75f9a1be75495c41b765344fd03c/LICENSE.md"
+    ]
+  },
   "clipboard-win 5.4.3": {
     "files": [
       "licenses/upstream/clipboard-win-ed27008ae5d1/LICENSE"
@@ -45,6 +53,14 @@
       "https://raw.githubusercontent.com/spdx/license-list-data/f715b3660bb164c3d0b81cba9ce94e3c558c4048/text/MIT.txt"
     ]
   },
+  "gl_generator 0.14.0": {
+    "files": [
+      "licenses/upstream/gl-rs-ea503e8d5fb6/LICENSE"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/brendanzab/gl-rs/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e/LICENSE"
+    ]
+  },
   "harfrust 0.5.2": {
     "files": [
       "licenses/upstream/harfrust-efdae3142ab7/LICENSE"
@@ -81,6 +97,14 @@
     "sources": [
       "https://raw.githubusercontent.com/jni-rs/jni-sys/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-APACHE",
       "https://raw.githubusercontent.com/jni-rs/jni-sys/64d77b7a5f119d7b55b4e2c169a4668067ff59e6/LICENSE-MIT"
+    ]
+  },
+  "khronos_api 3.1.0": {
+    "files": [
+      "licenses/upstream/gl-rs-f150967b1c44/LICENSE"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/brendanzab/gl-rs/f150967b1c44ae888e6676f93f639ebc82771bdc/LICENSE"
     ]
   },
   "ndk 0.9.0": {
@@ -265,6 +289,14 @@
       "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
     ]
   },
+  "objc2-metal 0.3.2": {
+    "files": [
+      "licenses/upstream/objc2-7b1abfd750a2/LICENSE.md"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/madsmtm/objc2/7b1abfd750a2cacaea71d6a56ecfb83cb7de560b/LICENSE.md"
+    ]
+  },
   "objc2-quartz-core 0.2.2": {
     "files": [
       "licenses/upstream/objc2-e282618be4c3/LICENSE.txt"
@@ -313,6 +345,16 @@
       "https://raw.githubusercontent.com/madsmtm/objc2/e282618be4c3a3b9542957e0c8540e9588472ce8/LICENSE.txt"
     ]
   },
+  "profiling 1.0.18": {
+    "files": [
+      "licenses/upstream/profiling-8271551172eb/LICENSE-APACHE",
+      "licenses/upstream/profiling-8271551172eb/LICENSE-MIT"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-APACHE",
+      "https://raw.githubusercontent.com/aclysma/profiling/8271551172eb6fa4cba47369aedd93790c623df9/LICENSE-MIT"
+    ]
+  },
   "r-efi 5.3.0": {
     "files": [
       "licenses/upstream/r-efi-97b55bed1c2c/AUTHORS"
@@ -327,6 +369,14 @@
     ],
     "sources": [
       "https://raw.githubusercontent.com/r-efi/r-efi/7e1b0322d31d625f81a5656096330934f9cd835d/AUTHORS"
+    ]
+  },
+  "spirv 0.4.0+sdk-1.4.341.0": {
+    "files": [
+      "licenses/upstream/rspirv-8afc3d0ac8e1/LICENSE"
+    ],
+    "sources": [
+      "https://raw.githubusercontent.com/gfx-rs/rspirv/8afc3d0ac8e158128cd1410bb2e4b4c26ab11bb4/LICENSE"
     ]
   },
   "winapi-i686-pc-windows-gnu 0.4.0": {

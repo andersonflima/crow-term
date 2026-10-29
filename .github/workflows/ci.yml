@@ -81,6 +81,42 @@ jobs:
           path: dist/*.*
           if-no-files-found: error
           retention-days: 14
+  gpu:
+    # GPU renderer: offscreen GPU frames of the real UI composition must match
+    # the software renderer within the golden tolerance (<= 2 per channel on
+    # <= 0.1% of pixels). Linux uses Mesa lavapipe (Vulkan on the CPU) and
+    # Windows DX12 WARP, so these jobs require an adapter; macOS uses the
+    # runner's Metal device when one is exposed and logs the reason when not.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            require: '1'
+            backend: vulkan
+          - os: windows-2025
+            require: '1'
+            backend: dx12
+          - os: macos-15
+            require: '0'
+            backend: metal
+    name: gpu (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    env:
+      CROW_TERM_GPU_TESTS: ${{ matrix.require }}
+      WGPU_BACKEND: ${{ matrix.backend }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - name: Linux native dependencies, Mesa lavapipe and emoji font
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev mesa-vulkan-drivers libvulkan1 fonts-noto-color-emoji
+      - name: GPU vs software goldens and GPU unit tests
+        run: cargo test --locked --lib -- 'render::' 'fixture::' --nocapture
+
   neovim:
     # Pinned upstream Neovim releases (SHA-256 checked by scripts/fetch_neovim.py)
     # against the real daemon PTY. LazyVim requires Neovim >= 0.11.2.
